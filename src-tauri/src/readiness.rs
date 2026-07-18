@@ -14,11 +14,17 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use crate::codex_plugins::CodexPluginPlan;
+use crate::project_paths;
 
 const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_PROMPT_BYTES: u64 = 256 * 1024;
 const MAX_FIRST_LINE_BYTES: usize = 64 * 1024;
 const MAX_DISMISSED: usize = 512;
+
+/// Dev/simulation switch: when this env var is set, project-path readiness
+/// treats every synced source path as foreign even if it exists locally, so
+/// the mapping flow can be exercised on the machine that pushed the profile.
+pub const FORCE_PATH_REMAP_ENV: &str = "AGENT_SYNC_FORCE_PATH_REMAP";
 
 // ── Local persistent state (~/.agent-sync/local-state.json) ─────────────────
 
@@ -76,6 +82,32 @@ pub fn save_local_state(path: &Path, state: &LocalState) -> Result<(), String> {
 
 // ── Issue model ──────────────────────────────────────────────────────────────
 
+/// One source-machine project that needs an explicit local folder choice
+/// (PLAN_CODEX_MANUAL_PROJECT_PATH_PICKING.md §4). `source_key` mirrors the
+/// shared mapping schema (`project_paths.rs`); for Codex it equals
+/// `source_path`.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProjectPathCandidate {
+    pub provider: String, // "codex" | "claude"
+    pub source_key: String,
+    pub source_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub git_origin: Option<String>,
+    /// Saved mapping target whose directory is gone — kept visible instead
+    /// of erased or silently resolved (D5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mapped_path: Option<String>,
+    /// Affected conversation ids recorded under this exact cwd: Codex thread
+    /// ids (for the `codex resume <id> -C <target>` commands) or Claude
+    /// session ids.
+    pub affected_threads: Vec<String>,
+    /// Provider-neutral row state the UI switches on (`unmapped`,
+    /// `missing_alias`, `missing_target`, `conflicting_*`, …); the frontend
+    /// never re-inspects the filesystem itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path_state: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SetupIssue {
     pub id: String,
@@ -90,6 +122,10 @@ pub struct SetupIssue {
     pub detail: String,
     pub source_path: Option<String>,
     pub action: String,
+    /// Structured payload for `attach_project` issues that have a real
+    /// folder picker; absent everywhere else.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_path: Option<ProjectPathCandidate>,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,6 +176,7 @@ fn push_issue(
         detail,
         source_path,
         action: action.to_string(),
+        project_path: None,
     });
 }
 
@@ -164,6 +201,16 @@ pub struct ScanInput<'a> {
     /// Pre-computed sidebar apply summary (codex_sidebar::pending_summary);
     /// Some = the merged lock holds state not yet reflected locally.
     pub sidebar_pending: Option<&'a str>,
+    /// Structured unmatched Codex sidebar projects, one folder-picker row
+    /// each — computed by the caller from the sidebar plan + saved mappings
+    /// (the scan itself stays dependency-free).
+    pub codex_path_candidates: &'a [ProjectPathCandidate],
+    /// Structured Claude project rows, computed by the caller with
+    /// `claude_path_candidates` from the projects dir + saved mappings.
+    pub claude_path_candidates: &'a [ProjectPathCandidate],
+    /// Set when the machine-local mapping document failed to load: surfaced
+    /// as one actionable row instead of silently treated as empty.
+    pub mappings_error: Option<&'a str>,
 }
 
 /// Deterministic for a fixed filesystem + inputs: issues are sorted, ids are
@@ -195,7 +242,24 @@ pub fn scan(input: &ScanInput) -> Vec<SetupIssue> {
     hook_issues(&mut issues, input);
     prompt_issues(&mut issues, ".codex", &input.codex_dir.join("prompts"));
     prompt_issues(&mut issues, ".claude", &input.claude_dir.join("commands"));
-    project_path_issues(&mut issues, input.claude_dir);
+    let force_paths = (input.env_present)(FORCE_PATH_REMAP_ENV);
+    claude_project_path_issues(&mut issues, input.claude_path_candidates, force_paths);
+    codex_project_path_issues(&mut issues, input.codex_path_candidates, force_paths);
+    if let Some(error) = input.mappings_error {
+        push_issue(
+            &mut issues,
+            ".claude",
+            "paths",
+            "warning",
+            "Project-path mappings file needs attention".to_string(),
+            format!(
+                "{} — new mappings and repairs are paused until the file is fixed; existing aliases keep working.",
+                error
+            ),
+            None,
+            "review_mappings_file",
+        );
+    }
     override_issue(&mut issues, input.codex_dir);
     sidebar_issue(&mut issues, input.sidebar_pending);
     // warnings first, then stable text order — deterministic for fixtures.
@@ -815,64 +879,77 @@ fn foreign_home_path(text: &str) -> Option<String> {
     None
 }
 
-// ── Project paths: transcript cwd no longer exists ───────────────────────────
+// ── Claude project paths (PLAN_CLAUDE_PROJECT_PATH_REMAP.md §7) ──────────────
 
-fn project_path_issues(issues: &mut Vec<SetupIssue>, claude_dir: &Path) {
-    // Claude only: resume is path-coupled there (AGENT_SYNC_FILE_SETS.md).
-    // The cwd comes from transcript content, not from decoding the encoded
-    // directory name (dashes are ambiguous).
+/// One real project bucket under `<claude-root>/projects/`, read-only.
+#[derive(Debug, Clone)]
+pub struct ClaudeProjectProbe {
+    /// Bucket basename — the stable identity; never decoded (lossy).
+    pub source_key: String,
+    /// Deduped, sorted first-`cwd` of each transcript's bounded head. A
+    /// bucket legitimately mixes old A-path and new B-path records after a
+    /// mapping, so all values are kept.
+    pub cwd_candidates: Vec<String>,
+    /// Session ids from direct `*.jsonl` basenames, sorted.
+    pub session_ids: Vec<String>,
+}
+
+/// Scan the real direct directories below `projects/` — symlinks (mapping
+/// aliases among them) are skipped, so an alias never probes as a second
+/// project.
+pub fn probe_claude_projects(claude_dir: &Path) -> Vec<ClaudeProjectProbe> {
     let projects = claude_dir.join("projects");
     let Ok(entries) = fs::read_dir(&projects) else {
-        return;
+        return Vec::new();
     };
+    // read_dir's file_type is the dirent's own type: a symlinked dir is not
+    // a dir here, which is exactly the no-follow rule this design needs.
     let mut dirs: Vec<_> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
         .collect();
     dirs.sort_by_key(|e| e.file_name());
-    for entry in dirs {
-        let Some(cwd) = project_cwd(&entry.path()) else {
-            continue;
-        };
-        if !Path::new(&cwd).exists() {
-            push_issue(
-                issues,
-                ".claude",
-                "paths",
-                "warning",
-                format!(
-                    "Project folder missing for '{}'",
-                    entry.file_name().to_string_lossy()
-                ),
-                format!(
-                    "Transcripts reference '{}', which does not exist on this machine. Claude resume only finds them at that exact path.",
-                    cwd
-                ),
-                Some(entry.path().to_string_lossy().to_string()),
-                "attach_project",
-            );
-        }
-    }
+    dirs.iter()
+        .filter_map(|entry| probe_claude_project(&entry.path()))
+        .collect()
 }
 
-/// `cwd` from the first line of any transcript in the project dir.
-fn project_cwd(project_dir: &Path) -> Option<String> {
+fn probe_claude_project(project_dir: &Path) -> Option<ClaudeProjectProbe> {
+    let source_key = project_dir.file_name()?.to_str()?.to_string();
     let entries = fs::read_dir(project_dir).ok()?;
     let mut jsonl: Vec<_> = entries
         .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .filter(|e| e.path().extension().is_some_and(|x| x == "jsonl"))
         .collect();
     jsonl.sort_by_key(|e| e.file_name());
-    for entry in jsonl {
-        let Ok(file) = fs::File::open(entry.path()) else {
-            continue;
-        };
-        let mut buf = Vec::new();
-        let _ = file.take(MAX_FIRST_LINE_BYTES as u64).read_to_end(&mut buf);
-        let text = String::from_utf8_lossy(&buf);
-        let Some(line) = text.lines().next() else {
-            continue;
-        };
+    let mut cwds = BTreeSet::new();
+    let mut session_ids = Vec::new();
+    for entry in &jsonl {
+        if let Some(stem) = entry.path().file_stem().and_then(|s| s.to_str()) {
+            session_ids.push(stem.to_string());
+        }
+        if let Some(cwd) = transcript_cwd(&entry.path()) {
+            cwds.insert(cwd);
+        }
+    }
+    (!session_ids.is_empty()).then(|| ClaudeProjectProbe {
+        source_key,
+        cwd_candidates: cwds.into_iter().collect(),
+        session_ids,
+    })
+}
+
+/// `cwd` from the earliest record carrying one. Real transcripts open with
+/// metadata records (`mode`, `last-prompt`, `queue-operation`, …) that have
+/// no cwd — it first appears a few lines in, so scan the capped head, not
+/// just line one.
+fn transcript_cwd(path: &Path) -> Option<String> {
+    let file = fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    let _ = file.take(MAX_FIRST_LINE_BYTES as u64).read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf);
+    for line in text.lines() {
         if let Ok(value) = serde_json::from_str::<serde_json::Value>(line) {
             if let Some(cwd) = value.get("cwd").and_then(|v| v.as_str()) {
                 return Some(cwd.to_string());
@@ -880,6 +957,233 @@ fn project_cwd(project_dir: &Path) -> Option<String> {
         }
     }
     None
+}
+
+/// One structured candidate per real Claude project bucket, mapping-aware:
+/// the row's `path_state` is what the UI switches on. Read-only — mappings
+/// are consulted, never created or edited.
+pub fn claude_path_candidates(
+    claude_dir: &Path,
+    mappings: &project_paths::ProjectPathMappings,
+    profile_id: &str,
+) -> Vec<ProjectPathCandidate> {
+    let projects = claude_dir.join("projects");
+    probe_claude_projects(claude_dir)
+        .into_iter()
+        .filter_map(|probe| {
+            // Display cwd: prefer one whose tested encoding equals the key;
+            // never decode the key itself. No cwd at all → nothing to show
+            // or map.
+            let display = probe
+                .cwd_candidates
+                .iter()
+                .find(|cwd| project_paths::encode_claude_project_path(cwd) == probe.source_key)
+                .or_else(|| probe.cwd_candidates.first())?
+                .clone();
+            let mapping =
+                project_paths::mapping_for(mappings, profile_id, "claude", &probe.source_key);
+            let (state, mapped_path) = match mapping {
+                Some(mapping) => (
+                    project_paths::claude_alias_state(&projects, mapping)
+                        .as_str()
+                        .to_string(),
+                    Some(mapping.target_path.clone()),
+                ),
+                None => {
+                    // Locally reachable only when an existing cwd encodes to
+                    // the real key — an unrelated same-named folder is not
+                    // enough (§7.5).
+                    let reachable = probe.cwd_candidates.iter().any(|cwd| {
+                        project_paths::encode_claude_project_path(cwd) == probe.source_key
+                            && Path::new(cwd).is_dir()
+                    });
+                    (
+                        (if reachable { "reachable" } else { "unmapped" }).to_string(),
+                        None,
+                    )
+                }
+            };
+            Some(ProjectPathCandidate {
+                provider: "claude".to_string(),
+                source_key: probe.source_key,
+                source_path: display,
+                git_origin: None,
+                mapped_path,
+                affected_threads: probe.session_ids,
+                path_state: Some(state),
+            })
+        })
+        .collect()
+}
+
+fn claude_project_path_issues(
+    issues: &mut Vec<SetupIssue>,
+    candidates: &[ProjectPathCandidate],
+    force: bool,
+) {
+    for candidate in candidates {
+        let state = candidate.path_state.as_deref().unwrap_or("unmapped");
+        let sessions = candidate.affected_threads.len();
+        let target = candidate.mapped_path.as_deref().unwrap_or("?");
+        let missing_title = format!("Project folder missing for '{}'", candidate.source_path);
+        let (title, detail) = match state {
+            // A valid mapping stays resolved even under the simulation
+            // switch — force must never invite replacing it (§7.7).
+            "ready" | "ready_without_alias" | "missing_source" => continue,
+            "reachable" => {
+                if !force {
+                    continue;
+                }
+                (
+                    missing_title,
+                    format!(
+                        "Transcripts reference '{}'. The folder exists here, but {} is set, so it is treated as foreign for simulation.",
+                        candidate.source_path, FORCE_PATH_REMAP_ENV
+                    ),
+                )
+            }
+            "unmapped" => (
+                missing_title,
+                format!(
+                    "Transcripts reference '{}', which does not exist on this machine. Choose the local folder that holds this project — {} session(s) can then resume from it.",
+                    candidate.source_path, sessions
+                ),
+            ),
+            "missing_target" => (
+                missing_title,
+                format!(
+                    "Mapped to '{}', which no longer exists on this machine. Choose the folder again; the saved mapping stays until you change or remove it.",
+                    target
+                ),
+            ),
+            "missing_alias" => (
+                format!("Mapping needs repair for '{}'", candidate.source_path),
+                format!(
+                    "The mapping to '{}' is saved, but its local alias link is missing. Repair recreates the link; transcripts are never touched.",
+                    target
+                ),
+            ),
+            "conflicting_directory" => (
+                format!("Mapping conflict for '{}'", candidate.source_path),
+                format!(
+                    "The alias for '{}' is blocked: a real project directory already uses that name, and Claude histories are never auto-merged. Choose a different folder, or move that directory aside and repair.",
+                    target
+                ),
+            ),
+            "conflicting_symlink" => (
+                format!("Mapping conflict for '{}'", candidate.source_path),
+                format!(
+                    "The alias for '{}' is blocked by a link pointing somewhere else. Remove the stale link, then repair the mapping.",
+                    target
+                ),
+            ),
+            "permission_denied" => (
+                format!("Access needed for '{}'", candidate.source_path),
+                "macOS denied access to this profile's projects folder. Grant Agent Sync access to it (or Full Disk Access when required), then repair the mapping.".to_string(),
+            ),
+            _ => continue,
+        };
+        push_issue(
+            issues,
+            ".claude",
+            "paths",
+            "warning",
+            title,
+            detail,
+            Some(candidate.source_key.clone()),
+            "attach_project",
+        );
+        if let Some(issue) = issues.last_mut() {
+            issue.project_path = Some(candidate.clone());
+        }
+    }
+}
+
+// ── Codex project paths: one folder-picker row per unmatched project ────────
+
+fn codex_project_path_issues(
+    issues: &mut Vec<SetupIssue>,
+    candidates: &[ProjectPathCandidate],
+    force: bool,
+) {
+    for candidate in candidates {
+        let tasks = candidate.affected_threads.len();
+        let mut detail = match &candidate.mapped_path {
+            Some(target) => format!(
+                "Mapped to '{}', which no longer exists on this machine. Choose the folder again; the saved mapping stays until you change or remove it.",
+                target
+            ),
+            None => format!(
+                "The synced sidebar references '{}', which does not exist here. Choose the local folder that holds this project — {} task(s) recorded under it can then continue via `codex resume -C`.",
+                candidate.source_path, tasks
+            ),
+        };
+        if force && Path::new(&candidate.source_path).exists() {
+            detail = format!(
+                "{} (The folder exists here, but {} is set, so it is treated as foreign for simulation.)",
+                detail, FORCE_PATH_REMAP_ENV
+            );
+        }
+        push_issue(
+            issues,
+            ".codex",
+            "paths",
+            "warning",
+            format!("Project folder missing for '{}'", candidate.source_path),
+            detail,
+            Some(candidate.source_path.clone()),
+            "attach_project",
+        );
+        if let Some(issue) = issues.last_mut() {
+            issue.project_path = Some(candidate.clone());
+        }
+    }
+}
+
+/// Thread ids grouped by the exact `session_meta.cwd` of each rollout's
+/// first record (bounded read, same cap as the Claude transcript probe).
+/// Read-only and deterministic: BTree ordering throughout.
+pub fn codex_threads_by_cwd(codex_dir: &Path) -> BTreeMap<String, Vec<String>> {
+    let mut grouped: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for dir in ["sessions", "archived_sessions"] {
+        for entry in walkdir::WalkDir::new(codex_dir.join(dir))
+            .follow_links(false)
+            .max_depth(5)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy();
+            if !name.starts_with("rollout-") || !name.ends_with(".jsonl") {
+                continue;
+            }
+            if let Some((id, cwd)) = rollout_first_record(entry.path()) {
+                grouped.entry(cwd).or_default().insert(id);
+            }
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(cwd, ids)| (cwd, ids.into_iter().collect()))
+        .collect()
+}
+
+/// (thread id, cwd) from a rollout's first record. Codex writes a
+/// `session_meta` record with an id + cwd payload first; files without one
+/// are skipped rather than guessed at from the filename.
+fn rollout_first_record(path: &Path) -> Option<(String, String)> {
+    let file = fs::File::open(path).ok()?;
+    let mut buf = Vec::new();
+    let _ = file.take(MAX_FIRST_LINE_BYTES as u64).read_to_end(&mut buf);
+    let text = String::from_utf8_lossy(&buf);
+    let line = text.lines().next()?;
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let payload = value.get("payload").unwrap_or(&value);
+    let cwd = payload.get("cwd").and_then(|v| v.as_str())?;
+    let id = payload.get("id").and_then(|v| v.as_str())?;
+    (!id.is_empty() && !cwd.is_empty()).then(|| (id.to_string(), cwd.to_string()))
 }
 
 // ── Active override (D6) ─────────────────────────────────────────────────────
@@ -943,6 +1247,13 @@ mod tests {
     fn scan_fixture(codex: &Path, claude: &Path, state: &LocalState) -> Vec<SetupIssue> {
         let resolve = |name: &str| name == "present-binary";
         let env_present = |name: &str| name == "PRESENT_ENV";
+        // Same composition as get_setup_readiness: candidates prefiltered
+        // from the projects dir + saved mappings (none in fixtures).
+        let claude_candidates = claude_path_candidates(
+            claude,
+            &project_paths::ProjectPathMappings::default(),
+            "claude",
+        );
         scan(&ScanInput {
             codex_dir: codex,
             claude_dir: claude,
@@ -953,6 +1264,9 @@ mod tests {
             resolve: &resolve,
             env_present: &env_present,
             sidebar_pending: None,
+            codex_path_candidates: &[],
+            claude_path_candidates: &claude_candidates,
+            mappings_error: None,
         })
     }
 
@@ -1031,6 +1345,179 @@ mod tests {
     }
 
     #[test]
+    fn transcript_cwd_found_past_leading_metadata_records() {
+        // Real transcripts open with metadata records (mode, last-prompt, …)
+        // that carry no cwd; the probe must scan past them.
+        let dir = tempfile::tempdir().unwrap();
+        let codex = dir.path().join(".codex");
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&codex).unwrap();
+        let proj = claude.join("projects/-tmp-meta-first");
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(
+            proj.join("s1.jsonl"),
+            "{\"type\":\"mode\",\"mode\":\"default\"}\n{\"type\":\"queue-operation\"}\n{\"type\":\"user\",\"cwd\":\"/tmp/definitely-gone-dir\"}\n",
+        )
+        .unwrap();
+
+        let issues = scan_fixture(&codex, &claude, &LocalState::default());
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.action == "attach_project"
+                    && i.detail.contains("/tmp/definitely-gone-dir")),
+            "missing-path issue not raised from a metadata-first transcript: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn force_path_remap_raises_issues_for_existing_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = dir.path().join(".codex");
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&codex).unwrap();
+        let exists = dir.path().join("here");
+        fs::create_dir_all(&exists).unwrap();
+        let proj = claude
+            .join("projects")
+            .join(project_paths::encode_claude_project_path(
+                &exists.to_string_lossy(),
+            ));
+        fs::create_dir_all(&proj).unwrap();
+        fs::write(
+            proj.join("s1.jsonl"),
+            format!("{{\"cwd\":\"{}\"}}\n", exists.display()),
+        )
+        .unwrap();
+
+        let quiet = scan_fixture(&codex, &claude, &LocalState::default());
+        assert!(
+            !quiet.iter().any(|i| i.action == "attach_project"),
+            "existing path must stay quiet without the switch: {:?}",
+            quiet
+        );
+
+        let resolve = |_: &str| false;
+        let env_present = |name: &str| name == FORCE_PATH_REMAP_ENV;
+        let claude_candidates = claude_path_candidates(
+            &claude,
+            &project_paths::ProjectPathMappings::default(),
+            "claude",
+        );
+        assert_eq!(
+            claude_candidates[0].path_state.as_deref(),
+            Some("reachable"),
+            "existing cwd encoding to the key is reachable"
+        );
+        let forced = scan(&ScanInput {
+            codex_dir: &codex,
+            claude_dir: &claude,
+            lock_dirs: &[],
+            codex_plan: None,
+            claude_plan: None,
+            state: &LocalState::default(),
+            resolve: &resolve,
+            env_present: &env_present,
+            sidebar_pending: None,
+            codex_path_candidates: &[],
+            claude_path_candidates: &claude_candidates,
+            mappings_error: None,
+        });
+        let issue = forced
+            .iter()
+            .find(|i| i.action == "attach_project")
+            .unwrap_or_else(|| panic!("forced scan raised no path issue: {:?}", forced));
+        assert!(
+            issue.detail.contains(FORCE_PATH_REMAP_ENV),
+            "forced issue must say it is simulated: {}",
+            issue.detail
+        );
+        assert!(
+            issue.project_path.is_some(),
+            "forced Claude row carries the folder-picker payload"
+        );
+    }
+
+    #[test]
+    fn claude_candidates_follow_mapping_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude = dir.path().join(".claude");
+        let projects = claude.join("projects");
+        let target = dir.path().join("local-repo");
+        fs::create_dir_all(&target).unwrap();
+        let bucket = projects.join("-a-gone-repo");
+        fs::create_dir_all(&bucket).unwrap();
+        fs::write(
+            bucket.join("6d1a1c1e-0000-4000-8000-000000000001.jsonl"),
+            "{\"type\":\"mode\"}\n{\"cwd\":\"/a/gone/repo\"}\n",
+        )
+        .unwrap();
+        fs::write(
+            bucket.join("6d1a1c1e-0000-4000-8000-000000000002.jsonl"),
+            "{\"cwd\":\"/a/gone/repo\"}\n",
+        )
+        .unwrap();
+
+        let mut mappings = project_paths::ProjectPathMappings::default();
+        mappings.schema = 1;
+
+        // Unmapped + missing cwd → one picker row with both session ids.
+        let unmapped = claude_path_candidates(&claude, &mappings, "claude");
+        assert_eq!(unmapped.len(), 1);
+        assert_eq!(unmapped[0].source_key, "-a-gone-repo");
+        assert_eq!(unmapped[0].source_path, "/a/gone/repo");
+        assert_eq!(unmapped[0].path_state.as_deref(), Some("unmapped"));
+        assert_eq!(unmapped[0].affected_threads.len(), 2);
+
+        // Saved mapping without its alias → missing_alias (Repair row).
+        project_paths::upsert(
+            &mut mappings,
+            project_paths::ProjectPathMapping {
+                profile: "claude".to_string(),
+                provider: "claude".to_string(),
+                source_key: "-a-gone-repo".to_string(),
+                source_path: "/a/gone/repo".to_string(),
+                target_path: target.to_string_lossy().to_string(),
+            },
+        )
+        .unwrap();
+        let saved = claude_path_candidates(&claude, &mappings, "claude");
+        assert_eq!(saved[0].path_state.as_deref(), Some("missing_alias"));
+        let mut issues = Vec::new();
+        claude_project_path_issues(&mut issues, &saved, false);
+        assert!(issues[0].title.contains("needs repair"), "{:?}", issues);
+
+        // Alias in place → ready → suppressed, force or not. An alias is
+        // also never probed as a second project.
+        std::os::unix::fs::symlink(
+            "-a-gone-repo",
+            projects.join(project_paths::encode_claude_project_path(
+                &target.to_string_lossy(),
+            )),
+        )
+        .unwrap();
+        let ready = claude_path_candidates(&claude, &mappings, "claude");
+        assert_eq!(ready.len(), 1, "alias must not probe as a project");
+        assert_eq!(ready[0].path_state.as_deref(), Some("ready"));
+        let mut quiet = Vec::new();
+        claude_project_path_issues(&mut quiet, &ready, true);
+        assert!(quiet.is_empty(), "{:?}", quiet);
+
+        // Target gone → stale row that keeps the saved mapping visible.
+        fs::remove_dir(&target).unwrap();
+        let stale = claude_path_candidates(&claude, &mappings, "claude");
+        assert_eq!(stale[0].path_state.as_deref(), Some("missing_target"));
+        let mut rows = Vec::new();
+        claude_project_path_issues(&mut rows, &stale, false);
+        assert!(
+            rows[0].detail.contains("Choose the folder again"),
+            "{:?}",
+            rows
+        );
+    }
+
+    #[test]
     fn scan_surfaces_conflicts_from_remapped_plugin_locks() {
         let dir = tempfile::tempdir().unwrap();
         let codex = dir.path().join(".codex");
@@ -1060,6 +1547,9 @@ mod tests {
             resolve: &resolve,
             env_present: &env_present,
             sidebar_pending: None,
+            codex_path_candidates: &[],
+            claude_path_candidates: &[],
+            mappings_error: None,
         });
 
         let conflict = issues
@@ -1285,6 +1775,131 @@ NODE_REPL_NODE_PATH = "{}"
             .file_type()
             .is_symlink());
         assert_eq!(load_local_state(&path).reviewed_hooks.get("safe"), Some(&9));
+    }
+
+    #[test]
+    fn codex_threads_group_by_exact_first_record_cwd() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = dir.path().join(".codex");
+        let sessions = codex.join("sessions/2026/07/15");
+        fs::create_dir_all(&sessions).unwrap();
+        let archived = codex.join("archived_sessions");
+        fs::create_dir_all(&archived).unwrap();
+
+        let meta = |id: &str, cwd: &str| {
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"cwd\":\"{}\"}}}}\n{{\"type\":\"turn\"}}\n",
+                id, cwd
+            )
+        };
+        fs::write(
+            sessions.join("rollout-2026-07-15T10-00-00-019f-bbbb.jsonl"),
+            meta("019f-bbbb", "/a/repo"),
+        )
+        .unwrap();
+        fs::write(
+            sessions.join("rollout-2026-07-15T11-00-00-019f-aaaa.jsonl"),
+            meta("019f-aaaa", "/a/repo"),
+        )
+        .unwrap();
+        fs::write(
+            archived.join("rollout-2026-07-01T09-00-00-019f-cccc.jsonl"),
+            meta("019f-cccc", "/a/other"),
+        )
+        .unwrap();
+        // Ignored: no session_meta cwd, non-rollout name, prefix-only cwd.
+        fs::write(
+            sessions.join("rollout-2026-07-15T12-00-00-broken.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+        fs::write(sessions.join("notes.txt"), "x").unwrap();
+        fs::write(
+            sessions.join("rollout-2026-07-15T13-00-00-019f-dddd.jsonl"),
+            meta("019f-dddd", "/a/repo-sibling"),
+        )
+        .unwrap();
+
+        let grouped = codex_threads_by_cwd(&codex);
+        assert_eq!(
+            grouped.get("/a/repo").cloned().unwrap_or_default(),
+            vec!["019f-aaaa".to_string(), "019f-bbbb".to_string()],
+            "sorted ids, exact cwd only: {:?}",
+            grouped
+        );
+        assert_eq!(grouped["/a/other"], vec!["019f-cccc"]);
+        assert_eq!(grouped["/a/repo-sibling"], vec!["019f-dddd"]);
+    }
+
+    #[test]
+    fn codex_path_candidates_become_structured_attach_project_issues() {
+        let dir = tempfile::tempdir().unwrap();
+        let codex = dir.path().join(".codex");
+        let claude = dir.path().join(".claude");
+        fs::create_dir_all(&codex).unwrap();
+        fs::create_dir_all(&claude).unwrap();
+
+        let candidates = vec![
+            ProjectPathCandidate {
+                provider: "codex".to_string(),
+                source_key: "/a/repo".to_string(),
+                source_path: "/a/repo".to_string(),
+                git_origin: None,
+                mapped_path: None,
+                affected_threads: vec!["019f-aaaa".to_string(), "019f-bbbb".to_string()],
+                path_state: Some("unmapped".to_string()),
+            },
+            ProjectPathCandidate {
+                provider: "codex".to_string(),
+                source_key: "/a/stale".to_string(),
+                source_path: "/a/stale".to_string(),
+                git_origin: None,
+                mapped_path: Some("/b/deleted".to_string()),
+                affected_threads: Vec::new(),
+                path_state: Some("missing_target".to_string()),
+            },
+        ];
+        let resolve = |_: &str| true;
+        let env_present = |_: &str| true;
+        let issues = scan(&ScanInput {
+            codex_dir: &codex,
+            claude_dir: &claude,
+            lock_dirs: &[],
+            codex_plan: None,
+            claude_plan: None,
+            state: &LocalState::default(),
+            resolve: &resolve,
+            env_present: &env_present,
+            sidebar_pending: None,
+            codex_path_candidates: &candidates,
+            claude_path_candidates: &[],
+            mappings_error: None,
+        });
+
+        let rows: Vec<&SetupIssue> = issues
+            .iter()
+            .filter(|issue| issue.action == "attach_project")
+            .collect();
+        assert_eq!(rows.len(), 2, "{:#?}", issues);
+        assert!(rows.iter().all(|issue| issue.category == "paths"
+            && issue.root == ".codex"
+            && issue.severity == "warning"));
+        let fresh = rows
+            .iter()
+            .find(|issue| issue.source_path.as_deref() == Some("/a/repo"))
+            .unwrap();
+        let candidate = fresh.project_path.as_ref().expect("structured payload");
+        assert_eq!(candidate.affected_threads.len(), 2);
+        assert!(fresh.detail.contains("2 task(s)"), "{}", fresh.detail);
+        let stale = rows
+            .iter()
+            .find(|issue| issue.source_path.as_deref() == Some("/a/stale"))
+            .unwrap();
+        assert!(stale.detail.contains("/b/deleted"), "{}", stale.detail);
+        assert_eq!(
+            stale.project_path.as_ref().unwrap().mapped_path.as_deref(),
+            Some("/b/deleted")
+        );
     }
 
     #[test]

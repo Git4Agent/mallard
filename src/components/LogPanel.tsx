@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { LogLine } from "../types";
+import { userFacingRepoTerms } from "../terminology";
 import Icon from "./Icons";
 
 interface Props {
@@ -17,11 +18,23 @@ function formatTs(ts: number): string {
 }
 
 export default function LogPanel({ lines, onClear, onClose }: Props) {
-  const endRef = useRef<HTMLDivElement>(null);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const followTailRef = useRef(true);
 
   useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (!followTailRef.current) return;
+
+    const body = bodyRef.current;
+    if (body) body.scrollTop = body.scrollHeight;
   }, [lines]);
+
+  const handleScroll = () => {
+    const body = bodyRef.current;
+    if (!body) return;
+
+    const distanceFromBottom = body.scrollHeight - body.scrollTop - body.clientHeight;
+    followTailRef.current = distanceFromBottom <= 16;
+  };
 
   return (
     <div className="log-panel">
@@ -36,18 +49,17 @@ export default function LogPanel({ lines, onClear, onClose }: Props) {
           </button>
         </div>
       </div>
-      <div className="log-panel-body">
+      <div className="log-panel-body" ref={bodyRef} onScroll={handleScroll}>
         {lines.length === 0 ? (
           <div className="log-empty">No entries yet — run a push or pull.</div>
         ) : (
           lines.map((line, i) => (
             <div key={i} className={`log-line log-${line.level}`}>
               <span className="log-ts">{formatTs(line.ts)}</span>
-              <span className="log-msg">{line.message}</span>
+              <span className="log-msg">{userFacingRepoTerms(line.message)}</span>
             </div>
           ))
         )}
-        <div ref={endRef} />
       </div>
     </div>
   );

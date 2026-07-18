@@ -1,5 +1,11 @@
 # Agent Sync — Design v2
 
+> **Legacy schema-2 design.** The active project-scoped schema-3 architecture
+> is defined in [`PLAN_PROJECT_SCOPED_SYNC.md`](./PLAN_PROJECT_SCOPED_SYNC.md).
+> Schema 3 uses project bundles, persistent resource recipes, machine-local
+> bindings, and `v3/bundles/`; it does not migrate or reuse the whole-profile
+> identities described below.
+
 Supersedes `DESIGN1.md`. What changed structurally from v1:
 
 - Publishing is a CAS flip of one tiny pointer object, `_head.json`. All

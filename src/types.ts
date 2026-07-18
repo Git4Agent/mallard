@@ -173,6 +173,50 @@ export interface CodexPluginRepairReport {
   verified: boolean;
 }
 
+/** One source project awaiting an explicit local folder choice
+ * (PLAN_CODEX_MANUAL_PROJECT_PATH_PICKING.md §4). */
+export interface ProjectPathCandidate {
+  provider: string; // "codex" | "claude"
+  source_key: string;
+  source_path: string;
+  git_origin?: string | null;
+  /** Saved mapping whose target directory is gone (stale, kept visible). */
+  mapped_path?: string | null;
+  affected_threads: string[];
+}
+
+/** One machine-local mapping record (`~/.agent-sync/project-path-mappings.json`). */
+export interface ProjectPathMapping {
+  profile: string;
+  provider: string;
+  source_key: string;
+  source_path: string;
+  target_path: string;
+}
+
+/** Provider-tagged result of `map_project_path`. */
+export interface CodexProjectPathApplyReport {
+  provider: "codex";
+  source_path: string;
+  target_path: string;
+  affected_thread_ids: string[];
+  sidebar_applied: boolean;
+  sidebar_pending: boolean;
+  resume_commands: string[];
+}
+
+export interface ClaudeProjectPathApplyReport {
+  provider: "claude";
+  source_key: string;
+  source_path: string;
+  target_path: string;
+  affected_session_ids: string[];
+  alias_path?: string | null;
+  state: string;
+}
+
+export type ProjectPathApplyReport = CodexProjectPathApplyReport | ClaudeProjectPathApplyReport;
+
 /** One post-pull readiness finding (PLAN_PORTABLE_AGENT_SETUP_V2.md §5). */
 export interface SetupIssue {
   id: string;
@@ -185,6 +229,8 @@ export interface SetupIssue {
   detail: string;
   source_path?: string | null;
   action: string;
+  /** Structured payload for `attach_project` issues with a folder picker. */
+  project_path?: ProjectPathCandidate | null;
 }
 
 export interface RootReadiness {
@@ -228,4 +274,432 @@ export interface SyncStatus {
   filesSynced?: number;
   /** Keep a concise operation result instead of collapsing success to "Updated". */
   preserveMessage?: boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Project-scoped sync (schema 3)
+// ---------------------------------------------------------------------------
+
+export type ProjectProvider = "codex" | "claude";
+
+export type ProjectResourceCategory =
+  | "conversations"
+  | "project_setup"
+  | "skills"
+  | "plugins"
+  | "tools";
+
+export type ProjectResourceState =
+  | "synced"
+  | "local_only"
+  | "local_ahead"
+  | "remote_only"
+  | "remote_ahead"
+  | "conflict"
+  | "missing"
+  | "blocked"
+  | "needs_review"
+  | "ready";
+
+export type ProjectResourceKind =
+  | "codex_conversation"
+  | "claude_conversation"
+  | "project_file"
+  | "project_memory"
+  | "agent"
+  | "command"
+  | "rule"
+  | "prompt"
+  | "project_skill"
+  | "standalone_skill"
+  | "plugin"
+  | "mcp_server"
+  | "hook"
+  | "setting"
+  | "requirement";
+
+export type ProjectResourceScope = "project" | "provider_state" | "dependency" | "requirement";
+export type ProjectApplyPolicy = "safe_file" | "merge" | "explicit_install" | "explicit_review" | "manual_only" | "never";
+
+export interface ProjectResourceDescriptor {
+  resource_id: string;
+  kind: ProjectResourceKind;
+  provider?: ProjectProvider | null;
+  scope: ProjectResourceScope;
+  display_name: string;
+  provenance: Record<string, unknown>;
+  apply_policy: ProjectApplyPolicy;
+  relative_cwd?: string | null;
+  codec_version: number;
+  metadata: Record<string, string>;
+  // Inventory DTO presentation hints; these are not manifest identity.
+  category?: ProjectResourceCategory | string;
+  description?: string | null;
+  logical_paths?: string[];
+  default_selected?: boolean;
+  selected_by_default?: boolean;
+  blocked_reason?: string | null;
+  provided_by?: string | null;
+  install_behavior?: string | null;
+}
+
+export interface RecipeEntry {
+  resource_id: string;
+  apply_policy: ProjectApplyPolicy;
+  required: boolean;
+}
+
+export interface BundleRecipe {
+  schema_version: 1;
+  revision: number;
+  entries: Record<string, RecipeEntry>;
+}
+
+export interface ResourceInventory {
+  project: string;
+  bundle_id?: string | null;
+  resources?: ProjectResourceDescriptor[];
+  candidates?: ProjectResourceDescriptor[];
+  recipe: BundleRecipe;
+  generated_at?: number;
+  warnings?: string[];
+}
+
+export interface LocalProjectRegistration {
+  local_project_id: string;
+  bundle_id: string;
+  display_name: string;
+  repository_fingerprint?: string | null;
+  recipe: BundleRecipe;
+  recipe_bases: Record<string, {
+    generation: number;
+    manifest_sha256: string;
+    recipe_revision: number;
+    binding_revision?: number | null;
+  }>;
+  revision: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProjectStorageLink {
+  local_project_id: string;
+  storage_id: string;
+  bundle_id: string;
+  pinned: boolean;
+  created_at: number;
+}
+
+export interface ProjectBinding {
+  replica_id: string;
+  local_project_id: string;
+  bundle_id: string;
+  project_root: string;
+  canonical_project_root: string;
+  profile_ids: Partial<Record<ProjectProvider, string>>;
+  state: "active" | "detached";
+  revision: number;
+  updated_at: number;
+}
+
+export interface LocalProjectSummary {
+  local_project_id: string;
+  bundle_id: string;
+  display_name: string;
+  repository_fingerprint?: string | null;
+  project_root?: string | null;
+  profile_ids?: Partial<Record<ProjectProvider, string>>;
+  providers?: ProjectProvider[];
+  resource_count?: number;
+  selected_resource_count?: number;
+  linked_storage_ids?: string[];
+  readiness_state?: "ready" | "needs_setup" | "blocked" | string;
+}
+
+export interface ApplyReceipt {
+  action_id: string;
+  resource_id: string;
+  action_type: string;
+  logical_path?: string | null;
+  source_sha256?: string | null;
+  target_path?: string | null;
+  target_sha256_after?: string | null;
+  status: "applied" | "skipped" | "failed" | "blocked";
+  applied_at: number;
+  error?: string | null;
+}
+
+export interface MaterializationRecord {
+  materialization_id: string;
+  plan_id: string;
+  replica_id: string;
+  local_project_id: string;
+  storage_id: string;
+  bundle_id: string;
+  generation: number;
+  commit_id: string;
+  manifest_sha256: string;
+  binding_revision: number;
+  status: "partial" | "complete" | "detached";
+  applied_at: number;
+  receipts: ApplyReceipt[];
+}
+
+/** Exact response from the schema-3 `get_project` command. */
+export interface ProjectDetail {
+  project: LocalProjectRegistration;
+  links: ProjectStorageLink[];
+  binding?: ProjectBinding | null;
+  materializations: MaterializationRecord[];
+}
+
+export interface ProjectDiscovery {
+  project_root: string;
+  display_name: string;
+  inventory: ResourceInventory;
+  repository_fingerprint?: string | null;
+  providers?: ProjectProvider[];
+  profile_ids: Partial<Record<ProjectProvider, string>>;
+  warnings?: string[];
+}
+
+export interface ProviderProfile {
+  profile_id: string;
+  provider: ProjectProvider;
+  display_name: string;
+  path: string;
+  canonical_path: string;
+  revision: number;
+  created_at: number;
+  updated_at: number;
+}
+
+export interface ProviderProfileSummary extends ProviderProfile {
+  available: boolean;
+  readable: boolean;
+  writable: boolean;
+  used_by_projects: string[];
+  error?: string | null;
+}
+
+export interface ProviderProfileProbe {
+  provider: ProjectProvider;
+  requested_path: string;
+  resolved_path: string;
+  canonical_path: string;
+  suggested_name: string;
+  readable: boolean;
+  writable: boolean;
+  detected_child: boolean;
+  existing_profile_id?: string | null;
+}
+
+export interface RegisterLocalProjectRequest {
+  display_name: string;
+  repository_fingerprint?: string | null;
+  bundle_id?: string | null;
+}
+
+export interface SaveProjectLinkRequest {
+  local_project_id: string;
+  storage_id: string;
+  pinned: boolean;
+}
+
+export interface ConnectProjectBundleRequest {
+  local_project_id: string;
+  storage_id: string;
+  bundle_id: string;
+  expected_bundle_id: string;
+  pinned: boolean;
+  allow_repository_mismatch?: boolean;
+}
+
+export interface SaveProjectBindingRequest {
+  local_project_id: string;
+  project_root: string;
+  profile_ids: Partial<Record<ProjectProvider, string>>;
+  expected_revision?: number | null;
+}
+
+export interface SyncConfigV3 {
+  schema: 3;
+  revision: number;
+  storages: StorageConfigV3[];
+  projects: LocalProjectRegistration[];
+  links: ProjectStorageLink[];
+}
+
+export interface StorageConfigV3 {
+  id: string;
+  name: string;
+  kind: "s3" | "local";
+  bucket: string;
+  access_key_id: string;
+  secret_access_key: string;
+  account_id: string;
+  s3_endpoint: string;
+  region: string;
+  local_dir: string;
+  included_default_exclusions: string[];
+  supports_conditional_writes?: boolean | null;
+}
+
+export interface BundleResourceStatus {
+  resource_id: string;
+  state: ProjectResourceState | string;
+  message?: string | null;
+  local_digest?: string | null;
+  remote_digest?: string | null;
+}
+
+export interface ResourceStatusReport {
+  project: string;
+  storage: string;
+  bundle_id?: string | null;
+  generation?: number;
+  statuses: Record<string, ProjectResourceState | string> | BundleResourceStatus[];
+  warnings?: string[];
+}
+
+export interface ProjectOperationResult {
+  success: boolean;
+  message: string;
+  operation_id?: string;
+  resources_changed?: number;
+  generation?: number;
+  results?: Array<{
+    resource_id: string;
+    state: string;
+    message?: string;
+  }>;
+}
+
+export interface RemoteBundleSummary {
+  bundle_id: string;
+  display_name: string;
+  kind?: string;
+  generation?: number;
+  updated_at?: number;
+  resource_count?: number;
+  providers?: ProjectProvider[];
+  repository_fingerprint?: string | null;
+}
+
+export interface BundlePage {
+  bundles: RemoteBundleSummary[];
+  next_cursor?: string | null;
+}
+
+export interface BundleSnapshotSummary extends RemoteBundleSummary {
+  storage_id: string;
+  resources?: ProjectResourceDescriptor[];
+  recipe?: BundleRecipe;
+  fetched_at?: number;
+  warnings?: string[];
+}
+
+export type PlanActionRisk = "safe" | "review" | "executable" | "blocked" | string;
+
+export interface PlannedAction {
+  action_id: string;
+  kind: string;
+  title: string;
+  detail?: string | null;
+  category?: ProjectResourceCategory | string;
+  provider?: ProjectProvider | null;
+  resource_id?: string | null;
+  target_path?: string | null;
+  risk?: PlanActionRisk;
+  default_approved?: boolean;
+  requires_explicit_approval?: boolean;
+  blocked_reason?: string | null;
+  state?: string;
+}
+
+export type RestoreActionKind =
+  | { kind: "write_file"; logical_path: string }
+  | { kind: "merge_file"; logical_path: string }
+  | { kind: "materialize_conversation"; provider: ProjectProvider; logical_path: string }
+  | { kind: "install_standalone_skill"; provider: ProjectProvider; target_relative_path: string }
+  | { kind: "install_plugin"; provider: ProjectProvider; plugin_id: string }
+  | { kind: "review_hook"; definition_sha256: string }
+  | { kind: "review_mcp"; definition_sha256: string }
+  | { kind: "apply_setting"; provider: ProjectProvider; semantic_key: string }
+  | { kind: "manual"; message: string };
+
+export interface RestoreAction {
+  action_id: string;
+  resource_id: string;
+  kind: RestoreActionKind;
+  target_path?: string | null;
+  source_sha256?: string | null;
+  expected_target_sha256?: string | null;
+  requires_explicit_approval: boolean;
+}
+
+export interface RestorePlan {
+  schema_version: 1;
+  plan_id: string;
+  storage_id: string;
+  bundle_id: string;
+  replica_id: string;
+  generation: number;
+  commit_id: string;
+  manifest_sha256: string;
+  binding_revision: number;
+  created_at: number;
+  expires_at: number;
+  actions: RestoreAction[];
+}
+
+export interface RestoreResult {
+  success: boolean;
+  message: string;
+  plan_id?: string;
+  applied_action_ids?: string[];
+  failed_actions?: Array<{ action_id: string; message: string }>;
+}
+
+export interface DependencyPlan {
+  plan_id: string;
+  bundle_id: string;
+  actions: DependencyAction[];
+  blockers?: string[];
+  warnings?: string[];
+}
+
+export interface DependencyAction {
+  action_id: string;
+  resource_id: string;
+  kind: "install_codex_plugin" | "install_claude_plugin" | "install_standalone_skill" | "check_binary" | "check_environment" | "manual";
+  display_name: string;
+  provider?: ProjectProvider | null;
+  argv: string[];
+  requires_explicit_approval: boolean;
+}
+
+export interface DependencyResult {
+  success: boolean;
+  message: string;
+  applied_action_ids?: string[];
+  failed_actions?: Array<{ action_id: string; message: string }>;
+}
+
+export interface BundleReadinessIssue {
+  issue_id: string;
+  category: ProjectResourceCategory | string;
+  title: string;
+  detail?: string | null;
+  severity?: "info" | "warning" | "error" | string;
+  provider?: ProjectProvider | null;
+  resource_id?: string | null;
+  action?: string | null;
+}
+
+export interface BundleReadiness {
+  bundle_id: string;
+  state: "ready" | "needs_setup" | "blocked" | string;
+  issues: BundleReadinessIssue[];
+  generated_at?: number;
 }

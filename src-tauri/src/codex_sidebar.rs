@@ -418,18 +418,29 @@ pub fn merge_sidebar_lock(local: &str, cloud: &str) -> String {
 
 // ── Apply: explicit, additive, identity-matched ──────────────────────────────
 
+/// A lock project with no local representation. Surfaced one-per-project so
+/// readiness can render a folder picker for each
+/// (PLAN_CODEX_MANUAL_PROJECT_PATH_PICKING.md §6) — never invented or added.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct UnmatchedProject {
+    /// Source-machine absolute path, exactly as captured.
+    pub path: String,
+    pub git_origin: Option<String>,
+}
+
 #[derive(Debug, Default, PartialEq)]
 pub struct SidebarApplyPlan {
     /// Local paths to add to the saved projects (lock projects whose path
-    /// exists here but is not in the sidebar yet).
+    /// exists here but is not in the sidebar yet, or the local targets of
+    /// valid manual mappings).
     pub add_projects: Vec<String>,
     /// thread id → title, limited to ids absent locally whose rollout
     /// exists on this machine.
     pub set_descriptions: BTreeMap<String, String>,
     /// Atom-state pref key → value, only where the local value differs.
     pub set_prefs: Vec<(String, String)>,
-    /// Lock paths with no local match — surfaced, never invented.
-    pub unmatched: Vec<String>,
+    /// Lock projects with no local match — surfaced, never invented.
+    pub unmatched: Vec<UnmatchedProject>,
 }
 
 impl SidebarApplyPlan {
@@ -452,7 +463,7 @@ impl SidebarApplyPlan {
         }
         if !self.unmatched.is_empty() {
             parts.push(format!(
-                "{} project(s) have no local folder (clone or attach them manually)",
+                "{} project(s) have no local folder (choose their folder under Projects & paths)",
                 self.unmatched.len()
             ));
         }
@@ -461,15 +472,24 @@ impl SidebarApplyPlan {
 }
 
 /// Plan the additive merge of a lock into a local global-state document.
-/// Match order per the plan: exact local path on disk, then git origin
-/// against a locally-listed project, else unmatched. `rollout_exists`
-/// answers "does this thread id have a rollout on this machine".
+/// Match order per the plan: exact local path on disk, then a saved manual
+/// mapping whose target exists (`resolve_project`, from
+/// `project-path-mappings.json` — adds the *target*, never the foreign
+/// source), then git origin against a locally-listed project, else
+/// unmatched. A stale mapped target does not satisfy its source (D5).
+/// `rollout_exists` answers "does this thread id have a rollout here".
+/// `force_unmatched` (the AGENT_SYNC_FORCE_PATH_REMAP dev switch) skips the
+/// direct-path and git-origin resolutions so every source needs an explicit
+/// mapping — the picker flow can then run on the machine that pushed the
+/// profile. Saved mappings still resolve, so `Map` completes the loop.
 pub fn plan_apply(
     lock: &CodexSidebarLock,
     state: &serde_json::Value,
     path_exists: &dyn Fn(&str) -> bool,
     local_origin_of: &dyn Fn(&str) -> Option<String>,
     rollout_exists: &dyn Fn(&str) -> bool,
+    resolve_project: &dyn Fn(&str) -> Option<String>,
+    force_unmatched: bool,
 ) -> SidebarApplyPlan {
     let mut plan = SidebarApplyPlan::default();
     let local_paths = string_array(state.get(KEY_ROOTS));
@@ -477,17 +497,31 @@ pub fn plan_apply(
         if local_paths.contains(&project.path) {
             continue; // already listed
         }
-        if path_exists(&project.path) {
+        if !force_unmatched && path_exists(&project.path) {
             plan.add_projects.push(project.path.clone());
             continue;
         }
-        let origin_matched = project.git_origin.as_deref().is_some_and(|origin| {
-            local_paths
-                .iter()
-                .any(|local| local_origin_of(local).as_deref() == Some(origin))
-        });
+        if let Some(target) = resolve_project(&project.path) {
+            if path_exists(&target) {
+                if !local_paths.contains(&target) && !plan.add_projects.contains(&target) {
+                    plan.add_projects.push(target);
+                }
+                continue;
+            }
+            // Stale target: fall through so the project re-raises (or an
+            // origin match satisfies it) instead of silently resolving.
+        }
+        let origin_matched = !force_unmatched
+            && project.git_origin.as_deref().is_some_and(|origin| {
+                local_paths
+                    .iter()
+                    .any(|local| local_origin_of(local).as_deref() == Some(origin))
+            });
         if !origin_matched {
-            plan.unmatched.push(project.path.clone());
+            plan.unmatched.push(UnmatchedProject {
+                path: project.path.clone(),
+                git_origin: project.git_origin.clone(),
+            });
         }
     }
     let local_descriptions = state
@@ -582,6 +616,8 @@ pub fn plan_for_codex_dir(
     lock: &CodexSidebarLock,
     codex_dir: &Path,
     state: &serde_json::Value,
+    resolve_project: &dyn Fn(&str) -> Option<String>,
+    force_unmatched: bool,
 ) -> SidebarApplyPlan {
     let rollouts: Vec<String> = walkdir::WalkDir::new(codex_dir.join("sessions"))
         .follow_links(false)
@@ -594,22 +630,56 @@ pub fn plan_for_codex_dir(
     let path_exists = |path: &str| Path::new(path).is_dir();
     let local_origin_of = |path: &str| git_origin_of_dir(Path::new(path));
     let rollout_exists = |id: &str| rollouts.iter().any(|name| name.contains(id));
-    plan_apply(lock, state, &path_exists, &local_origin_of, &rollout_exists)
+    plan_apply(
+        lock,
+        state,
+        &path_exists,
+        &local_origin_of,
+        &rollout_exists,
+        resolve_project,
+        force_unmatched,
+    )
 }
 
-/// The pending-work summary for readiness: Some(detail) when the merged
-/// lock holds something not yet reflected in this machine's desktop state.
-pub fn pending_summary(lock_path: &Path, codex_dir: &Path) -> Option<String> {
+/// The full plan for readiness: None when the lock is absent/unreadable.
+pub fn pending_plan(
+    lock_path: &Path,
+    codex_dir: &Path,
+    resolve_project: &dyn Fn(&str) -> Option<String>,
+    force_unmatched: bool,
+) -> Option<SidebarApplyPlan> {
     let lock = read_lock(lock_path).ok()?;
     let state = read_global_state(codex_dir).unwrap_or_else(|_| serde_json::json!({}));
-    let plan = plan_for_codex_dir(&lock, codex_dir, &state);
+    Some(plan_for_codex_dir(
+        &lock,
+        codex_dir,
+        &state,
+        resolve_project,
+        force_unmatched,
+    ))
+}
+
+/// The pending-work summary: Some(detail) when the merged lock holds
+/// something not yet reflected in this machine's desktop state.
+pub fn pending_summary(
+    lock_path: &Path,
+    codex_dir: &Path,
+    resolve_project: &dyn Fn(&str) -> Option<String>,
+    force_unmatched: bool,
+) -> Option<String> {
+    let plan = pending_plan(lock_path, codex_dir, resolve_project, force_unmatched)?;
     (plan.has_changes() || !plan.unmatched.is_empty()).then(|| plan.summary())
 }
 
 /// Execute the additive apply against the desktop state file: backup, plan,
 /// mutate, temp-file + rename. The caller guards against a running desktop
 /// app; this stays pure file work.
-pub fn apply_from_lock(lock_path: &Path, codex_dir: &Path) -> Result<String, String> {
+pub fn apply_from_lock(
+    lock_path: &Path,
+    codex_dir: &Path,
+    resolve_project: &dyn Fn(&str) -> Option<String>,
+    force_unmatched: bool,
+) -> Result<String, String> {
     let lock = read_lock(lock_path)?;
     let state_path = codex_dir.join(GLOBAL_STATE_FILE);
     let mut state = if state_path.is_file() {
@@ -617,7 +687,7 @@ pub fn apply_from_lock(lock_path: &Path, codex_dir: &Path) -> Result<String, Str
     } else {
         serde_json::json!({})
     };
-    let plan = plan_for_codex_dir(&lock, codex_dir, &state);
+    let plan = plan_for_codex_dir(&lock, codex_dir, &state, resolve_project, force_unmatched);
     if !plan.has_changes() {
         return Ok(if plan.unmatched.is_empty() {
             "Sidebar state already reflected locally".to_string()
@@ -834,11 +904,26 @@ mod tests {
         let local_origin =
             |p: &str| (p == "/local/listed").then(|| "github.com/x/shared".to_string());
         let rollout = |id: &str| id == "t-here" || id == "t-local";
-        let plan = plan_apply(&lock, &state, &path_exists, &local_origin, &rollout);
+        let no_mapping = |_: &str| None;
+        let plan = plan_apply(
+            &lock,
+            &state,
+            &path_exists,
+            &local_origin,
+            &rollout,
+            &no_mapping,
+            false,
+        );
 
         assert_eq!(plan.add_projects, vec!["/exists/on-disk"]);
         // Origin matched an already-listed project: satisfied, not unmatched.
-        assert_eq!(plan.unmatched, vec!["/gone/nowhere"]);
+        assert_eq!(
+            plan.unmatched,
+            vec![UnmatchedProject {
+                path: "/gone/nowhere".into(),
+                git_origin: Some("github.com/x/gone".into()),
+            }]
+        );
         // Only the id with a local rollout and no local title lands.
         assert_eq!(plan.set_descriptions.len(), 1);
         assert_eq!(plan.set_descriptions["t-here"], "portable title");
@@ -868,8 +953,154 @@ mod tests {
         assert!(applied.get("electron-main-window-bounds").is_none());
 
         // Re-planning after the apply is a no-op.
-        let again = plan_apply(&lock, &applied, &path_exists, &local_origin, &rollout);
+        let again = plan_apply(
+            &lock,
+            &applied,
+            &path_exists,
+            &local_origin,
+            &rollout,
+            &no_mapping,
+            false,
+        );
         assert!(!again.has_changes(), "{:?}", again);
+    }
+
+    #[test]
+    fn manual_mapping_adds_target_never_source_and_stale_reraises() {
+        let lock = CodexSidebarLock {
+            schema: 1,
+            projects: vec![
+                SidebarProject {
+                    path: "/a/mapped".into(),
+                    git_origin: None,
+                },
+                SidebarProject {
+                    path: "/a/stale".into(),
+                    git_origin: Some("github.com/x/stale".into()),
+                },
+                // Source exists locally too: direct add wins over the mapping.
+                SidebarProject {
+                    path: "/a/also-here".into(),
+                    git_origin: None,
+                },
+                // Mapping target already listed: satisfied, nothing added.
+                SidebarProject {
+                    path: "/a/listed-target".into(),
+                    git_origin: None,
+                },
+            ],
+            ..CodexSidebarLock::default()
+        };
+        let state = serde_json::json!({
+            "electron-saved-workspace-roots": ["/b/already-listed"],
+        });
+        let path_exists =
+            |p: &str| p == "/b/mapped" || p == "/a/also-here" || p == "/b/already-listed";
+        let local_origin = |_: &str| None;
+        let rollout = |_: &str| false;
+        let resolve = |source: &str| match source {
+            "/a/mapped" => Some("/b/mapped".to_string()),
+            "/a/stale" => Some("/b/deleted".to_string()),
+            "/a/also-here" => Some("/b/mapped".to_string()),
+            "/a/listed-target" => Some("/b/already-listed".to_string()),
+            _ => None,
+        };
+        let plan = plan_apply(
+            &lock,
+            &state,
+            &path_exists,
+            &local_origin,
+            &rollout,
+            &resolve,
+            false,
+        );
+
+        // The mapped target is added exactly once; the foreign source and the
+        // already-listed target never appear.
+        assert_eq!(plan.add_projects, vec!["/b/mapped", "/a/also-here"]);
+        // The stale mapping re-raises its project instead of resolving (D5).
+        assert_eq!(
+            plan.unmatched,
+            vec![UnmatchedProject {
+                path: "/a/stale".into(),
+                git_origin: Some("github.com/x/stale".into()),
+            }]
+        );
+
+        let mut applied = state.clone();
+        apply_plan_to_state(&mut applied, &plan);
+        let roots: Vec<&str> = applied["electron-saved-workspace-roots"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert_eq!(
+            roots,
+            vec!["/b/already-listed", "/b/mapped", "/a/also-here"]
+        );
+    }
+
+    #[test]
+    fn force_unmatched_skips_direct_and_origin_but_honors_mappings() {
+        let lock = CodexSidebarLock {
+            schema: 1,
+            projects: vec![
+                // Exists on disk: normally a direct add, forced to unmatched.
+                SidebarProject {
+                    path: "/exists/on-disk".into(),
+                    git_origin: None,
+                },
+                // Origin matches a listed project: normally satisfied, forced.
+                SidebarProject {
+                    path: "/exists/origin-match".into(),
+                    git_origin: Some("github.com/x/shared".into()),
+                },
+                // Already listed locally: stays resolved even under force.
+                SidebarProject {
+                    path: "/local/listed".into(),
+                    git_origin: None,
+                },
+                // Mapped to an existing target: `Map` still completes the loop.
+                SidebarProject {
+                    path: "/exists/mapped".into(),
+                    git_origin: None,
+                },
+            ],
+            ..CodexSidebarLock::default()
+        };
+        let state = serde_json::json!({
+            "electron-saved-workspace-roots": ["/local/listed"],
+        });
+        let path_exists = |p: &str| p.starts_with("/exists/") || p == "/b/target";
+        let local_origin =
+            |p: &str| (p == "/local/listed").then(|| "github.com/x/shared".to_string());
+        let rollout = |_: &str| false;
+        let resolve = |source: &str| (source == "/exists/mapped").then(|| "/b/target".to_string());
+        let plan = plan_apply(
+            &lock,
+            &state,
+            &path_exists,
+            &local_origin,
+            &rollout,
+            &resolve,
+            true,
+        );
+
+        assert_eq!(plan.add_projects, vec!["/b/target"]);
+        assert_eq!(
+            plan.unmatched,
+            vec![
+                UnmatchedProject {
+                    path: "/exists/on-disk".into(),
+                    git_origin: None,
+                },
+                UnmatchedProject {
+                    path: "/exists/origin-match".into(),
+                    git_origin: Some("github.com/x/shared".into()),
+                },
+            ]
+        );
     }
 
     #[test]

@@ -33,6 +33,8 @@ type AppHandle = tauri::AppHandle<TauriRuntime>;
 mod codex_config;
 mod codex_plugins;
 mod codex_sidebar;
+mod project_paths;
+mod project_sync_v3;
 mod readiness;
 
 #[cfg(test)]
@@ -369,7 +371,11 @@ fn store_cloud_cache(app: &AppHandle, mut cache: CloudStateCache) {
     }
 }
 
-fn load_cloud_cache(app: &AppHandle, storage_id: &str, profile_id: &str) -> Option<CloudStateCache> {
+fn load_cloud_cache(
+    app: &AppHandle,
+    storage_id: &str,
+    profile_id: &str,
+) -> Option<CloudStateCache> {
     let slot = app.try_state::<CloudCacheSlot>()?;
     let mut guard = slot.0.lock().ok()?;
     let cache = guard.get_mut(&link_state_key(storage_id, profile_id))?;
@@ -403,10 +409,39 @@ fn process_is_running(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Test-only override: mapping/apply tests must not depend on whether the
+/// developer's machine happens to run the desktop app.
+#[cfg(test)]
+pub(crate) static TEST_CODEX_DESKTOP_RUNNING: AtomicBool = AtomicBool::new(false);
+
 /// The desktop bundle has shipped under both names. The current macOS app
 /// uses `ChatGPT` even though its bundle identifier is still com.openai.codex.
 fn codex_desktop_is_running() -> bool {
-    ["ChatGPT", "Codex"].into_iter().any(process_is_running)
+    #[cfg(test)]
+    {
+        TEST_CODEX_DESKTOP_RUNNING.load(Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        ["ChatGPT", "Codex"].into_iter().any(process_is_running)
+    }
+}
+
+#[cfg(test)]
+pub(crate) static TEST_CLAUDE_CLI_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Conservative guard for Claude alias mutation: any running `claude` CLI
+/// refuses the operation — per-profile process attribution is not reliable
+/// (PLAN_CLAUDE_PROJECT_PATH_REMAP.md §6).
+fn claude_cli_is_running() -> bool {
+    #[cfg(test)]
+    {
+        TEST_CLAUDE_CLI_RUNNING.load(Ordering::SeqCst)
+    }
+    #[cfg(not(test))]
+    {
+        process_is_running("claude")
+    }
 }
 
 /// Best-effort advisory: syncing while an agent is running can lose
@@ -1030,8 +1065,7 @@ fn write_machine_registry(roots: &Roots, config: &SyncConfig) {
         .local_profiles
         .iter()
         .filter_map(|profile| {
-            let mount =
-                Roots::for_profile_with_home(profile, roots.home.clone()).ok()?;
+            let mount = Roots::for_profile_with_home(profile, roots.home.clone()).ok()?;
             let links: Vec<serde_json::Value> = config
                 .links
                 .iter()
@@ -1058,10 +1092,18 @@ fn write_machine_registry(roots: &Roots, config: &SyncConfig) {
     // Best-effort: a failed registry write never blocks a sync.
     let _ = (|| -> Result<(), String> {
         let destination = dir.join("machine.json");
-        ensure_app_owned_path_has_no_symlinks(roots.agent_sync(), &destination, "machine registry")?;
+        ensure_app_owned_path_has_no_symlinks(
+            roots.agent_sync(),
+            &destination,
+            "machine registry",
+        )?;
         fs::create_dir_all(&dir)
             .map_err(|error| format!("create '{}': {}", dir.display(), error))?;
-        ensure_app_owned_path_has_no_symlinks(roots.agent_sync(), &destination, "machine registry")?;
+        ensure_app_owned_path_has_no_symlinks(
+            roots.agent_sync(),
+            &destination,
+            "machine registry",
+        )?;
         let mut tmp = tempfile::NamedTempFile::new_in(&dir)
             .map_err(|error| format!("create machine registry temp file: {}", error))?;
         tmp.as_file_mut()
@@ -1814,10 +1856,16 @@ fn validate_sync_config(config: &SyncConfig) -> Result<(), String> {
     let mut cells = HashSet::new();
     for link in &config.links {
         if !profile_ids.contains(&link.profile) {
-            return Err(format!("link references unknown profile '{}'", link.profile));
+            return Err(format!(
+                "link references unknown profile '{}'",
+                link.profile
+            ));
         }
         if !storage_ids.contains(&link.storage) {
-            return Err(format!("link references unknown storage '{}'", link.storage));
+            return Err(format!(
+                "link references unknown storage '{}'",
+                link.storage
+            ));
         }
         if !cells.insert((link.profile.clone(), link.storage.clone())) {
             return Err(format!(
@@ -2159,12 +2207,12 @@ fn checked_physical_sync_path(roots: &Roots, rel: &str) -> Result<PathBuf, Strin
             rel, roots.root
         ));
     }
-    let (physical_root, app_owned_root) =
-        if tail == "agent-sync" || tail.starts_with("agent-sync/") {
-            (roots.remap.clone(), true)
-        } else {
-            (roots.dir.clone(), false)
-        };
+    let (physical_root, app_owned_root) = if tail == "agent-sync" || tail.starts_with("agent-sync/")
+    {
+        (roots.remap.clone(), true)
+    } else {
+        (roots.dir.clone(), false)
+    };
     let destination = roots.abs(&rel);
     // Configured agent roots may intentionally be symlinks, but the remapped
     // app-owned namespace is not user-selected.
@@ -2550,9 +2598,7 @@ fn make_store(config: &StorageConfig, mount: Option<&Roots>) -> Result<Store, St
         if let Some(roots) = mount {
             let canonical_store = prospective_canonical_path(&root)?;
             let canonical_dir = prospective_canonical_path(&roots.dir)?;
-            if paths_overlap(&root, &roots.dir)
-                || paths_overlap(&canonical_store, &canonical_dir)
-            {
+            if paths_overlap(&root, &roots.dir) || paths_overlap(&canonical_store, &canonical_dir) {
                 return Err(format!(
                     "Local sync folder '{}' overlaps the config root '{}'",
                     root.display(),
@@ -3426,16 +3472,16 @@ async fn resolve_profile_for_link(
     }
     let discovered = discover_profiles(store).await?;
     let labels: HashSet<String> = discovered.iter().map(|p| p.label.clone()).collect();
-    let matching: Vec<ProfileInfo> = discovered
-        .into_iter()
-        .filter(|p| p.root == root)
-        .collect();
+    let matching: Vec<ProfileInfo> = discovered.into_iter().filter(|p| p.root == root).collect();
     let link = match matching.len() {
         0 => {
             emit_log(
                 app,
                 "info",
-                &format!("No cloud profile for {} in this storage — creating one", root),
+                &format!(
+                    "No cloud profile for {} in this storage — creating one",
+                    root
+                ),
             );
             let conditional = ensure_conditional_capability(app, store, storage).await?;
             create_profile_cloud(
@@ -4930,7 +4976,9 @@ async fn push_profile(
                 outcome.errors.len(),
                 detail
             );
-            if let Err(error) = save_baseline(app, local_id, &storage.id, &profile.profile_id, &baseline) {
+            if let Err(error) =
+                save_baseline(app, local_id, &storage.id, &profile.profile_id, &baseline)
+            {
                 message.push_str(&format!(
                     "; failed to save partial-apply baseline: {}",
                     error
@@ -5024,7 +5072,9 @@ async fn push_profile(
                 outcome.errors.len(),
                 detail
             );
-            if let Err(error) = save_baseline(app, local_id, &storage.id, &profile.profile_id, &baseline) {
+            if let Err(error) =
+                save_baseline(app, local_id, &storage.id, &profile.profile_id, &baseline)
+            {
                 message.push_str(&format!(
                     "; failed to save partial-apply baseline: {}",
                     error
@@ -5058,10 +5108,17 @@ async fn push_profile(
             // only the baseline needs to remember.
             store_cloud_cache(
                 app,
-                cache_from_manifest(&head, &cloud_manifest.files, &storage.id, &profile.profile_id),
+                cache_from_manifest(
+                    &head,
+                    &cloud_manifest.files,
+                    &storage.id,
+                    &profile.profile_id,
+                ),
             );
             baseline.last_push = now_secs();
-            if let Err(e) = save_baseline(app, local_id, &storage.id, &profile.profile_id, &baseline) {
+            if let Err(e) =
+                save_baseline(app, local_id, &storage.id, &profile.profile_id, &baseline)
+            {
                 emit_log(app, "error", &format!("Failed to save baseline: {}", e));
             }
             if !outcome.errors.is_empty() {
@@ -5311,12 +5368,19 @@ async fn push_profile(
                         .insert(rel.clone(), file_record(&roots.abs(rel), data));
                 }
                 baseline.last_push = now_secs();
-                if let Err(e) = save_baseline(app, local_id, &storage.id, &profile.profile_id, &baseline) {
+                if let Err(e) =
+                    save_baseline(app, local_id, &storage.id, &profile.profile_id, &baseline)
+                {
                     emit_log(app, "error", &format!("Failed to save baseline: {}", e));
                 }
                 store_cloud_cache(
                     app,
-                    cache_from_manifest(&new_head, &desired_files, &storage.id, &profile.profile_id),
+                    cache_from_manifest(
+                        &new_head,
+                        &desired_files,
+                        &storage.id,
+                        &profile.profile_id,
+                    ),
                 );
                 if !outcome.errors.is_empty() {
                     let msg = format!("{} sync operation(s) failed", outcome.errors.len());
@@ -5962,7 +6026,12 @@ async fn do_pull_link(
     let cloud_manifest = fetch_cloud_manifest(&store, &profile.profile_id, &head).await?;
     store_cloud_cache(
         app,
-        cache_from_manifest(&head, &cloud_manifest.files, &storage.id, &profile.profile_id),
+        cache_from_manifest(
+            &head,
+            &cloud_manifest.files,
+            &storage.id,
+            &profile.profile_id,
+        ),
     );
     emit_log(
         app,
@@ -6724,6 +6793,30 @@ fn local_state_path(roots: &Roots) -> Result<PathBuf, String> {
     Ok(path)
 }
 
+/// `~/.agent-sync/project-path-mappings.json` — the machine-local mapping
+/// file (PLAN_CODEX_MANUAL_PROJECT_PATH_PICKING.md D2). Top-level like
+/// `local-state.json`, outside every remap subtree, so it is structurally
+/// unsyncable.
+fn project_path_mappings_path(home: &Path) -> Result<PathBuf, String> {
+    let top = home.join(".agent-sync");
+    let path = top.join(project_paths::MAPPINGS_FILE);
+    ensure_app_owned_path_has_no_symlinks(top, &path, "project path mappings")?;
+    Ok(path)
+}
+
+/// Mapping resolver for one Codex profile's sidebar planning: the saved
+/// manual target for a captured source path, existence-unchecked (the
+/// planner validates the target and re-raises stale ones).
+fn codex_project_resolver(home: &Path, profile_id: &str) -> impl Fn(&str) -> Option<String> {
+    let mappings = project_path_mappings_path(home)
+        .and_then(|path| project_paths::load_mappings(&path))
+        .unwrap_or_default();
+    let profile_id = profile_id.to_string();
+    move |source: &str| {
+        project_paths::target_for(&mappings, &profile_id, "codex", source).map(str::to_string)
+    }
+}
+
 /// Everything one profile's readiness scan reads, resolved outside the
 /// blocking task. The "other" agent dir is a guaranteed-absent path so the
 /// shared scan skips that side entirely.
@@ -6737,6 +6830,33 @@ struct ProfileScanInput {
     codex_home: Option<PathBuf>,
 }
 
+/// The Finish-setup "treat folders as foreign" toggle. Session-only by
+/// design: a persisted simulation switch left on would silently keep every
+/// readiness scan lying about existing folders across restarts.
+static FORCE_PATH_REMAP_UI: AtomicBool = AtomicBool::new(false);
+
+/// Simulation switch: treat every synced source project path as foreign even
+/// when it exists locally, so the Finish-setup mapping flow can be exercised
+/// on one machine. On when either the UI toggle or the
+/// readiness::FORCE_PATH_REMAP_ENV boot-time override is set.
+fn force_path_remap() -> bool {
+    FORCE_PATH_REMAP_UI.load(Ordering::Relaxed)
+        || std::env::var_os(readiness::FORCE_PATH_REMAP_ENV).is_some()
+}
+
+#[tauri::command]
+async fn get_force_path_remap() -> Result<bool, String> {
+    Ok(force_path_remap())
+}
+
+/// Flip the session-only simulation toggle; returns the effective value
+/// (stays true if the env override is set).
+#[tauri::command]
+async fn set_force_path_remap(enabled: bool) -> Result<bool, String> {
+    FORCE_PATH_REMAP_UI.store(enabled, Ordering::Relaxed);
+    Ok(force_path_remap())
+}
+
 /// Read-only post-pull readiness scan (PLAN_PORTABLE_AGENT_SETUP_V2.md §5),
 /// per local profile: aggregate the plugin plans and parse this machine's
 /// synced files. Never installs, writes, or trusts anything — not even
@@ -6747,12 +6867,14 @@ async fn get_setup_readiness(app: AppHandle) -> Result<readiness::SetupReadiness
     let config = load_sync_config(&app).unwrap_or_default();
     let mut scans: Vec<ProfileScanInput> = Vec::new();
     let mut state_path: Option<PathBuf> = None;
+    let mut mappings_path: Option<PathBuf> = None;
     let mut none_dir: Option<PathBuf> = None;
     for profile in &config.local_profiles {
         let Ok(roots) = Roots::for_profile(profile) else {
             continue;
         };
         state_path.get_or_insert(local_state_path(&roots)?);
+        mappings_path.get_or_insert(project_path_mappings_path(&roots.home)?);
         // Never created; absolute so nothing resolves relative to the CWD.
         none_dir.get_or_insert(roots.agent_sync().join("__none__"));
         let is_codex = profile.root == ".codex";
@@ -6782,8 +6904,27 @@ async fn get_setup_readiness(app: AppHandle) -> Result<readiness::SetupReadiness
     };
     tauri::async_runtime::spawn_blocking(move || {
         let state = readiness::load_local_state(&state_path);
+        // A malformed mapping document is one actionable row, never silently
+        // an empty document — resolution would quietly re-raise every mapped
+        // project (PLAN_CLAUDE_PROJECT_PATH_REMAP.md §7).
+        let (mappings, mappings_error) = match mappings_path
+            .as_ref()
+            .map(|path| project_paths::load_mappings(path))
+        {
+            Some(Ok(doc)) => (doc, None),
+            Some(Err(error)) => (Default::default(), Some(error)),
+            None => (Default::default(), None),
+        };
         let resolve = |name: &str| codex_plugins::find_binary(name).is_ok();
-        let env_present = |name: &str| std::env::var_os(name).is_some();
+        // The scan asks for the force switch through env_present; answer with
+        // the effective value so the UI toggle counts, not just the env var.
+        let env_present = |name: &str| {
+            if name == readiness::FORCE_PATH_REMAP_ENV {
+                force_path_remap()
+            } else {
+                std::env::var_os(name).is_some()
+            }
+        };
         let mut issues = Vec::new();
         let mut roots_summary = Vec::new();
         for scan in &scans {
@@ -6797,10 +6938,57 @@ async fn get_setup_readiness(app: AppHandle) -> Result<readiness::SetupReadiness
             let claude_plan = (!is_codex)
                 .then(|| codex_plugins::plan_for_claude_lock(&scan.lock, &scan.dir).ok())
                 .flatten();
-            let sidebar_pending = scan
-                .sidebar_lock
+            // The sidebar plan splits in two: the aggregate apply issue for
+            // adds/titles/prefs, and one structured folder-picker candidate
+            // per unmatched project (PLAN_CODEX_MANUAL_PROJECT_PATH_PICKING.md).
+            let resolve_mapping = |source: &str| {
+                project_paths::target_for(&mappings, &scan.profile_id, "codex", source)
+                    .map(str::to_string)
+            };
+            let sidebar_plan = scan.sidebar_lock.as_ref().and_then(|lock| {
+                codex_sidebar::pending_plan(lock, &scan.dir, &resolve_mapping, force_path_remap())
+            });
+            let sidebar_pending = sidebar_plan
                 .as_ref()
-                .and_then(|lock| codex_sidebar::pending_summary(lock, &scan.dir));
+                .filter(|plan| plan.has_changes())
+                .map(|plan| plan.summary());
+            let path_candidates: Vec<readiness::ProjectPathCandidate> = sidebar_plan
+                .as_ref()
+                .map(|plan| plan.unmatched.as_slice())
+                .filter(|unmatched| !unmatched.is_empty())
+                .map(|unmatched| {
+                    // Rollouts are only read when something is unmatched.
+                    let threads = readiness::codex_threads_by_cwd(&scan.dir);
+                    unmatched
+                        .iter()
+                        .map(|project| {
+                            let mapped_path = resolve_mapping(&project.path);
+                            // An unmatched project with a saved mapping means
+                            // the target is gone (a valid one would resolve).
+                            let path_state = if mapped_path.is_some() {
+                                "missing_target"
+                            } else {
+                                "unmapped"
+                            };
+                            readiness::ProjectPathCandidate {
+                                provider: "codex".to_string(),
+                                source_key: project.path.clone(),
+                                source_path: project.path.clone(),
+                                git_origin: project.git_origin.clone(),
+                                mapped_path,
+                                affected_threads: threads
+                                    .get(&project.path)
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                path_state: Some(path_state.to_string()),
+                            }
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let claude_candidates = (!is_codex)
+                .then(|| readiness::claude_path_candidates(&scan.dir, &mappings, &scan.profile_id))
+                .unwrap_or_default();
             let mut profile_issues = readiness::scan(&readiness::ScanInput {
                 codex_dir: if is_codex { &scan.dir } else { &none_dir },
                 claude_dir: if is_codex { &none_dir } else { &scan.dir },
@@ -6811,6 +6999,9 @@ async fn get_setup_readiness(app: AppHandle) -> Result<readiness::SetupReadiness
                 resolve: &resolve,
                 env_present: &env_present,
                 sidebar_pending: sidebar_pending.as_deref(),
+                codex_path_candidates: &path_candidates,
+                claude_path_candidates: &claude_candidates,
+                mappings_error: (!is_codex).then_some(mappings_error.as_deref()).flatten(),
             });
             for issue in &mut profile_issues {
                 issue.id = format!("{}.{}", scan.profile_id, issue.id);
@@ -6870,9 +7061,7 @@ async fn mark_hook_reviewed(app: AppHandle, id: String) -> Result<(), String> {
         );
         if resolved.is_none() {
             if let Some(inner) = id.strip_prefix(&format!("{}.", profile.id)) {
-                if let Some(hash) =
-                    readiness::hook_hash_for_issue(&codex_dir, &claude_dir, inner)
-                {
+                if let Some(hash) = readiness::hook_hash_for_issue(&codex_dir, &claude_dir, inner) {
                     resolved = Some((hash, roots));
                 }
             }
@@ -7066,8 +7255,11 @@ async fn apply_sidebar_state(app: AppHandle, profile: String) -> Result<String, 
     }
     let lock_path = checked_physical_sync_path(&roots, codex_sidebar::LOCK_REL)?;
     let codex_dir = roots.dir.clone();
+    let home = roots.home.clone();
+    let profile_id = local.id.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        codex_sidebar::apply_from_lock(&lock_path, &codex_dir)
+        let resolve = codex_project_resolver(&home, &profile_id);
+        codex_sidebar::apply_from_lock(&lock_path, &codex_dir, &resolve, force_path_remap())
     })
     .await
     .map_err(|e| e.to_string())?;
@@ -7076,6 +7268,302 @@ async fn apply_sidebar_state(app: AppHandle, profile: String) -> Result<String, 
         Err(e) => emit_log(&app, "error", &format!("Sidebar apply failed: {}", e)),
     }
     result
+}
+
+/// Everything `map_project_path`/`repair_project_path_mapping` reports back
+/// — display-safe facts only, tagged by provider so the UI cannot confuse
+/// Codex sidebar state with Claude alias state
+/// (PLAN_CLAUDE_PROJECT_PATH_REMAP.md §9).
+#[derive(Serialize, Debug)]
+#[serde(tag = "provider", rename_all = "lowercase")]
+pub enum ProjectPathApplyReport {
+    /// D4: a saved mapping and the sidebar apply are separate outcomes, so a
+    /// running desktop app leaves the mapping saved with `sidebar_pending`.
+    Codex {
+        source_path: String,
+        target_path: String,
+        affected_thread_ids: Vec<String>,
+        sidebar_applied: bool,
+        sidebar_pending: bool,
+        resume_commands: Vec<String>,
+    },
+    Claude {
+        source_key: String,
+        source_path: String,
+        target_path: String,
+        affected_session_ids: Vec<String>,
+        alias_path: Option<String>,
+        state: String,
+    },
+}
+
+/// Save an explicit source → target project-path mapping
+/// (PLAN_CODEX_MANUAL_PROJECT_PATH_PICKING.md §5,
+/// PLAN_CLAUDE_PROJECT_PATH_REMAP.md §8.1). Codex applies the mapped sidebar
+/// state unless the desktop app is running; Claude materializes one relative
+/// alias symlink inside `projects/`. Neither rewrites transcripts, rollouts,
+/// databases, or any cloud object. `source_key` is the shared mapping
+/// identity — the Codex source path, or the Claude bucket basename.
+#[tauri::command]
+async fn map_project_path(
+    app: AppHandle,
+    profile: String,
+    provider: String,
+    source_key: String,
+    target_path: String,
+) -> Result<ProjectPathApplyReport, String> {
+    match provider.as_str() {
+        "codex" => map_codex_project_path(app, profile, source_key, target_path).await,
+        "claude" => map_claude_project_path(app, profile, source_key, target_path).await,
+        other => Err(format!("unknown provider '{}'", other)),
+    }
+}
+
+async fn map_codex_project_path(
+    app: AppHandle,
+    profile: String,
+    source_path: String,
+    target_path: String,
+) -> Result<ProjectPathApplyReport, String> {
+    let config = load_sync_config(&app).unwrap_or_default();
+    let (local, roots) = profile_roots(&config, &profile)?;
+    require_profile_kind(&local, ".codex")?;
+    // The frontend identifies a candidate; the synced lock decides what is
+    // real. An arbitrary source path cannot be invented.
+    let lock_path = checked_physical_sync_path(&roots, codex_sidebar::LOCK_REL)?;
+    let lock = codex_sidebar::read_lock(&lock_path)?;
+    if !lock.projects.iter().any(|p| p.path == source_path) {
+        return Err(format!(
+            "'{}' is not a project captured in this profile's sidebar lock",
+            source_path
+        ));
+    }
+    project_paths::validate_target_path(&target_path)?;
+    let mappings_path = project_path_mappings_path(&roots.home)?;
+    let mut mappings = project_paths::load_mappings(&mappings_path)?;
+    project_paths::upsert(
+        &mut mappings,
+        project_paths::ProjectPathMapping {
+            profile: local.id.clone(),
+            provider: "codex".to_string(),
+            source_key: source_path.clone(),
+            source_path: source_path.clone(),
+            target_path: target_path.clone(),
+        },
+    )?;
+    project_paths::save_mappings(&mappings_path, &mappings)?;
+
+    let affected_thread_ids = readiness::codex_threads_by_cwd(&roots.dir)
+        .remove(&source_path)
+        .unwrap_or_default();
+    let resume_commands = affected_thread_ids
+        .iter()
+        .map(|id| format!("codex resume {} -C {}", id, target_path))
+        .collect();
+    let mut sidebar_applied = false;
+    let mut sidebar_pending = false;
+
+    if codex_desktop_is_running() {
+        sidebar_pending = true;
+        emit_log(
+            &app,
+            "info",
+            &format!(
+                "Mapping saved: {} → {} — quit ChatGPT/Codex, then apply the sidebar from Finish setup",
+                source_path, target_path
+            ),
+        );
+        return Ok(ProjectPathApplyReport::Codex {
+            source_path,
+            target_path,
+            affected_thread_ids,
+            sidebar_applied,
+            sidebar_pending,
+            resume_commands,
+        });
+    }
+    let codex_dir = roots.dir.clone();
+    let home = roots.home.clone();
+    let profile_id = local.id.clone();
+    let apply = tauri::async_runtime::spawn_blocking(move || {
+        let resolve = codex_project_resolver(&home, &profile_id);
+        codex_sidebar::apply_from_lock(&lock_path, &codex_dir, &resolve, force_path_remap())
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    match apply {
+        Ok(summary) => {
+            sidebar_applied = true;
+            emit_log(
+                &app,
+                "ok",
+                &format!(
+                    "Project path mapped: {} → {} — {}",
+                    source_path, target_path, summary
+                ),
+            );
+        }
+        // D4: the mapping is already saved; a failed apply stays pending
+        // instead of making the user pick the folder again.
+        Err(e) => {
+            sidebar_pending = true;
+            emit_log(
+                &app,
+                "error",
+                &format!("Mapping saved, but sidebar apply failed: {}", e),
+            );
+        }
+    }
+    Ok(ProjectPathApplyReport::Codex {
+        source_path,
+        target_path,
+        affected_thread_ids,
+        sidebar_applied,
+        sidebar_pending,
+        resume_commands,
+    })
+}
+
+async fn map_claude_project_path(
+    app: AppHandle,
+    profile: String,
+    source_key: String,
+    target_path: String,
+) -> Result<ProjectPathApplyReport, String> {
+    let config = load_sync_config(&app).unwrap_or_default();
+    let (local, roots) = profile_roots(&config, &profile)?;
+    require_profile_kind(&local, ".claude")?;
+    if claude_cli_is_running() {
+        return Err(
+            "Claude Code is running — quit it before changing a project mapping".to_string(),
+        );
+    }
+
+    project_paths::validate_claude_source_key(&source_key)?;
+    project_paths::validate_target_path(&target_path)?;
+    let probe = readiness::probe_claude_projects(&roots.dir)
+        .into_iter()
+        .find(|probe| probe.source_key == source_key)
+        .ok_or_else(|| {
+            format!(
+                "'{}' is not a real Claude project bucket in this profile",
+                source_key
+            )
+        })?;
+    let source_path = probe
+        .cwd_candidates
+        .iter()
+        .find(|cwd| project_paths::encode_claude_project_path(cwd) == source_key)
+        .or_else(|| probe.cwd_candidates.first())
+        .cloned()
+        .unwrap_or_else(|| source_key.clone());
+
+    let mappings_path = project_path_mappings_path(&roots.home)?;
+    let previous = project_paths::load_mappings(&mappings_path)?;
+    let mut next = previous.clone();
+    let mapping = project_paths::ProjectPathMapping {
+        profile: local.id,
+        provider: "claude".to_string(),
+        source_key: source_key.clone(),
+        source_path: source_path.clone(),
+        target_path: target_path.clone(),
+    };
+    project_paths::upsert(&mut next, mapping.clone())?;
+
+    let projects_dir = roots.dir.join("projects");
+    let existing_state = project_paths::claude_alias_state(&projects_dir, &mapping);
+    if matches!(
+        existing_state,
+        project_paths::ClaudeAliasState::ConflictingDirectory
+            | project_paths::ClaudeAliasState::ConflictingSymlink
+            | project_paths::ClaudeAliasState::MissingSource
+            | project_paths::ClaudeAliasState::MissingTarget
+            | project_paths::ClaudeAliasState::PermissionDenied
+    ) {
+        return Err(format!(
+            "cannot create Claude project mapping: {}",
+            existing_state.as_str()
+        ));
+    }
+
+    project_paths::save_mappings(&mappings_path, &next)?;
+    let alias = match project_paths::create_claude_alias(&projects_dir, &mapping) {
+        Ok(alias) => alias,
+        Err(primary) => {
+            let rollback = project_paths::save_mappings(&mappings_path, &previous);
+            return match rollback {
+                Ok(()) => Err(primary),
+                Err(rollback) => Err(format!(
+                    "{}; mapping rollback failed: {}",
+                    primary, rollback
+                )),
+            };
+        }
+    };
+
+    let state = project_paths::claude_alias_state(&projects_dir, &mapping);
+    if !state.is_ready() {
+        let mut rollback_errors = Vec::new();
+        if let Err(error) = project_paths::remove_claude_alias(&projects_dir, &mapping) {
+            rollback_errors.push(error);
+        }
+        if let Err(error) = project_paths::save_mappings(&mappings_path, &previous) {
+            rollback_errors.push(format!("mapping rollback failed: {}", error));
+        }
+        let suffix = if rollback_errors.is_empty() {
+            String::new()
+        } else {
+            format!("; {}", rollback_errors.join("; "))
+        };
+        return Err(format!(
+            "Claude project alias verification failed: {}{}",
+            state.as_str(),
+            suffix
+        ));
+    }
+
+    emit_log(
+        &app,
+        "ok",
+        &format!(
+            "Claude project path mapped: {} → {}",
+            source_path, target_path
+        ),
+    );
+    Ok(ProjectPathApplyReport::Claude {
+        source_key,
+        source_path,
+        target_path,
+        affected_session_ids: probe.session_ids,
+        alias_path: alias.map(|path| path.to_string_lossy().to_string()),
+        state: state.as_str().to_string(),
+    })
+}
+
+/// Delete one machine-local mapping record. Never removes a project folder,
+/// task, sidebar entry, or cloud object — sidebar application is additive
+/// and past applies are not undone.
+#[tauri::command]
+async fn remove_project_path_mapping(
+    profile: String,
+    provider: String,
+    source_path: String,
+) -> Result<(), String> {
+    let home = dirs::home_dir().ok_or("Cannot find home directory")?;
+    let path = project_path_mappings_path(&home)?;
+    let mut mappings = project_paths::load_mappings(&path)?;
+    if !project_paths::remove(&mut mappings, &profile, &provider, &source_path) {
+        return Err(format!("no saved mapping for '{}'", source_path));
+    }
+    project_paths::save_mappings(&path, &mappings)
+}
+
+/// All saved project-path mappings, for the settings editor.
+#[tauri::command]
+async fn list_project_path_mappings() -> Result<Vec<project_paths::ProjectPathMapping>, String> {
+    let home = dirs::home_dir().ok_or("Cannot find home directory")?;
+    let path = project_path_mappings_path(&home)?;
+    Ok(project_paths::load_mappings(&path)?.mappings)
 }
 
 /// Reinstall missing Codex plugins from the synced lock through Codex's own
@@ -7105,7 +7593,11 @@ async fn repair_codex_plugins(
 /// installer — offering the CLI install first when it is missing.
 /// Explicit user action only.
 #[tauri::command]
-async fn setup_link(app: AppHandle, storage: String, profile: String) -> Result<SyncResult, String> {
+async fn setup_link(
+    app: AppHandle,
+    storage: String,
+    profile: String,
+) -> Result<SyncResult, String> {
     let config = load_sync_config(&app).unwrap_or_default();
     let (local, roots) = profile_roots(&config, &profile)?;
     let root = local.root.clone();
@@ -7188,7 +7680,10 @@ async fn setup_link(app: AppHandle, storage: String, profile: String) -> Result<
         }
 
         let sidebar_lock = checked_physical_sync_path(&roots, codex_sidebar::LOCK_REL)?;
-        if let Some(summary) = codex_sidebar::pending_summary(&sidebar_lock, &dir) {
+        let resolve = codex_project_resolver(&roots.home, &local.id);
+        if let Some(summary) =
+            codex_sidebar::pending_summary(&sidebar_lock, &dir, &resolve, force_path_remap())
+        {
             result.message = format!("{} · sidebar setup required", result.message);
             emit_log(
                 &app,
@@ -7509,7 +8004,7 @@ fn emit_progress(app: &AppHandle, done: usize, total: usize) {
     );
 }
 
-fn emit_log(app: &AppHandle, level: &str, message: &str) {
+pub(crate) fn emit_log<R: tauri::Runtime>(app: &tauri::AppHandle<R>, level: &str, message: &str) {
     let ts = std::time::SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -7562,10 +8057,10 @@ mod tests {
         ));
 
         let config = vec![
-                ".codex/.tmp".to_string(),
-                ".codex/plugins/cache".to_string(),
-                ".claude/plugins/installed_plugins.json".to_string(),
-            ];
+            ".codex/.tmp".to_string(),
+            ".codex/plugins/cache".to_string(),
+            ".claude/plugins/installed_plugins.json".to_string(),
+        ];
         assert!(!relative_path_is_included(
             ".codex/plugins/cache/plugin/file.json",
             &config
@@ -7695,7 +8190,8 @@ mod tests {
 
     #[test]
     fn old_configs_default_to_excluding_recreatable_paths() {
-        let storage: StorageConfig = serde_json::from_str("{\"id\":\"s1\",\"kind\":\"s3\"}").unwrap();
+        let storage: StorageConfig =
+            serde_json::from_str("{\"id\":\"s1\",\"kind\":\"s3\"}").unwrap();
         assert!(storage.included_default_exclusions.is_empty());
         assert!(!relative_path_is_included(
             ".codex/.local/bin/tool",
@@ -7721,9 +8217,9 @@ mod tests {
         ));
 
         let config = vec![
-                ".codex/state_5.sqlite*".to_string(),
-                ".codex/memories_1.sqlite*".to_string(),
-            ];
+            ".codex/state_5.sqlite*".to_string(),
+            ".codex/memories_1.sqlite*".to_string(),
+        ];
         assert!(relative_path_is_included(".codex/state_5.sqlite", &config));
         assert!(relative_path_is_included(
             ".codex/memories_1.sqlite",
@@ -7969,12 +8465,10 @@ enabled = true
         symlink(outside.path(), home.path().join(".agent-sync/codex")).unwrap();
         let lock_path = roots.abs(codex_plugins::LOCK_REL);
 
-        assert!(collect_upload_files(
-            &[lock_path.to_string_lossy().to_string()],
-            &roots,
-            &[],
-        )
-        .is_empty());
+        assert!(
+            collect_upload_files(&[lock_path.to_string_lossy().to_string()], &roots, &[],)
+                .is_empty()
+        );
         let error = apply_cloud_bytes(&roots, codex_plugins::LOCK_REL, b"cloud", 0)
             .unwrap_err()
             .to_string();
@@ -8152,13 +8646,13 @@ source = "owner/team"
     #[test]
     fn never_sync_paths_are_hard_denied_even_with_opt_ins() {
         let config = vec![
-                ".codex/auth.json".to_string(),
-                ".codex/.tmp".to_string(),
-                ".codex/plugins/cache".to_string(),
-                ".codex/.TMP".to_string(),
-                ".codex/Plugins/Cache".to_string(),
-                ".codex/memories/.GIT".to_string(),
-            ];
+            ".codex/auth.json".to_string(),
+            ".codex/.tmp".to_string(),
+            ".codex/plugins/cache".to_string(),
+            ".codex/.TMP".to_string(),
+            ".codex/Plugins/Cache".to_string(),
+            ".codex/memories/.GIT".to_string(),
+        ];
         assert!(!relative_path_is_included(".codex/auth.json", &config));
         assert!(!relative_path_is_included(
             ".codex/auth.json.bak-2026",
@@ -9093,10 +9587,10 @@ source = "owner/team"
         // Opt-ins add exactly the opted runtime database; SQLite sidecars and
         // hard-Never plugin manager trees stay excluded.
         let config = vec![
-                ".codex/state_5.sqlite*".to_string(),
-                ".codex/.tmp".to_string(),
-                ".codex/plugins/cache".to_string(),
-            ];
+            ".codex/state_5.sqlite*".to_string(),
+            ".codex/.tmp".to_string(),
+            ".codex/plugins/cache".to_string(),
+        ];
         let got = collect(&config);
         assert!(got.contains(".codex/state_5.sqlite"));
         assert!(!got.contains(".codex/state_5.sqlite-wal"));
@@ -9121,12 +9615,10 @@ source = "owner/team"
         fs::write(&outside_file, b"secret").unwrap();
         let direct_link = home.path().join(".codex/agents/direct.md");
         symlink(&outside_file, &direct_link).unwrap();
-        assert!(collect_upload_files(
-            &[direct_link.to_string_lossy().to_string()],
-            &mounts,
-            &[],
-        )
-        .is_empty());
+        assert!(
+            collect_upload_files(&[direct_link.to_string_lossy().to_string()], &mounts, &[],)
+                .is_empty()
+        );
 
         let outside_dir = outside.path().join("tree");
         fs::create_dir_all(&outside_dir).unwrap();
@@ -9134,19 +9626,14 @@ source = "owner/team"
         let ancestor_link = home.path().join(".codex/skills");
         symlink(&outside_dir, &ancestor_link).unwrap();
         assert!(build_tree(&ancestor_link, &mounts, &[], 0).is_none());
-        assert!(collect_upload_files(
-            &[ancestor_link.to_string_lossy().to_string()],
-            &mounts,
-            &[],
-        )
-        .is_empty());
+        assert!(
+            collect_upload_files(&[ancestor_link.to_string_lossy().to_string()], &mounts, &[],)
+                .is_empty()
+        );
         let nested = ancestor_link.join("nested.md");
-        assert!(collect_upload_files(
-            &[nested.to_string_lossy().to_string()],
-            &mounts,
-            &[],
-        )
-        .is_empty());
+        assert!(
+            collect_upload_files(&[nested.to_string_lossy().to_string()], &mounts, &[],).is_empty()
+        );
     }
 
     // ── Cloud-input hardening and back-compat ───────────────────────────
@@ -9291,13 +9778,11 @@ source = "owner/team"
         // so each local root acts as an independent replica of the profile.
         validate_sync_config(&SyncConfig {
             schema: CONFIG_SCHEMA_VERSION,
-            storages: vec![
-                StorageConfig {
-                    id: "s1".to_string(),
-                    kind: "s3".to_string(),
-                    ..Default::default()
-                },
-            ],
+            storages: vec![StorageConfig {
+                id: "s1".to_string(),
+                kind: "s3".to_string(),
+                ..Default::default()
+            }],
             local_profiles: vec![
                 LocalProfile {
                     id: "codex".to_string(),
@@ -9328,8 +9813,9 @@ source = "owner/team"
 
     #[test]
     fn unique_profile_label_suffixes_taken_names() {
-        let existing: HashSet<String> =
-            ["Claude".to_string(), "Claude 2".to_string()].into_iter().collect();
+        let existing: HashSet<String> = ["Claude".to_string(), "Claude 2".to_string()]
+            .into_iter()
+            .collect();
         assert_eq!(unique_profile_label("Codex", &existing), "Codex");
         assert_eq!(unique_profile_label("Claude", &existing), "Claude 3");
     }
@@ -9916,11 +10402,10 @@ source = "owner/team"
         .unwrap();
         assert_eq!(custom.remap, PathBuf::from("/h/.agent-sync/abc123"));
         // Ids are the record-dir name: enforce the same safe charset.
-        assert!(Roots::for_profile_with_home(
-            &profile_at("Bad.Id", ".codex", ""),
-            home.clone(),
-        )
-        .is_err());
+        assert!(
+            Roots::for_profile_with_home(&profile_at("Bad.Id", ".codex", ""), home.clone(),)
+                .is_err()
+        );
 
         assert_eq!(
             expand_home_relative_path("~/Desktop/project/myconf2", Path::new("/h")),
@@ -9937,16 +10422,12 @@ source = "owner/team"
 
         // Container semantics: a folder not named after the root hosts it
         // as a subdirectory, so one container can hold both roots …
-        let codex = Roots::for_profile_with_home(
-            &profile_at("codex", ".codex", "/x"),
-            home.clone(),
-        )
-        .unwrap();
-        let claude = Roots::for_profile_with_home(
-            &profile_at("claude", ".claude", "/x"),
-            home.clone(),
-        )
-        .unwrap();
+        let codex =
+            Roots::for_profile_with_home(&profile_at("codex", ".codex", "/x"), home.clone())
+                .unwrap();
+        let claude =
+            Roots::for_profile_with_home(&profile_at("claude", ".claude", "/x"), home.clone())
+                .unwrap();
         assert_eq!(codex.dir, PathBuf::from("/x/.codex"));
         assert_eq!(claude.dir, PathBuf::from("/x/.claude"));
 
@@ -9991,10 +10472,12 @@ source = "owner/team"
             local_dir: dir.to_string(),
             ..Default::default()
         };
-        assert!(make_store(&local_storage("/scratch/.codex/store"), Some(&roots))
-            .err()
-            .expect("must fail")
-            .contains("overlaps"));
+        assert!(
+            make_store(&local_storage("/scratch/.codex/store"), Some(&roots))
+                .err()
+                .expect("must fail")
+                .contains("overlaps")
+        );
         assert!(make_store(&local_storage("/scratch"), Some(&roots))
             .err()
             .expect("must fail")
@@ -10096,11 +10579,52 @@ fn commands_used_by_run() {
         get_claude_plugin_plan,
         repair_codex_plugins,
         apply_sidebar_state,
+        map_project_path,
+        remove_project_path_mapping,
+        list_project_path_mappings,
         get_setup_readiness,
+        get_force_path_remap,
+        set_force_path_remap,
         mark_hook_reviewed,
         dismiss_setup_issue,
         resolve_conflict_copy,
         setup_link,
+        project_sync_v3::commands::get_project_sync_config,
+        project_sync_v3::commands::save_project_sync_config,
+        project_sync_v3::commands::list_local_projects,
+        project_sync_v3::commands::get_project,
+        project_sync_v3::commands::get_local_project,
+        project_sync_v3::commands::register_local_project,
+        project_sync_v3::commands::remove_local_project,
+        project_sync_v3::commands::save_bundle_recipe,
+        project_sync_v3::commands::save_project_link,
+        project_sync_v3::commands::connect_project_to_remote_bundle,
+        project_sync_v3::commands::remove_project_link,
+        project_sync_v3::commands::list_provider_profiles,
+        project_sync_v3::commands::probe_provider_profile,
+        project_sync_v3::commands::create_provider_profile,
+        project_sync_v3::commands::rename_provider_profile,
+        project_sync_v3::commands::remove_provider_profile,
+        project_sync_v3::commands::list_project_bindings,
+        project_sync_v3::commands::get_project_binding,
+        project_sync_v3::commands::save_project_binding,
+        project_sync_v3::commands::remove_project_binding,
+        project_sync_v3::commands::list_project_materializations,
+        project_sync_v3::commands::get_restore_plan,
+        project_sync_v3::commands::discard_restore_plan,
+        project_sync_v3::commands::discover_project,
+        project_sync_v3::commands::get_bundle_inventory,
+        project_sync_v3::commands::list_remote_bundles,
+        project_sync_v3::commands::list_remote_bundle_snapshots,
+        project_sync_v3::commands::find_remote_bundle_matches,
+        project_sync_v3::commands::fetch_bundle,
+        project_sync_v3::commands::get_bundle_status,
+        project_sync_v3::commands::push_bundle,
+        project_sync_v3::commands::plan_bundle_restore,
+        project_sync_v3::commands::apply_bundle_restore,
+        project_sync_v3::commands::plan_dependencies,
+        project_sync_v3::commands::apply_dependency_actions,
+        project_sync_v3::commands::get_bundle_readiness,
         UploadControl::default,
     );
 }
@@ -10133,11 +10657,52 @@ pub fn run() {
             get_claude_plugin_plan,
             repair_codex_plugins,
             apply_sidebar_state,
+            map_project_path,
+            remove_project_path_mapping,
+            list_project_path_mappings,
             get_setup_readiness,
+            get_force_path_remap,
+            set_force_path_remap,
             mark_hook_reviewed,
             dismiss_setup_issue,
             resolve_conflict_copy,
             setup_link,
+            project_sync_v3::commands::get_project_sync_config,
+            project_sync_v3::commands::save_project_sync_config,
+            project_sync_v3::commands::list_local_projects,
+            project_sync_v3::commands::get_project,
+            project_sync_v3::commands::get_local_project,
+            project_sync_v3::commands::register_local_project,
+            project_sync_v3::commands::remove_local_project,
+            project_sync_v3::commands::save_bundle_recipe,
+            project_sync_v3::commands::save_project_link,
+            project_sync_v3::commands::connect_project_to_remote_bundle,
+            project_sync_v3::commands::remove_project_link,
+            project_sync_v3::commands::list_provider_profiles,
+            project_sync_v3::commands::probe_provider_profile,
+            project_sync_v3::commands::create_provider_profile,
+            project_sync_v3::commands::rename_provider_profile,
+            project_sync_v3::commands::remove_provider_profile,
+            project_sync_v3::commands::list_project_bindings,
+            project_sync_v3::commands::get_project_binding,
+            project_sync_v3::commands::save_project_binding,
+            project_sync_v3::commands::remove_project_binding,
+            project_sync_v3::commands::list_project_materializations,
+            project_sync_v3::commands::get_restore_plan,
+            project_sync_v3::commands::discard_restore_plan,
+            project_sync_v3::commands::discover_project,
+            project_sync_v3::commands::get_bundle_inventory,
+            project_sync_v3::commands::list_remote_bundles,
+            project_sync_v3::commands::list_remote_bundle_snapshots,
+            project_sync_v3::commands::find_remote_bundle_matches,
+            project_sync_v3::commands::fetch_bundle,
+            project_sync_v3::commands::get_bundle_status,
+            project_sync_v3::commands::push_bundle,
+            project_sync_v3::commands::plan_bundle_restore,
+            project_sync_v3::commands::apply_bundle_restore,
+            project_sync_v3::commands::plan_dependencies,
+            project_sync_v3::commands::apply_dependency_actions,
+            project_sync_v3::commands::get_bundle_readiness,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

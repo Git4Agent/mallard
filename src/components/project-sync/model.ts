@@ -1,0 +1,121 @@
+import type {
+  BundleRecipe,
+  BundleResourceStatus,
+  ProjectProvider,
+  ProjectResourceCategory,
+  ProjectResourceDescriptor,
+  ResourceInventory,
+  ResourceStatusReport,
+} from "../../types";
+import { userFacingRepoTerms } from "../../terminology";
+
+export const RESOURCE_GROUPS: Array<{
+  id: ProjectResourceCategory;
+  label: string;
+  description: string;
+}> = [
+  { id: "conversations", label: "Conversations", description: "Tasks, sessions, memory, and their filtered indexes" },
+  { id: "project_setup", label: "Project setup", description: "Instructions and provider-supported project configuration" },
+  { id: "skills", label: "Skills", description: "Project skills and selected standalone skills" },
+  { id: "plugins", label: "Plugins", description: "Portable install intent; payloads and caches never sync" },
+  { id: "tools", label: "Tools & hooks", description: "MCP servers, hooks, commands, and environment requirements" },
+];
+
+const CATEGORY_BY_KIND: Record<string, ProjectResourceCategory> = {
+  codex_conversation: "conversations",
+  claude_conversation: "conversations",
+  codex_task: "conversations",
+  claude_session: "conversations",
+  conversation: "conversations",
+  task: "conversations",
+  session: "conversations",
+  memory: "conversations",
+  project_memory: "conversations",
+  instruction: "project_setup",
+  instructions: "project_setup",
+  project_file: "project_setup",
+  project_config: "project_setup",
+  project_settings: "project_setup",
+  setting: "project_setup",
+  settings_patch: "project_setup",
+  agent: "project_setup",
+  command: "project_setup",
+  rule: "project_setup",
+  prompt: "project_setup",
+  skill: "skills",
+  project_skill: "skills",
+  standalone_skill: "skills",
+  plugin_skill: "skills",
+  plugin: "plugins",
+  mcp: "tools",
+  mcp_server: "tools",
+  hook: "tools",
+  tool: "tools",
+  requirement: "tools",
+};
+
+export function categoryFor(resource: ProjectResourceDescriptor): ProjectResourceCategory {
+  const explicit = resource.category;
+  if (explicit === "conversations" || explicit === "project_setup" || explicit === "skills" || explicit === "plugins" || explicit === "tools") {
+    return explicit;
+  }
+  return CATEGORY_BY_KIND[resource.kind.toLowerCase()] ?? "project_setup";
+}
+
+export function inventoryResources(inventory: ResourceInventory | null): ProjectResourceDescriptor[] {
+  return inventory?.resources ?? inventory?.candidates ?? [];
+}
+
+export function recipeSelection(recipe: BundleRecipe): Set<string> {
+  return new Set(Object.keys(recipe.entries));
+}
+
+export function recipeWithSelection(
+  recipe: BundleRecipe,
+  resources: ProjectResourceDescriptor[],
+  selected: Set<string>,
+): BundleRecipe {
+  return {
+    ...recipe,
+    entries: Object.fromEntries(resources
+      .filter((resource) => selected.has(resource.resource_id) && resource.apply_policy !== "never")
+      .map((resource) => [resource.resource_id, recipe.entries[resource.resource_id] ?? {
+        resource_id: resource.resource_id,
+        apply_policy: resource.apply_policy,
+        required: false,
+      }])),
+  };
+}
+
+export function statusMap(report: ResourceStatusReport | null): Map<string, string> {
+  if (!report) return new Map();
+  if (Array.isArray(report.statuses)) {
+    return new Map(report.statuses.map((status: BundleResourceStatus) => [status.resource_id, status.state]));
+  }
+  return new Map(Object.entries(report.statuses));
+}
+
+export function compactProjectPath(path?: string | null): string {
+  if (!path) return "Not mapped on this machine";
+  return path.replace(/^\/Users\/[^/]+/, "~");
+}
+
+export function providerLabel(provider?: ProjectProvider | null): string {
+  if (provider === "codex") return "Codex";
+  if (provider === "claude") return "Claude";
+  return "Shared";
+}
+
+export function formatRelativeTime(epoch?: number): string {
+  if (!epoch) return "Unknown";
+  const milliseconds = epoch > 10_000_000_000 ? epoch : epoch * 1000;
+  const delta = Date.now() - milliseconds;
+  if (delta < 60_000) return "just now";
+  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)}m ago`;
+  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)}h ago`;
+  return new Date(milliseconds).toLocaleDateString();
+}
+
+export function errorMessage(error: unknown): string {
+  return userFacingRepoTerms(error instanceof Error ? error.message : String(error));
+}

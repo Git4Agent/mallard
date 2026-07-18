@@ -5138,13 +5138,16 @@ mod tests {
     #[test]
     fn plan_for_lock_handles_missing_and_invalid_lock() {
         let dir = tempfile::tempdir().unwrap();
+        // Explicit codex_home: None falls back to $CODEX_HOME/$HOME, which the
+        // sync_tests harness swaps process-globally during parallel runs.
+        let home = Some(dir.path().to_path_buf());
         let missing = dir.path().join("nope.json");
-        let plan = plan_for_lock(&missing, None).unwrap();
+        let plan = plan_for_lock(&missing, home.clone()).unwrap();
         assert!(plan.blocked.is_none());
         assert!(plan.missing_plugins.is_empty() && plan.manual.is_empty());
         let bad = dir.path().join("bad.json");
         fs::write(&bad, "{broken").unwrap();
-        assert!(plan_for_lock(&bad, None).unwrap().blocked.is_some());
+        assert!(plan_for_lock(&bad, home).unwrap().blocked.is_some());
     }
 
     #[test]

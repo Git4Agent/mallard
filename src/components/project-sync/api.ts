@@ -1,0 +1,127 @@
+import { invoke } from "@tauri-apps/api/core";
+import type {
+  BundlePage,
+  BundleReadiness,
+  BundleRecipe,
+  BundleSnapshotSummary,
+  ConnectProjectBundleRequest,
+  DependencyPlan,
+  DependencyResult,
+  LocalProjectRegistration,
+  ProjectBinding,
+  ProjectDiscovery,
+  ProjectDetail,
+  ProjectOperationResult,
+  ProjectProvider,
+  ProjectStorageLink,
+  ProviderProfile,
+  ProviderProfileProbe,
+  ProviderProfileSummary,
+  RegisterLocalProjectRequest,
+  ResourceInventory,
+  ResourceStatusReport,
+  RestorePlan,
+  RestoreResult,
+  SaveProjectBindingRequest,
+  SaveProjectLinkRequest,
+  SyncConfigV3,
+} from "../../types";
+
+/**
+ * Schema-3 Tauri contract. Multi-word Rust parameters use Tauri's camel-case
+ * JavaScript names, matching the existing command surface in App.tsx.
+ */
+export const projectSyncApi = {
+  discoverProject: (path: string, profileIds: Partial<Record<ProjectProvider, string>>) =>
+    invoke<ProjectDiscovery>("discover_project", { path, profileIds }),
+
+  listProviderProfiles: () =>
+    invoke<ProviderProfileSummary[]>("list_provider_profiles"),
+
+  probeProviderProfile: (provider: ProjectProvider, path: string) =>
+    invoke<ProviderProfileProbe>("probe_provider_profile", { provider, path }),
+
+  createProviderProfile: (provider: ProjectProvider, displayName: string, path: string) =>
+    invoke<ProviderProfile>("create_provider_profile", { provider, displayName, path }),
+
+  renameProviderProfile: (profileId: string, displayName: string, expectedRevision: number) =>
+    invoke<ProviderProfile>("rename_provider_profile", { profileId, displayName, expectedRevision }),
+
+  removeProviderProfile: (profileId: string, expectedRevision: number) =>
+    invoke<boolean>("remove_provider_profile", { profileId, expectedRevision }),
+
+  listProjects: () =>
+    invoke<LocalProjectRegistration[]>("list_local_projects"),
+
+  getProject: (localProjectId: string) =>
+    invoke<ProjectDetail | null>("get_project", { localProjectId }),
+
+  registerProject: (request: RegisterLocalProjectRequest) =>
+    invoke<LocalProjectRegistration>("register_local_project", { request }),
+
+  removeProject: (localProjectId: string) =>
+    invoke<boolean>("remove_local_project", { localProjectId }),
+
+  getConfig: () =>
+    invoke<SyncConfigV3>("get_project_sync_config"),
+
+  saveConfig: (config: SyncConfigV3) =>
+    invoke<SyncConfigV3>("save_project_sync_config", { config }),
+
+  listRemoteBundles: (storageId: string, cursor?: string | null) =>
+    invoke<BundlePage>("list_remote_bundles", { storageId, cursor: cursor ?? null }),
+
+  listRemoteBundleSnapshots: (storageId: string) =>
+    invoke<BundleSnapshotSummary[]>("list_remote_bundle_snapshots", { storageId }),
+
+  findRemoteBundleMatches: (storageId: string, repositoryFingerprint: string) =>
+    invoke<BundleSnapshotSummary[]>("find_remote_bundle_matches", { storageId, repositoryFingerprint }),
+
+  fetchBundle: (storageId: string, bundleId: string) =>
+    invoke<BundleSnapshotSummary>("fetch_bundle", { storageId, bundleId }),
+
+  saveLink: (request: SaveProjectLinkRequest) =>
+    invoke<ProjectStorageLink>("save_project_link", { request }),
+
+  connectProjectToRemoteBundle: (request: ConnectProjectBundleRequest) =>
+    invoke<ProjectDetail>("connect_project_to_remote_bundle", { request }),
+
+  removeLink: (localProjectId: string, storageId: string) =>
+    invoke<boolean>("remove_project_link", { localProjectId, storageId }),
+
+  getInventory: (localProjectId: string) =>
+    invoke<ResourceInventory>("get_bundle_inventory", { localProjectId }),
+
+  saveRecipe: (localProjectId: string, recipe: BundleRecipe) =>
+    invoke<LocalProjectRegistration>("save_bundle_recipe", { localProjectId, recipe }),
+
+  getStatus: (localProjectId: string, storageId: string) =>
+    invoke<ResourceStatusReport>("get_bundle_status", { localProjectId, storageId }),
+
+  pushBundle: (localProjectId: string, storageId: string) =>
+    invoke<ProjectOperationResult>("push_bundle", { localProjectId, storageId }),
+
+  getBinding: (localProjectId: string) =>
+    invoke<ProjectBinding | null>("get_project_binding", { localProjectId }),
+
+  listBindings: () =>
+    invoke<ProjectBinding[]>("list_project_bindings"),
+
+  saveBinding: (request: SaveProjectBindingRequest) =>
+    invoke<ProjectBinding>("save_project_binding", { request }),
+
+  planRestore: (storageId: string, bundleId: string, binding: ProjectBinding) =>
+    invoke<RestorePlan>("plan_bundle_restore", { storageId, bundleId, binding }),
+
+  applyRestore: (planId: string, approvedActionIds: string[]) =>
+    invoke<RestoreResult>("apply_bundle_restore", { planId, approvedActionIds }),
+
+  planDependencies: (bundleId: string, binding: ProjectBinding) =>
+    invoke<DependencyPlan>("plan_dependencies", { bundleId, binding }),
+
+  applyDependencies: (planId: string, actionIds: string[]) =>
+    invoke<DependencyResult>("apply_dependency_actions", { planId, actionIds }),
+
+  getReadiness: (bundleId: string, binding: ProjectBinding) =>
+    invoke<BundleReadiness>("get_bundle_readiness", { bundleId, binding }),
+};

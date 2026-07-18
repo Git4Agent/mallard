@@ -2,14 +2,15 @@ import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import type { MouseEvent as ReactMouseEvent } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { confirm } from "@tauri-apps/plugin-dialog";
+import { confirm, open } from "@tauri-apps/plugin-dialog";
 import FilesWorkspace from "./components/FilesWorkspace";
 import SyncPanel from "./components/SyncPanel";
 import LogPanel from "./components/LogPanel";
 import FinishSetup from "./components/FinishSetup";
 import Icon from "./components/Icons";
+import ProjectSyncV3 from "./components/project-sync/ProjectSyncV3";
 import { profileLabel } from "./components/SyncPanel";
-import { AppTheme, CloudRootState, CodexPluginRepairReport, CodexPluginRestoreState, ConfigSource, FileEntry, FileStatusReport, PluginRepairReport, SetupIssue, SetupReadiness, SyncConfig, SyncStatus, SyncResult, LogLine, SyncProgress } from "./types";
+import { AppTheme, CloudRootState, CodexPluginRepairReport, CodexPluginRestoreState, ConfigSource, FileEntry, FileStatusReport, PluginRepairReport, ProjectPathApplyReport, ProjectPathMapping, SetupIssue, SetupReadiness, SyncConfig, SyncStatus, SyncResult, LogLine, SyncProgress } from "./types";
 import { applyTheme, getStoredTheme } from "./theme";
 import "./App.css";
 
@@ -113,9 +114,13 @@ function codexRepairStatus(state: CodexPluginRestoreState): Pick<SyncStatus, "st
   }
 }
 
-export default function App() {
-  const [theme, setTheme] = useState<AppTheme>(getStoredTheme);
-  useEffect(() => applyTheme(theme), [theme]);
+interface LegacyAppProps {
+  theme: AppTheme;
+  onThemeChange: (theme: AppTheme) => void;
+  onOpenProjects: () => void;
+}
+
+function LegacyApp({ theme, onThemeChange, onOpenProjects }: LegacyAppProps) {
 
   const [sources, setSources] = useState<ConfigSource[]>([]);
   const [loading, setLoading] = useState(true);
@@ -285,6 +290,9 @@ export default function App() {
   // Finish-setup badge. Advisory only — fail quietly (no config, no CLI).
   const [readiness, setReadiness] = useState<SetupReadiness | null>(null);
   const [showFinishSetup, setShowFinishSetup] = useState(false);
+  // Session-only simulation switch: readiness treats every source project
+  // path as foreign, so the mapping flow can be tried on one machine.
+  const [forceRemap, setForceRemap] = useState(false);
   const refreshReadiness = useCallback(async (): Promise<SetupReadiness | null> => {
     try {
       const next = await invoke<SetupReadiness>("get_setup_readiness");
@@ -296,14 +304,41 @@ export default function App() {
     }
   }, []);
 
+  // Machine-local project-path mappings (~/.agent-sync/project-path-mappings.json):
+  // created from Finish setup after a pull, managed in Settings.
+  const [projectPathMappings, setProjectPathMappings] = useState<ProjectPathMapping[]>([]);
+  const loadProjectPathMappings = useCallback(async () => {
+    try {
+      setProjectPathMappings(await invoke<ProjectPathMapping[]>("list_project_path_mappings"));
+    } catch {
+      setProjectPathMappings([]);
+    }
+  }, []);
+
+  const toggleForceRemap = useCallback(async (enabled: boolean) => {
+    try {
+      setForceRemap(await invoke<boolean>("set_force_path_remap", { enabled }));
+    } catch {
+      // command missing (stale backend) — leave the toggle as-is
+    }
+    await refreshReadiness();
+  }, [refreshReadiness]);
+
   useEffect(() => {
     (async () => {
       await refreshCloudState();
       await loadFiles();
       await loadConfig();
+      // The env override can preset the switch — reflect it, don't assume off.
+      try {
+        setForceRemap(await invoke<boolean>("get_force_path_remap"));
+      } catch {
+        // stale backend without the command
+      }
       await refreshReadiness();
+      await loadProjectPathMappings();
     })();
-  }, [loadFiles, loadConfig, refreshCloudState, refreshReadiness]);
+  }, [loadFiles, loadConfig, refreshCloudState, refreshReadiness, loadProjectPathMappings]);
 
   useEffect(() => {
     void refreshStatuses(activeProfileId, activeStorageId);
@@ -524,7 +559,12 @@ export default function App() {
         (issue) => issue.profile === profile
           && (issue.category === "plugins" || issue.action === "apply_sidebar_state"),
       );
-      if (root === ".codex" && (codexSetupIncomplete || codexFollowUp)) {
+      // Project paths need a human choice on any provider — surface them
+      // right after setup instead of hiding behind the footer badge.
+      const pathFollowUp = nextReadiness?.issues.some(
+        (issue) => issue.profile === profile && issue.action === "attach_project",
+      );
+      if (pathFollowUp || (root === ".codex" && (codexSetupIncomplete || codexFollowUp))) {
         setShowFinishSetup(true);
       }
     } catch (e) {
@@ -687,6 +727,64 @@ export default function App() {
     await refreshReadiness();
   };
 
+  // Save a source → target project-path mapping (machine-local, D2) and let
+  // the backend apply the mapped sidebar when the desktop app is closed.
+  const handleMapProjectPath = async (issue: SetupIssue, targetPath: string): Promise<ProjectPathApplyReport> => {
+    const candidate = issue.project_path;
+    if (!candidate) throw new Error("not a project-path issue");
+    const report = await invoke<ProjectPathApplyReport>("map_project_path", {
+      profile: issue.profile,
+      provider: candidate.provider,
+      sourceKey: candidate.source_key,
+      targetPath,
+    });
+    await refreshReadiness();
+    await loadProjectPathMappings();
+    return report;
+  };
+
+  // Settings: re-pick the folder for an existing mapping. Same backend
+  // command — the mapping record is replaced, never duplicated.
+  const handleChangeProjectPath = async (mapping: ProjectPathMapping) => {
+    const picked = await open({ directory: true, multiple: false });
+    if (typeof picked !== "string" || !picked) return;
+    try {
+      const report = await invoke<ProjectPathApplyReport>("map_project_path", {
+        profile: mapping.profile,
+        provider: mapping.provider,
+        sourceKey: mapping.source_key,
+        targetPath: picked,
+      });
+      if (report.provider === "codex" && report.sidebar_pending) {
+        appendLog({ level: "info", message: "Mapping saved — quit ChatGPT/Codex, then apply the sidebar from Finish setup" });
+      }
+    } catch (e) {
+      appendLog({ level: "error", message: String(e) });
+    }
+    await refreshReadiness();
+    await loadProjectPathMappings();
+  };
+
+  const handleRemoveProjectPath = async (mapping: ProjectPathMapping) => {
+    const confirmed = await confirm(
+      `Remove the mapping ${mapping.source_path} → ${mapping.target_path}?\n\n`
+      + "No project folder, task, or sidebar entry is deleted — only this Mac's saved path mapping.",
+      { title: "Remove mapping" },
+    );
+    if (!confirmed) return;
+    try {
+      await invoke("remove_project_path_mapping", {
+        profile: mapping.profile,
+        provider: mapping.provider,
+        sourcePath: mapping.source_path,
+      });
+    } catch (e) {
+      appendLog({ level: "error", message: String(e) });
+    }
+    await refreshReadiness();
+    await loadProjectPathMappings();
+  };
+
   const startSidebarResize = useCallback((event: ReactMouseEvent<HTMLDivElement>) => {
     if (event.button !== 0) return;
     event.preventDefault();
@@ -771,6 +869,14 @@ export default function App() {
             </div>
 
             <div className="sidebar-nav">
+              <button
+                className="sidebar-nav-item"
+                type="button"
+                onClick={onOpenProjects}
+              >
+                <Icon name="folder" size={15} />
+                <span>Projects</span>
+              </button>
               <button
                 className={`sidebar-nav-item${!showSyncPanel ? " active" : ""}`}
                 type="button"
@@ -956,8 +1062,9 @@ export default function App() {
               <SyncPanel
                 config={syncConfig}
                 theme={theme}
-                onThemeChange={setTheme}
+                onThemeChange={onThemeChange}
                 profileStats={profileStats}
+                onRefresh={handleFilesRefresh}
                 onSave={handleSaveSyncConfig}
                 focusProfile={settingsFocus?.kind === "profile" ? settingsFocus.id : null}
                 focusStorage={settingsFocus?.kind === "storage" ? settingsFocus.id : null}
@@ -970,6 +1077,9 @@ export default function App() {
                     ? handleRepairCodexPlugins(profile.id)
                     : handleRepairPlugins(profile.id)
                 }
+                projectPathMappings={projectPathMappings}
+                onChangeProjectPath={handleChangeProjectPath}
+                onRemoveProjectPath={handleRemoveProjectPath}
                 busy={busy}
                 setupBusy={settingUp}
                 onClose={() => {
@@ -1061,6 +1171,9 @@ export default function App() {
               onMarkReviewed={handleMarkReviewed}
               onResolveConflict={handleResolveConflict}
               onDismiss={handleDismissIssue}
+              onMapProjectPath={handleMapProjectPath}
+              forceRemap={forceRemap}
+              onToggleForceRemap={(enabled) => void toggleForceRemap(enabled)}
               onClose={() => setShowFinishSetup(false)}
             />
           )}
@@ -1069,5 +1182,26 @@ export default function App() {
         </div>
       </div>
     </div>
+  );
+}
+
+export default function App() {
+  const [theme, setTheme] = useState<AppTheme>(getStoredTheme);
+  const [mode, setMode] = useState<"projects" | "legacy">("projects");
+
+  useEffect(() => applyTheme(theme), [theme]);
+
+  return mode === "projects" ? (
+    <ProjectSyncV3
+      theme={theme}
+      onThemeChange={setTheme}
+      onOpenLegacy={() => setMode("legacy")}
+    />
+  ) : (
+    <LegacyApp
+      theme={theme}
+      onThemeChange={setTheme}
+      onOpenProjects={() => setMode("projects")}
+    />
   );
 }

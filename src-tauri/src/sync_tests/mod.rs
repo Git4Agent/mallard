@@ -163,11 +163,7 @@ async fn run_s2_a_push_b_pull_b_push_a_pull(cloud: TestCloud) {
     b.pull(&cloud).await.expect("B pull");
     assert_eq!(b.read(".codex/memories/notes.md"), "shared note v1\n");
     assert_eq!(b.read(".claude/CLAUDE.md"), "claude v1\n");
-    assert_eq!(
-        b.saved_links(&cloud).len(),
-        2,
-        "B auto-linked both roots"
-    );
+    assert_eq!(b.saved_links(&cloud).len(), 2, "B auto-linked both roots");
 
     // B edits one file, adds another, pushes.
     b.seed(".codex/memories/notes.md", "shared note v2 (from B)\n");
@@ -800,10 +796,7 @@ async fn save_sync_config_scopes_state_to_storage_identity() {
         .unwrap();
     let saved = m.saved_config();
     assert_eq!(saved.links.len(), 2);
-    assert!(saved
-        .links
-        .iter()
-        .all(|l| !l.cloud.profile_id.is_empty()));
+    assert!(saved.links.iter().all(|l| !l.cloud.profile_id.is_empty()));
     assert!(saved
         .storages
         .iter()
@@ -1491,9 +1484,10 @@ async fn statuses_under_custom_mounts() {
         .path(".codex/memories/notes.md")
         .to_string_lossy()
         .into_owned();
-    let report = crate::get_file_statuses(m.handle().clone(), "codex".to_string(), None, scan.clone())
-        .await
-        .unwrap();
+    let report =
+        crate::get_file_statuses(m.handle().clone(), "codex".to_string(), None, scan.clone())
+            .await
+            .unwrap();
     assert_eq!(
         report.statuses.get(&file).map(String::as_str),
         Some("synced")
@@ -1691,6 +1685,9 @@ async fn codex_plugin_source_conflict_is_visible_and_published_losslessly() {
         resolve: &yes,
         env_present: &yes,
         sidebar_pending: None,
+        codex_path_candidates: &[],
+        claude_path_candidates: &[],
+        mappings_error: None,
     });
     assert!(issues.iter().any(|issue| {
         issue.action == "resolve_conflict_copy"
@@ -1762,7 +1759,9 @@ async fn codex_plugin_source_conflict_is_visible_and_published_losslessly() {
     // Resolution remains durable even if this replica's app-data baseline is
     // reset while its agent root (and review copy) survives.
     let profile_id = cloud.profile_for_root(".codex");
-    let _ = std::fs::remove_file(crate::baseline_path(c.handle(), "codex", &cloud.storage_id, &profile_id).unwrap());
+    let _ = std::fs::remove_file(
+        crate::baseline_path(c.handle(), "codex", &cloud.storage_id, &profile_id).unwrap(),
+    );
     c.pull(&cloud)
         .await
         .expect("published resolution reaches unchanged replica");
@@ -2167,6 +2166,9 @@ async fn custom_agents_sync_and_readiness_flags_conflicts_and_hooks() {
         resolve: &yes,
         env_present: &yes,
         sidebar_pending: None,
+        codex_path_candidates: &[],
+        claude_path_candidates: &[],
+        mappings_error: None,
     });
     assert!(
         issues_b.iter().any(|i| i.action == "resolve_conflict_copy"),
@@ -2196,6 +2198,9 @@ async fn custom_agents_sync_and_readiness_flags_conflicts_and_hooks() {
         resolve: &yes,
         env_present: &yes,
         sidebar_pending: None,
+        codex_path_candidates: &[],
+        claude_path_candidates: &[],
+        mappings_error: None,
     });
     assert!(!issues_b.iter().any(|i| i.category == "hooks"));
     let issues_a = scan(&ScanInput {
@@ -2211,6 +2216,9 @@ async fn custom_agents_sync_and_readiness_flags_conflicts_and_hooks() {
         resolve: &yes,
         env_present: &yes,
         sidebar_pending: None,
+        codex_path_candidates: &[],
+        claude_path_candidates: &[],
+        mappings_error: None,
     });
     assert!(
         issues_a.iter().any(|i| i.category == "hooks"),
@@ -2575,7 +2583,8 @@ async fn run_sidebar_lock_converges_and_applies(cloud: TestCloud) {
         "{}\n",
     );
     let summary =
-        crate::codex_sidebar::apply_from_lock(&b.path(LOCK), &b.path(".codex")).expect("apply");
+        crate::codex_sidebar::apply_from_lock(&b.path(LOCK), &b.path(".codex"), &|_| None, false)
+            .expect("apply");
     assert!(summary.contains("project"), "{}", summary);
     let state: serde_json::Value =
         serde_json::from_str(&b.read(".codex/.codex-global-state.json")).unwrap();
@@ -2612,6 +2621,244 @@ async fn sidebar_lock_converges_and_applies() {
 async fn sidebar_lock_converges_and_applies_local() {
     let _env = harness::lock_env().await;
     run_sidebar_lock_converges_and_applies(TestCloud::start_local().await).await;
+}
+
+/// PLAN_CODEX_MANUAL_PROJECT_PATH_PICKING.md — the manual mapping story end
+/// to end: B pulls A's sidebar lock + rollouts for a project path that only
+/// exists on A, maps it to a local folder through the real command (source
+/// re-derived from the lock, target validated), the mapping persists at the
+/// top of `~/.agent-sync` and never enters a manifest, mapped sidebar apply
+/// adds the target and never the foreign source, and the report carries
+/// `codex resume <id> -C <target>` for every thread recorded under that cwd.
+async fn run_codex_project_path_mapping_flow(cloud: TestCloud) {
+    use std::sync::atomic::Ordering;
+
+    const LOCK: &str = ".codex/agent-sync/codex-sidebar.lock.json";
+    let a = Machine::new("pathmapA");
+    let b = Machine::new("pathmapB");
+
+    // Fabricated source path: machines share the host filesystem, so a real
+    // directory on "A" would path-match on "B" and defeat the scenario.
+    let source = "/pathmap-machine-a/repo".to_string();
+
+    a.seed(".codex/config.toml", "model = \"gpt\"\n");
+    a.seed(
+        LOCK,
+        &format!(
+            "{{\"schema\":1,\"projects\":[{{\"path\":\"{p}\"}}],\"project_order\":[\"{p}\"],\"thread_descriptions\":{{}},\"sidebar\":{{}}}}",
+            p = source
+        ),
+    );
+    let meta = |id: &str, cwd: &str| {
+        format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"cwd\":\"{}\"}}}}\n",
+            id, cwd
+        )
+    };
+    a.seed(
+        ".codex/sessions/2026/07/15/rollout-2026-07-15T10-00-00-019f-aaaa.jsonl",
+        &meta("019f-aaaa", &source),
+    );
+    a.seed(
+        ".codex/sessions/2026/07/15/rollout-2026-07-15T11-00-00-019f-bbbb.jsonl",
+        &meta("019f-bbbb", &source),
+    );
+    a.seed(
+        ".codex/sessions/2026/07/16/rollout-2026-07-16T09-00-00-019f-cccc.jsonl",
+        &meta("019f-cccc", "/somewhere/else"),
+    );
+    a.push(&cloud, &[".codex"]).await.expect("A push");
+
+    b.seed(".codex/config.toml", "model = \"gpt\"\n");
+    // B-only desktop state that every apply must preserve.
+    b.seed(
+        ".codex/.codex-global-state.json",
+        "{\"electron-saved-workspace-roots\":[\"/b/existing\"]}\n",
+    );
+    b.pull(&cloud).await.expect("B pull");
+
+    // One structured unmatched project before any mapping exists.
+    b.activate();
+    let plan =
+        crate::codex_sidebar::pending_plan(&b.path(LOCK), &b.path(".codex"), &|_| None, false)
+            .expect("plan");
+    assert_eq!(plan.unmatched.len(), 1, "{:?}", plan.unmatched);
+    assert_eq!(plan.unmatched[0].path, source);
+
+    let target_dir = b.home().join("repo-on-b");
+    std::fs::create_dir_all(&target_dir).unwrap();
+    let target = target_dir.to_string_lossy().to_string();
+
+    // The frontend cannot invent a source path — it must be in the lock...
+    let err = crate::map_project_path(
+        b.handle().clone(),
+        "codex".to_string(),
+        "codex".to_string(),
+        "/not/in/the/lock".to_string(),
+        target.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("not a project"), "{}", err);
+    // ...and the target must be an existing directory.
+    let err = crate::map_project_path(
+        b.handle().clone(),
+        "codex".to_string(),
+        "codex".to_string(),
+        source.clone(),
+        b.home().join("missing").to_string_lossy().to_string(),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("does not exist"), "{}", err);
+
+    // Desktop "running": the mapping saves, the apply stays pending, and the
+    // desktop state file is untouched (D4 — no second folder prompt later).
+    crate::TEST_CODEX_DESKTOP_RUNNING.store(true, Ordering::SeqCst);
+    let report = crate::map_project_path(
+        b.handle().clone(),
+        "codex".to_string(),
+        "codex".to_string(),
+        source.clone(),
+        target.clone(),
+    )
+    .await;
+    crate::TEST_CODEX_DESKTOP_RUNNING.store(false, Ordering::SeqCst);
+    let report = report.expect("map while desktop runs");
+    let crate::ProjectPathApplyReport::Codex {
+        affected_thread_ids,
+        sidebar_applied,
+        sidebar_pending,
+        resume_commands,
+        ..
+    } = report
+    else {
+        panic!("expected Codex mapping report")
+    };
+    assert!(sidebar_pending && !sidebar_applied);
+    assert_eq!(affected_thread_ids, vec!["019f-aaaa", "019f-bbbb"]);
+    assert_eq!(
+        resume_commands,
+        vec![
+            format!("codex resume 019f-aaaa -C {}", target),
+            format!("codex resume 019f-bbbb -C {}", target),
+        ]
+    );
+    let state: serde_json::Value =
+        serde_json::from_str(&b.read(".codex/.codex-global-state.json")).unwrap();
+    assert_eq!(
+        state["electron-saved-workspace-roots"],
+        serde_json::json!(["/b/existing"]),
+        "desktop state untouched while pending"
+    );
+
+    // The mapping lives at the top of ~/.agent-sync and never syncs.
+    let mappings_raw =
+        std::fs::read_to_string(b.home().join(".agent-sync/project-path-mappings.json")).unwrap();
+    assert!(mappings_raw.contains(&target));
+    b.push(&cloud, &[".codex"]).await.expect("B push");
+    assert!(
+        !cloud
+            .manifest(".codex")
+            .files
+            .keys()
+            .any(|key| key.contains("project-path-mappings")),
+        "mapping file must never enter a manifest"
+    );
+
+    // Desktop quit: the explicit apply adds the mapped target — never the
+    // foreign source — and preserves B-only entries.
+    let summary = crate::apply_sidebar_state(b.handle().clone(), "codex".to_string())
+        .await
+        .expect("apply");
+    assert!(summary.contains("project"), "{}", summary);
+    let state: serde_json::Value =
+        serde_json::from_str(&b.read(".codex/.codex-global-state.json")).unwrap();
+    let roots: Vec<&str> = state["electron-saved-workspace-roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(roots, vec!["/b/existing", target.as_str()]);
+
+    // Steady state: another pull reuses the saved mapping — nothing
+    // unmatched, nothing pending, no new folder prompt.
+    b.pull(&cloud).await.expect("B pull again");
+    b.activate();
+    let resolve = crate::codex_project_resolver(b.home(), "codex");
+    let plan =
+        crate::codex_sidebar::pending_plan(&b.path(LOCK), &b.path(".codex"), &resolve, false)
+            .expect("plan");
+    assert!(plan.unmatched.is_empty(), "{:?}", plan.unmatched);
+    assert!(!plan.has_changes(), "{:?}", plan);
+
+    // Changing the mapping with the desktop closed applies immediately and
+    // stays additive: the old target is never removed.
+    let target2_dir = b.home().join("repo-moved");
+    std::fs::create_dir_all(&target2_dir).unwrap();
+    let target2 = target2_dir.to_string_lossy().to_string();
+    let report = crate::map_project_path(
+        b.handle().clone(),
+        "codex".to_string(),
+        "codex".to_string(),
+        source.clone(),
+        target2.clone(),
+    )
+    .await
+    .expect("re-map");
+    let crate::ProjectPathApplyReport::Codex {
+        sidebar_applied,
+        sidebar_pending,
+        ..
+    } = report
+    else {
+        panic!("expected Codex mapping report")
+    };
+    assert!(sidebar_applied && !sidebar_pending);
+    let state: serde_json::Value =
+        serde_json::from_str(&b.read(".codex/.codex-global-state.json")).unwrap();
+    let roots: Vec<&str> = state["electron-saved-workspace-roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        roots,
+        vec!["/b/existing", target.as_str(), target2.as_str()]
+    );
+
+    // Removing the mapping deletes only the record; the sidebar keeps both
+    // targets and the source re-raises as unmatched on the next plan.
+    crate::remove_project_path_mapping("codex".to_string(), "codex".to_string(), source.clone())
+        .await
+        .expect("remove mapping");
+    let resolve = crate::codex_project_resolver(b.home(), "codex");
+    let plan =
+        crate::codex_sidebar::pending_plan(&b.path(LOCK), &b.path(".codex"), &resolve, false)
+            .expect("plan");
+    assert_eq!(plan.unmatched.len(), 1);
+    assert_eq!(plan.unmatched[0].path, source);
+    let state: serde_json::Value =
+        serde_json::from_str(&b.read(".codex/.codex-global-state.json")).unwrap();
+    assert_eq!(
+        state["electron-saved-workspace-roots"],
+        serde_json::json!(["/b/existing", target, target2]),
+        "removal never mutates the sidebar"
+    );
+}
+
+#[tokio::test]
+async fn codex_project_path_mapping_flow() {
+    let _env = harness::lock_env().await;
+    run_codex_project_path_mapping_flow(TestCloud::start().await).await;
+}
+
+#[tokio::test]
+async fn codex_project_path_mapping_flow_local() {
+    let _env = harness::lock_env().await;
+    run_codex_project_path_mapping_flow(TestCloud::start_local().await).await;
 }
 
 /// A cloud/baseline path remains in the reconcile domain even when WalkDir
@@ -2811,7 +3058,8 @@ async fn run_s23_unlink_drops_state_and_relink_reverifies(cloud: TestCloud) {
     m.push(&cloud, &[".codex"]).await.expect("push");
     let profile_id = cloud.profile_for_root(".codex");
     m.activate();
-    let baseline = crate::baseline_path(m.handle(), "codex", &cloud.storage_id, &profile_id).unwrap();
+    let baseline =
+        crate::baseline_path(m.handle(), "codex", &cloud.storage_id, &profile_id).unwrap();
     assert!(baseline.exists(), "push must persist a baseline");
 
     // Unlink the cell through the real settings save: the baseline drops;
@@ -2875,11 +3123,20 @@ async fn s23_unlink_drops_state_and_relink_reverifies_local() {
 async fn run_s24_matrix_two_storages_three_profiles(c1: TestCloud, c2: TestCloud) {
     let m = Machine::new("M");
     m.pin_cloud_prefix(".claude", "001/.claude");
-    m.add_profile("work", ".claude", m.home().join("myconf"), Some("001/.claude"));
+    m.add_profile(
+        "work",
+        ".claude",
+        m.home().join("myconf"),
+        Some("001/.claude"),
+    );
     m.seed(".codex/memories/notes.md", "codex notes v1\n");
     m.seed(".codex/auth.json", "{\"secret\":\"never\"}\n");
     m.seed(".claude/CLAUDE.md", "personal claude\n");
-    m.seed_profile("work", ".claude/CLAUDE.md", "work claude, different bytes\n");
+    m.seed_profile(
+        "work",
+        ".claude/CLAUDE.md",
+        "work claude, different bytes\n",
+    );
 
     // Four links: codex -> both storages, personal claude -> c1, work -> c2.
     m.push(&c1, &[".codex", ".claude"]).await.expect("push c1");
@@ -2894,10 +3151,11 @@ async fn run_s24_matrix_two_storages_three_profiles(c1: TestCloud, c2: TestCloud
     let codex2 = c2.profile_for_root(".codex");
     assert_eq!(c1.profiles_for_root(".claude"), vec!["001/.claude"]);
     assert_eq!(c2.profiles_for_root(".claude"), vec!["001/.claude"]);
-    let claude_sha =
-        |cloud: &TestCloud| cloud.manifest_of("001/.claude").files[".claude/CLAUDE.md"]
+    let claude_sha = |cloud: &TestCloud| {
+        cloud.manifest_of("001/.claude").files[".claude/CLAUDE.md"]
             .sha256
-            .clone();
+            .clone()
+    };
     assert_eq!(claude_sha(&c1), crate::sha256_bytes(b"personal claude\n"));
     assert_eq!(
         claude_sha(&c2),
@@ -2909,8 +3167,14 @@ async fn run_s24_matrix_two_storages_three_profiles(c1: TestCloud, c2: TestCloud
         c2.manifest_of(&codex2).files[".codex/memories/notes.md"].sha256
     );
     // ...and the Never tier held per link.
-    assert!(!c1.manifest_of(&codex1).files.contains_key(".codex/auth.json"));
-    assert!(!c2.manifest_of(&codex2).files.contains_key(".codex/auth.json"));
+    assert!(!c1
+        .manifest_of(&codex1)
+        .files
+        .contains_key(".codex/auth.json"));
+    assert!(!c2
+        .manifest_of(&codex2)
+        .files
+        .contains_key(".codex/auth.json"));
 
     // Per-link sync state: four baselines keyed (local profile, storage,
     // cloud profile) — in particular the same-named claude profiles have
@@ -2950,7 +3214,10 @@ async fn run_s24_matrix_two_storages_three_profiles(c1: TestCloud, c2: TestCloud
     )
     .await
     .unwrap();
-    assert_eq!(report.statuses.get(&file).map(String::as_str), Some("synced"));
+    assert_eq!(
+        report.statuses.get(&file).map(String::as_str),
+        Some("synced")
+    );
     let report = crate::get_file_statuses(
         m.handle().clone(),
         "codex".to_string(),
@@ -2975,7 +3242,10 @@ async fn run_s24_matrix_two_storages_three_profiles(c1: TestCloud, c2: TestCloud
         m.read_profile("work", ".claude/CLAUDE.md"),
         "work claude, different bytes\n"
     );
-    assert!(!m.list(".claude").iter().any(|p| p.contains("sync-conflict")));
+    assert!(!m
+        .list(".claude")
+        .iter()
+        .any(|p| p.contains("sync-conflict")));
     assert!(!m
         .list_profile("work", ".claude")
         .iter()
@@ -3000,8 +3270,14 @@ async fn run_s24_matrix_two_storages_three_profiles(c1: TestCloud, c2: TestCloud
     n.pin_cloud_prefix(".claude", "001/.claude");
     n.pull_root(&c2, ".claude").await.expect("N pull claude");
     n.pull_root(&c2, ".codex").await.expect("N pull codex");
-    assert_eq!(n.read(".claude/CLAUDE.md"), "work claude, different bytes\n");
-    assert_eq!(n.read(".codex/memories/notes.md"), "codex notes v2, now longer\n");
+    assert_eq!(
+        n.read(".claude/CLAUDE.md"),
+        "work claude, different bytes\n"
+    );
+    assert_eq!(
+        n.read(".codex/memories/notes.md"),
+        "codex notes v2, now longer\n"
+    );
 }
 
 #[tokio::test]
@@ -3094,8 +3370,11 @@ async fn run_s25_storage_and_profile_removal_cleanups(c1: TestCloud, c2: TestClo
 #[tokio::test]
 async fn s25_storage_and_profile_removal_cleanups() {
     let _env = harness::lock_env().await;
-    run_s25_storage_and_profile_removal_cleanups(TestCloud::start().await, TestCloud::start().await)
-        .await;
+    run_s25_storage_and_profile_removal_cleanups(
+        TestCloud::start().await,
+        TestCloud::start().await,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -3119,7 +3398,12 @@ async fn run_s26_two_local_roots_share_one_cloud_profile(cloud: TestCloud) {
     let profile_id = cloud.profile_for_root(".claude");
 
     // Second root, same machine, pinned to the SAME cloud profile.
-    m.add_profile("conf4", ".claude", m.home().join("myconf4"), Some(&profile_id));
+    m.add_profile(
+        "conf4",
+        ".claude",
+        m.home().join("myconf4"),
+        Some(&profile_id),
+    );
     m.pull_profile(&cloud, "conf4").await.expect("pull conf4");
     assert_eq!(m.read_profile("conf4", ".claude/CLAUDE.md"), "v1\n");
     assert_eq!(
@@ -3153,13 +3437,18 @@ async fn run_s26_two_local_roots_share_one_cloud_profile(cloud: TestCloud) {
         Some(crate::sha256_bytes(b"v2, longer than before\n")),
         "stale sibling must never clobber the newer generation"
     );
-    assert_eq!(m.read_profile("conf4", ".claude/CLAUDE.md"), "v2, longer than before\n");
+    assert_eq!(
+        m.read_profile("conf4", ".claude/CLAUDE.md"),
+        "v2, longer than before\n"
+    );
 
     // Divergent edits still go through the normal conflict machinery: both
     // sides survive (union), nothing is silently lost.
     m.seed(".claude/CLAUDE.md", "default edit\n");
     m.seed_profile("conf4", ".claude/CLAUDE.md", "conf4 edit\n");
-    m.push(&cloud, &[".claude"]).await.expect("push default edit");
+    m.push(&cloud, &[".claude"])
+        .await
+        .expect("push default edit");
     m.push_profile(&cloud, "conf4", &[".claude"])
         .await
         .expect("push conf4 edit");
@@ -3222,12 +3511,21 @@ async fn run_s27_shared_profile_relay_convergence(cloud: TestCloud) {
     m.pull_root(&cloud, ".claude").await.expect("A pull v3");
     m.pull_profile(&cloud, "conf4").await.expect("B pull v3");
     assert_eq!(m.read(".claude/CLAUDE.md"), "v3 from machine N\n");
-    assert_eq!(m.read_profile("conf4", ".claude/CLAUDE.md"), "v3 from machine N\n");
+    assert_eq!(
+        m.read_profile("conf4", ".claude/CLAUDE.md"),
+        "v3 from machine N\n"
+    );
 
     // Sequential edits: one profile, linear history, zero conflict copies.
     assert_eq!(cloud.profiles_for_root(".claude"), vec![p.clone()]);
-    assert!(m.list(".claude").iter().all(|r| !r.contains("sync-conflict")));
-    assert!(m.list_profile("conf4", ".claude").iter().all(|r| !r.contains("sync-conflict")));
+    assert!(m
+        .list(".claude")
+        .iter()
+        .all(|r| !r.contains("sync-conflict")));
+    assert!(m
+        .list_profile("conf4", ".claude")
+        .iter()
+        .all(|r| !r.contains("sync-conflict")));
 
     // Per-link state: two distinct baselines on M, both live.
     m.activate();
@@ -3270,9 +3568,10 @@ async fn run_s28_per_link_statuses_shared_cache(cloud: TestCloud) {
         let storage = cloud.storage_id.clone();
         let handle = m.handle().clone();
         async move {
-            let report = crate::get_file_statuses(handle, profile, Some(storage), vec![file.clone()])
-                .await
-                .unwrap();
+            let report =
+                crate::get_file_statuses(handle, profile, Some(storage), vec![file.clone()])
+                    .await
+                    .unwrap();
             report.statuses.get(&file).cloned()
         }
     };
@@ -3281,12 +3580,21 @@ async fn run_s28_per_link_statuses_shared_cache(cloud: TestCloud) {
         .profile_path("conf4", ".claude/CLAUDE.md")
         .to_string_lossy()
         .into_owned();
-    assert_eq!(status_of("claude", &file_a).await.as_deref(), Some("synced"));
-    assert_eq!(status_of("conf4", &file_b).await.as_deref(), Some("cloud-ahead"));
+    assert_eq!(
+        status_of("claude", &file_a).await.as_deref(),
+        Some("synced")
+    );
+    assert_eq!(
+        status_of("conf4", &file_b).await.as_deref(),
+        Some("cloud-ahead")
+    );
 
     m.pull_profile(&cloud, "conf4").await.expect("B pull v2");
     assert_eq!(status_of("conf4", &file_b).await.as_deref(), Some("synced"));
-    assert_eq!(m.read_profile("conf4", ".claude/CLAUDE.md"), "v2, longer than before\n");
+    assert_eq!(
+        m.read_profile("conf4", ".claude/CLAUDE.md"),
+        "v2, longer than before\n"
+    );
 }
 
 #[tokio::test]
@@ -3321,14 +3629,19 @@ async fn run_s29_conflict_resolution_reaches_sibling(cloud: TestCloud) {
         .expect("B push edit");
     m.pull_root(&cloud, ".claude").await.expect("A pull union");
     m.pull_profile(&cloud, "conf4").await.expect("B pull union");
-    assert_eq!(m.read(".claude/CLAUDE.md"), m.read_profile("conf4", ".claude/CLAUDE.md"));
+    assert_eq!(
+        m.read(".claude/CLAUDE.md"),
+        m.read_profile("conf4", ".claude/CLAUDE.md")
+    );
     let sibling = m
         .list_profile("conf4", ".claude")
         .into_iter()
         .find(|rel| rel.contains("sync-conflict"))
         .expect("conflict sibling must exist on B");
     assert!(
-        m.list(".claude").iter().any(|rel| rel.contains("sync-conflict")),
+        m.list(".claude")
+            .iter()
+            .any(|rel| rel.contains("sync-conflict")),
         "conflict sibling must exist on A too"
     );
 
@@ -3344,12 +3657,19 @@ async fn run_s29_conflict_resolution_reaches_sibling(cloud: TestCloud) {
     assert!(!m.profile_path("conf4", &sibling).exists());
 
     // A pulls: the published resolution removes A's unchanged review copy.
-    m.pull_root(&cloud, ".claude").await.expect("A pull resolution");
+    m.pull_root(&cloud, ".claude")
+        .await
+        .expect("A pull resolution");
     assert!(
-        m.list(".claude").iter().all(|rel| !rel.contains("sync-conflict")),
+        m.list(".claude")
+            .iter()
+            .all(|rel| !rel.contains("sync-conflict")),
         "resolution must reach the sibling root"
     );
-    assert_eq!(m.read(".claude/CLAUDE.md"), m.read_profile("conf4", ".claude/CLAUDE.md"));
+    assert_eq!(
+        m.read(".claude/CLAUDE.md"),
+        m.read_profile("conf4", ".claude/CLAUDE.md")
+    );
 }
 
 #[tokio::test]
@@ -3371,20 +3691,35 @@ async fn s29_conflict_resolution_reaches_sibling_local() {
 async fn run_s30_pick_existing_profile_among_several(cloud: TestCloud) {
     let m = Machine::new("M");
     m.seed(".claude/CLAUDE.md", "real content\n");
-    m.seed(".claude/agent-sync/claude-plugins.lock.json", "{\"schema\":1}\n");
+    m.seed(
+        ".claude/agent-sync/claude-plugins.lock.json",
+        "{\"schema\":1}\n",
+    );
     m.push(&cloud, &[".claude"]).await.expect("seed P1");
     let p1 = cloud.profile_for_root(".claude");
 
     // The old bug's leftover shape: a second, empty profile.
-    m.add_profile("junk", ".claude", m.home().join("junk"), Some("claude-empty"));
-    m.pull_profile(&cloud, "junk").await.expect("materialize empty profile");
+    m.add_profile(
+        "junk",
+        ".claude",
+        m.home().join("junk"),
+        Some("claude-empty"),
+    );
+    m.pull_profile(&cloud, "junk")
+        .await
+        .expect("materialize empty profile");
     assert_eq!(cloud.profiles_for_root(".claude").len(), 2);
 
     // Fresh root picks P1 explicitly — exactly what the picker persists.
     m.add_profile("conf4", ".claude", m.home().join("myconf4"), None);
     m.pick_cloud_profile(&cloud, "conf4", &p1, "Claude");
-    m.pull_profile(&cloud, "conf4").await.expect("pull the picked profile");
-    assert_eq!(m.read_profile("conf4", ".claude/CLAUDE.md"), "real content\n");
+    m.pull_profile(&cloud, "conf4")
+        .await
+        .expect("pull the picked profile");
+    assert_eq!(
+        m.read_profile("conf4", ".claude/CLAUDE.md"),
+        "real content\n"
+    );
     assert!(
         m.profile_path("conf4", ".claude/agent-sync/claude-plugins.lock.json")
             .exists(),
@@ -3427,7 +3762,9 @@ async fn run_s31_auto_link_single_candidate_only(cloud: TestCloud) {
     let p1 = cloud.profile_for_root(".claude");
 
     m.add_profile("auto1", ".claude", m.home().join("auto1"), None);
-    m.pull_profile(&cloud, "auto1").await.expect("auto links the only profile");
+    m.pull_profile(&cloud, "auto1")
+        .await
+        .expect("auto links the only profile");
     assert_eq!(m.read_profile("auto1", ".claude/CLAUDE.md"), "v1\n");
     assert_eq!(cloud.profiles_for_root(".claude"), vec![p1.clone()]);
     let link = m
@@ -3441,12 +3778,27 @@ async fn run_s31_auto_link_single_candidate_only(cloud: TestCloud) {
     assert!(!link.pinned, "auto-discovered links stay unpinned");
 
     // A second candidate turns auto ambiguous: loud error, no side effects.
-    m.add_profile("junk", ".claude", m.home().join("junk"), Some("claude-empty"));
-    m.pull_profile(&cloud, "junk").await.expect("materialize second profile");
+    m.add_profile(
+        "junk",
+        ".claude",
+        m.home().join("junk"),
+        Some("claude-empty"),
+    );
+    m.pull_profile(&cloud, "junk")
+        .await
+        .expect("materialize second profile");
     m.add_profile("auto2", ".claude", m.home().join("auto2"), None);
     let err = m.pull_profile(&cloud, "auto2").await.unwrap_err();
-    assert!(err.contains("pin one explicitly"), "unexpected error: {}", err);
-    assert_eq!(cloud.profiles_for_root(".claude").len(), 2, "nothing created");
+    assert!(
+        err.contains("pin one explicitly"),
+        "unexpected error: {}",
+        err
+    );
+    assert_eq!(
+        cloud.profiles_for_root(".claude").len(),
+        2,
+        "nothing created"
+    );
 }
 
 #[tokio::test]
@@ -3483,15 +3835,21 @@ async fn run_s32_create_new_alongside_existing(cloud: TestCloud) {
     let mut expected = vec![p1.clone(), "ab12cd34".to_string()];
     expected.sort();
     assert_eq!(ids, expected);
-    assert_eq!(cloud.head_of(&p1).unwrap().generation, gen_p1, "P1 untouched");
+    assert_eq!(
+        cloud.head_of(&p1).unwrap().generation,
+        gen_p1,
+        "P1 untouched"
+    );
     assert_eq!(
         cloud.manifest_of("ab12cd34").files[".claude/CLAUDE.md"].sha256,
         crate::sha256_bytes(b"brand new profile\n")
     );
     m.activate();
-    assert!(crate::baseline_path(m.handle(), "confd", &cloud.storage_id, "ab12cd34")
-        .unwrap()
-        .exists());
+    assert!(
+        crate::baseline_path(m.handle(), "confd", &cloud.storage_id, "ab12cd34")
+            .unwrap()
+            .exists()
+    );
 
     let infos = crate::list_sync_profiles(m.handle().clone(), cloud.storage_id.clone())
         .await
@@ -3531,7 +3889,9 @@ async fn run_s33_repick_resets_link_state(cloud: TestCloud) {
     let p1 = cloud.profile_for_root(".claude");
     m.add_profile("other", ".claude", m.home().join("other"), Some("claude-2"));
     m.seed_profile("other", ".claude/settings.json", "{\"p2\":true}\n");
-    m.push_profile(&cloud, "other", &[".claude"]).await.expect("push P2");
+    m.push_profile(&cloud, "other", &[".claude"])
+        .await
+        .expect("push P2");
 
     // The sibling that must stay unaffected.
     m.add_profile("conf4", ".claude", m.home().join("myconf4"), Some(&p1));
@@ -3559,27 +3919,45 @@ async fn run_s33_repick_resets_link_state(cloud: TestCloud) {
         };
         config
     };
-    crate::save_sync_config(m.handle().clone(), repick(m.saved_config(), "claude-2".to_string()))
-        .await
-        .unwrap();
-    assert!(!baseline("claude", &p1).exists(), "re-pick must drop the old baseline");
-    assert!(baseline("conf4", &p1).exists(), "sibling baseline untouched");
+    crate::save_sync_config(
+        m.handle().clone(),
+        repick(m.saved_config(), "claude-2".to_string()),
+    )
+    .await
+    .unwrap();
+    assert!(
+        !baseline("claude", &p1).exists(),
+        "re-pick must drop the old baseline"
+    );
+    assert!(
+        baseline("conf4", &p1).exists(),
+        "sibling baseline untouched"
+    );
 
     // Re-verify against P2: its file lands, local extras stay, no conflicts.
     m.pull_root(&cloud, ".claude").await.expect("pull P2");
     assert_eq!(m.read(".claude/settings.json"), "{\"p2\":true}\n");
     assert_eq!(m.read(".claude/CLAUDE.md"), "p1 content\n");
-    assert!(m.list(".claude").iter().all(|r| !r.contains("sync-conflict")));
+    assert!(m
+        .list(".claude")
+        .iter()
+        .all(|r| !r.contains("sync-conflict")));
 
     // Pick back to P1: the old baseline is gone, so this starts clean too.
     crate::save_sync_config(m.handle().clone(), repick(m.saved_config(), p1.clone()))
         .await
         .unwrap();
-    assert!(!baseline("claude", "claude-2").exists(), "P2 baseline dropped too");
+    assert!(
+        !baseline("claude", "claude-2").exists(),
+        "P2 baseline dropped too"
+    );
     m.pull_root(&cloud, ".claude").await.expect("pull P1 again");
     assert_eq!(m.read(".claude/CLAUDE.md"), "p1 content\n");
     assert_eq!(m.read(".claude/settings.json"), "{\"p2\":true}\n");
-    assert!(m.list(".claude").iter().all(|r| !r.contains("sync-conflict")));
+    assert!(m
+        .list(".claude")
+        .iter()
+        .all(|r| !r.contains("sync-conflict")));
     assert!(baseline("conf4", &p1).exists(), "sibling still untouched");
 }
 
@@ -3603,7 +3981,9 @@ async fn s33_repick_resets_link_state_local() {
 async fn run_s34_rename_propagates_and_survives_push(cloud: TestCloud) {
     let a = Machine::new("A");
     a.seed(".claude/CLAUDE.md", "v1\n");
-    a.push(&cloud, &[".claude"]).await.expect("A creates profile");
+    a.push(&cloud, &[".claude"])
+        .await
+        .expect("A creates profile");
     let profile = cloud.profile_for_root(".claude");
 
     let b = Machine::new("B");
@@ -3617,7 +3997,9 @@ async fn run_s34_rename_propagates_and_survives_push(cloud: TestCloud) {
         .find(|p| p.id == "claude")
         .unwrap()
         .name = "Team Claude".to_string();
-    crate::save_sync_config(a.handle().clone(), cfg).await.unwrap();
+    crate::save_sync_config(a.handle().clone(), cfg)
+        .await
+        .unwrap();
     a.seed(".claude/CLAUDE.md", "v2 longer\n");
     a.push(&cloud, &[".claude"]).await.expect("A renaming push");
 
@@ -3625,7 +4007,11 @@ async fn run_s34_rename_propagates_and_survives_push(cloud: TestCloud) {
     let infos = crate::list_sync_profiles(a.handle().clone(), cloud.storage_id.clone())
         .await
         .unwrap();
-    let label = &infos.iter().find(|i| i.profile_id == profile).unwrap().label;
+    let label = &infos
+        .iter()
+        .find(|i| i.profile_id == profile)
+        .unwrap()
+        .label;
     assert_eq!(label, "Team Claude", "push must rename the cloud profile");
     assert_eq!(
         a.saved_link(&cloud, ".claude").unwrap().profile_label,
@@ -3641,7 +4027,11 @@ async fn run_s34_rename_propagates_and_survives_push(cloud: TestCloud) {
     let infos = crate::list_sync_profiles(b.handle().clone(), cloud.storage_id.clone())
         .await
         .unwrap();
-    let label = &infos.iter().find(|i| i.profile_id == profile).unwrap().label;
+    let label = &infos
+        .iter()
+        .find(|i| i.profile_id == profile)
+        .unwrap()
+        .label;
     assert_eq!(label, "Team Claude", "B's push must not revert the rename");
     assert_eq!(
         b.saved_link(&cloud, ".claude").unwrap().profile_label,
@@ -3676,7 +4066,9 @@ async fn run_s35_shared_profile_rename_one_machine(cloud: TestCloud) {
 
     // Sibling local profile on the same machine, sharing the cloud profile.
     m.add_profile("conf4", ".claude", m.home().join("myconf4"), Some(&profile));
-    m.pull_profile(&cloud, "conf4").await.expect("sibling links");
+    m.pull_profile(&cloud, "conf4")
+        .await
+        .expect("sibling links");
 
     // Rename the default profile; its next push renames the cloud profile
     // even with NOTHING to publish (the user's exact repro: rename, push,
@@ -3688,7 +4080,9 @@ async fn run_s35_shared_profile_rename_one_machine(cloud: TestCloud) {
         .find(|p| p.id == "claude")
         .unwrap()
         .name = "testclaude".to_string();
-    crate::save_sync_config(m.handle().clone(), cfg).await.unwrap();
+    crate::save_sync_config(m.handle().clone(), cfg)
+        .await
+        .unwrap();
     let generation = cloud.head_of(&profile).unwrap().generation;
     m.push(&cloud, &[".claude"]).await.expect("renaming push");
     assert_eq!(
@@ -3702,7 +4096,11 @@ async fn run_s35_shared_profile_rename_one_machine(cloud: TestCloud) {
     let infos = crate::list_sync_profiles(m.handle().clone(), cloud.storage_id.clone())
         .await
         .unwrap();
-    let label = &infos.iter().find(|i| i.profile_id == profile).unwrap().label;
+    let label = &infos
+        .iter()
+        .find(|i| i.profile_id == profile)
+        .unwrap()
+        .label;
     assert_eq!(label, "testclaude", "push must rename the cloud profile");
 
     // One push heals every cached link label on this machine — the
@@ -3726,8 +4124,15 @@ async fn run_s35_shared_profile_rename_one_machine(cloud: TestCloud) {
     let infos = crate::list_sync_profiles(m.handle().clone(), cloud.storage_id.clone())
         .await
         .unwrap();
-    let label = &infos.iter().find(|i| i.profile_id == profile).unwrap().label;
-    assert_eq!(label, "testclaude", "sibling push must not revert the rename");
+    let label = &infos
+        .iter()
+        .find(|i| i.profile_id == profile)
+        .unwrap()
+        .label;
+    assert_eq!(
+        label, "testclaude",
+        "sibling push must not revert the rename"
+    );
 }
 
 #[tokio::test]

@@ -666,8 +666,8 @@ impl Machine {
 
     fn ensure_profile_link(&self, cloud: &TestCloud, profile_id: &str) {
         self.activate();
-        let mut saved = crate::load_sync_config(self.handle())
-            .unwrap_or_else(|_| crate::default_sync_config());
+        let mut saved =
+            crate::load_sync_config(self.handle()).unwrap_or_else(|_| crate::default_sync_config());
         let storage = cloud.storage_config();
         if let Some(existing) = saved.storages.iter_mut().find(|s| s.id == storage.id) {
             let probe = existing.supports_conditional_writes;
@@ -803,8 +803,8 @@ impl Machine {
         let mut combined = None;
         for (root, _) in KINDS {
             self.ensure_link_config(cloud, root);
-            let result = do_pull_link(self.handle(), &cloud.storage_id, kind_profile_id(root))
-                .await?;
+            let result =
+                do_pull_link(self.handle(), &cloud.storage_id, kind_profile_id(root)).await?;
             Self::merge_results(&mut combined, result);
         }
         combined.ok_or_else(|| "nothing pulled".to_string())
@@ -859,8 +859,7 @@ impl Machine {
     /// The machine's persisted sync config (probe results, resolved links).
     pub fn saved_config(&self) -> SyncConfig {
         self.activate();
-        crate::load_sync_config(self.handle())
-            .unwrap_or_else(|_| crate::default_sync_config())
+        crate::load_sync_config(self.handle()).unwrap_or_else(|_| crate::default_sync_config())
     }
 
     /// The saved cloud side of this machine's link for (cloud, root); None
@@ -936,8 +935,8 @@ impl Machine {
         }
         // Cloud side, mirrored into the saved config's links for this kind.
         let profile_id = kind_profile_id(root);
-        let mut saved = crate::load_sync_config(self.handle())
-            .unwrap_or_else(|_| crate::default_sync_config());
+        let mut saved =
+            crate::load_sync_config(self.handle()).unwrap_or_else(|_| crate::default_sync_config());
         if cloud_prefix.is_empty() {
             self.pins.borrow_mut().remove(root_key);
             // Back to auto: drop pinned links so discovery relinks; a plain
@@ -990,8 +989,8 @@ impl Machine {
         label: &str,
     ) {
         self.ensure_profile_link(cloud, local_id);
-        let mut saved = crate::load_sync_config(self.handle())
-            .unwrap_or_else(|_| crate::default_sync_config());
+        let mut saved =
+            crate::load_sync_config(self.handle()).unwrap_or_else(|_| crate::default_sync_config());
         let root = saved
             .local_profiles
             .iter()
@@ -1022,12 +1021,10 @@ impl Machine {
             .find(|(kind, _)| *kind == root)
             .map(|(kind, _)| *kind)
             .expect("known root");
-        self.pins
-            .borrow_mut()
-            .insert(root_key, prefix.to_string());
+        self.pins.borrow_mut().insert(root_key, prefix.to_string());
         let profile_id = kind_profile_id(root);
-        let mut saved = crate::load_sync_config(self.handle())
-            .unwrap_or_else(|_| crate::default_sync_config());
+        let mut saved =
+            crate::load_sync_config(self.handle()).unwrap_or_else(|_| crate::default_sync_config());
         for link in saved.links.iter_mut().filter(|l| l.profile == profile_id) {
             link.cloud = ProfileLink {
                 root: root.to_string(),

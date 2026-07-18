@@ -135,6 +135,7 @@ cloud layout and machine homes can be inspected.
 | S31 auto link (`cloud: {}`): one candidate links unpinned; two error "pin one explicitly", storage untouched | ✓ | ✓ |
 | S32 picker create-new: fresh pinned id + deduped label lands alongside existing profile (P1 fix) | ✓ | ✓ |
 | S33 re-pick drops the old baseline via settings save, re-verifies cleanly, sibling unaffected (P2 fix) | ✓ | ✓ |
+| `codex_project_path_mapping_flow` (manual project-path picking: lock-derived source validation, machine-local mapping outside every manifest, pending vs immediate mapped sidebar apply, `codex resume -C` report, removal never mutates the sidebar) | ✓ | ✓ |
 | `statuses_under_custom_mounts` / `editor_boundary_follows_mounts` / `mount_name_is_cosmetic` | ✓ (single backend) | partial |
 
 The local store implements CAS as check-then-write under an exclusive lock on

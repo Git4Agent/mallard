@@ -1,6 +1,10 @@
 # Plan: Manual project-path mapping after pull
 
-Status: proposed (2026-07-15)
+Status: proposed (2026-07-15). The Codex half shipped 2026-07-16 via
+`PLAN_CODEX_MANUAL_PROJECT_PATH_PICKING.md` (shared schema in
+`project_paths.rs`, `map_project_path`/`remove_project_path_mapping`/
+`list_project_path_mappings`, Finish-setup picker, Settings editor); the
+Claude projection/materialization (§6) remains unimplemented.
 
 ## 1. Goal
 

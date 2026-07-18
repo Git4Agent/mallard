@@ -1,121 +1,349 @@
 # Agent Sync
 
-Tauri 2 desktop app for syncing local agent state such as `~/.codex` and
-`~/.claude` to an S3-compatible bucket (AWS S3, Cloudflare R2) or a local
-folder.
+Agent Sync is a Tauri 2 desktop app for moving the Codex and Claude resources
+that belong to a project between machines. It syncs a selected project bundle,
+not an entire `~/.codex` or `~/.claude` directory.
 
-## UI concept
+## Handoff status
 
-![Agent Sync profile-to-storage link matrix](./docs/images/profile-storage-link-matrix.png)
+The July 18 update makes the schema-3 project workspace the default UI. It now
+supports:
 
-## Setup
+- named, machine-local Codex and Claude profiles selected before project
+  discovery;
+- project resource inventory and persistent selection recipes;
+- project links to local-folder and S3/R2 storage;
+- remote bundle browsing and repository-fingerprint matching;
+- push, verified fetch, restore planning, explicit apply approval, dependency
+  planning, and readiness checks; and
+- a legacy schema-2 workspace available from the sidebar for reference.
 
-Prerequisites: Node.js + npm, and a stable Rust toolchain + cargo (edition
-2021). The Tauri CLI is a project devDependency — no global install needed.
+The current work is not committed. It sits on `main` as tracked and untracked
+changes, including `src-tauri/src/project_sync_v3/` and
+`src/components/project-sync/`. Run `git status --short` first and do not clean
+or reset the worktree.
+
+## Run locally
+
+Requirements: Node.js with npm and a stable Rust toolchain.
 
 ```sh
 npm install
-npm run dev          # Vite frontend only, http://localhost:1420
-npm run tauri dev    # full app: Rust backend + Vite frontend
+npm run dev          # Vite frontend only at http://localhost:1420
+npm run tauri dev    # desktop app with the Rust backend
 ```
 
+There is no `.env` file. Add projects, provider profiles, and storage through
+the app.
 
-There's no `.env` or checked-in config. On first launch, open Settings: add
-one or more **storages** (a local folder, or an S3-compatible bucket —
-bucket name, access key, secret, endpoint), then link **profiles** (local
-agent roots like `~/.codex`, `~/.claude`, or extra ones at custom paths) to
-storages in the matrix. Select a link to pull or push it. Everything is
-saved to app data, not the repo.
+## How to use it
 
-## Design (basic)
+For the takeover, please use a local folder as storage and a disposable custom
+Codex home. Do not use `~/.codex` or S3/R2 for the first smoke test.
 
-Full spec: [`DESIGN2.md`](./DESIGN2.md) and
-[`PLAN_MULTI_STORAGE.md`](./PLAN_MULTI_STORAGE.md). Short version:
+This example assumes the current checkout is at
+`$HOME/work/tauri-codex-sync`:
 
-- The settings matrix links N local **profiles** to N **storages**; each
-  link syncs independently, with its own baseline keyed by
-  (storage, cloud profile) — same-named profiles in two storages never
-  share state. Per-file opt-ins are per storage.
-- Each linked profile syncs as an independent cloud **profile**:
-  `_head.json` (a small, CAS-protected pointer to the current
-  generation), immutable `_manifests/`/`_commits/` history, and `_uploads/`
-  object storage. Pull reads exactly what the head's manifest references —
-  never a stray bucket object.
-- Storage is abstracted behind a `Store` enum with two backends: S3-compatible
-  (real sigv4 + conditional-PUT CAS) and local-folder (CAS via an flock'd
-  `.lock` file, temp-file-then-rename writes).
-- File state is a three-way comparison of local baseline (last synced), the
-  cloud manifest, and the current filesystem scan. Push reconciles remote
-  changes into a **union** before uploading instead of blocking: files
-  changed on both sides get a deterministic conflict-copy sibling, unless the
-  path has a merge driver (`history.jsonl`, `session_index.jsonl` dedup +
-  sort instead). Deletions never propagate — pull restores a locally-deleted
-  file.
-- Which files sync by default is a tier allowlist, see
-  [`AGENT_SYNC_FILE_SETS.md`](./AGENT_SYNC_FILE_SETS.md).
+| Purpose | Example path |
+|---|---|
+| Source checkout | `$HOME/work/tauri-codex-sync` |
+| Source Codex home | `$HOME/agent-sync-takeover/codex-source` |
+| Local bundle storage | `$HOME/agent-sync-takeover/local-storage` |
+| Restore checkout | `$HOME/work/tauri-codex-sync-restore` |
+| Restore Codex home | `$HOME/agent-sync-takeover/codex-restore` |
 
-## Testing
+1. Create a Codex home and storage directory outside the project checkout.
+   Keep these paths separate from each other and from the checkout.
 
-Frontend has no committed test framework yet — `npm run build` (tsc) is the
-frontend check. Rust gets `cargo check` plus the sync integration suite
-below; add Rust unit tests near new backend logic as you go.
+   ```sh
+   mkdir -p "$HOME/agent-sync-takeover/codex-source"
+   mkdir -p "$HOME/agent-sync-takeover/codex-restore"
+   mkdir -p "$HOME/agent-sync-takeover/local-storage"
+   touch "$HOME/agent-sync-takeover/codex-source/config.toml"
+   touch "$HOME/agent-sync-takeover/codex-restore/config.toml"
+   ```
+
+   `codex-source` is the exact `CODEX_HOME`. It does not need to be named
+   `.codex`. The command above creates its config at
+   `codex-source/config.toml`, not `~/.codex/config.toml`. Use a normal local
+   directory for storage, not Dropbox or iCloud, during the first test.
+
+   If this isolated Codex home is not logged in, authenticate it directly:
+
+   ```sh
+   CODEX_HOME="$HOME/agent-sync-takeover/codex-source" codex login
+   ```
+
+2. Start Codex with the custom home and complete one small task in the test
+   checkout. This gives Agent Sync a project-owned task to discover.
+
+   ```sh
+   CODEX_HOME="$HOME/agent-sync-takeover/codex-source" codex -C "$HOME/work/tauri-codex-sync"
+   ```
+
+   Reuse that `CODEX_HOME` whenever you reopen the test task. Do not copy
+   `auth.json` or other machine state from `~/.codex` into this directory.
+
+3. Start the app with `npm run tauri dev`.
+4. In the Storage section, click `+`, select `Local folder`, choose
+   `$HOME/agent-sync-takeover/local-storage`, name it `Takeover local`, then
+   click `Create storage`.
+5. In the Projects section, click `+` and choose
+   `$HOME/work/tauri-codex-sync`. On `Choose provider profiles`, click `Add`
+   beside Codex and select the exact
+   `$HOME/agent-sync-takeover/codex-source` directory. Leave Claude set to
+   `Not used`, then click `Discover resources`.
+6. Review the discovered task and config resources, choose what should sync,
+   link the local storage, and click `Create project`. Open the project row and
+   click `Push`. The Activity panel should show the published generation, and
+   the storage directory should contain `v3/bundles/<bundle-id>/`.
+7. Prepare a second checkout of the same Git repository at
+   `$HOME/work/tauri-codex-sync-restore`. Add it as another project, choose
+   `$HOME/agent-sync-takeover/codex-restore` as its Codex profile, and link
+   `Takeover local`. Choose the matching remote repo, click
+   `Connect and review Pull`, inspect the restore plan, then approve only the
+   writes and dependency actions you expect. The task and selected agent
+   resources should appear under `codex-restore`; Agent Sync should not copy
+   the application's source files.
+
+Bundle IDs are opaque. Checkout paths, provider profile paths, credentials,
+trust decisions, and apply receipts stay on the local machine. Schema 3 uses
+its own app-data `v3/` directory and cloud keys under
+`v3/bundles/<bundle-id>/`; it does not migrate or overwrite schema-2 state.
+
+## Metadata layout
+
+"Local metadata" and "local-folder storage" are different things:
+
+```text
+Machine                                              Portable storage
+checkout + selected provider home -- selected data -> v3/bundles/<bundle-id>/
+sync_config: bundle ID + recipe ------ projection --> current manifest
+paths, profiles, credentials, plans ------- X         never uploaded
+```
+
+The bundle ID, display name, hashed repository fingerprint, and selected
+recipe are represented both locally and in the current remote manifest. The
+local JSON documents are never copied as objects. Push builds a portable
+manifest from the selected fields and captured resources.
+
+### Machine-local metadata
+
+On macOS, `<Tauri app-data>` is normally
+`~/Library/Application Support/com.hequ.agent-sync`. Files are created as the
+corresponding feature is used:
+
+```text
+<Tauri app-data>/v3/
+|-- sync_config.json
+|-- machine_projects.json
+|-- materializations.json
+|-- dependency_applications.json
+|-- restore_plans/
+|   `-- <plan-id>.json
+|-- dependency_plans/
+|   `-- <plan-id>.json
+`-- backups/
+    `-- <plan-id>/...
+```
+
+- `sync_config.json` stores the schema and revision, storage definitions,
+  project registrations, bundle recipes, project-to-storage links, and the
+  reviewed remote base for each storage. S3 credentials are local fields in
+  this file.
+- `machine_projects.json` stores named provider profiles, exact and canonical
+  `CODEX_HOME` or `CLAUDE_CONFIG_DIR` paths, checkout bindings, local profile
+  IDs, and per-machine replica IDs.
+- `restore_plans/` and `dependency_plans/` store generation-pinned approval
+  documents. Restore plans contain resolved absolute target paths; dependency
+  plans contain typed installer arguments and blockers.
+- `materializations.json` records Pull results and per-action receipts,
+  including the source manifest hash, binding revision, target paths, target
+  hashes, status, and errors.
+- `dependency_applications.json` records dependency actions that were applied,
+  skipped, blocked, or failed.
+- `backups/<plan-id>/` holds pre-write copies made while applying a Pull.
+
+These files are atomically replaced with revision checks and private file
+permissions on Unix. They contain machine paths and may contain storage
+credentials, so do not copy this directory into the shared storage folder.
+The selected Codex or Claude home is separate again: Agent Sync reads and
+writes approved provider resources there, but it does not treat that whole
+directory as app metadata.
+
+### Portable storage metadata
+
+Local-folder and S3/R2 storage use the same object keys. A local folder also
+has a lock file used for compare-and-swap writes:
+
+```text
+<local-storage>/
+|-- .bundle-store.lock                 # local-folder mode only
+`-- v3/bundles/<bundle-id>/
+    |-- _tag.json
+    |-- _head.json
+    |-- _manifests/
+    |   `-- <generation>-<commit-id>.json
+    |-- _commits/
+    |   `-- <generation>-<commit-id>.json
+    `-- _uploads/
+        `-- <upload-id>/files/<logical-path>
+```
+
+- `_tag.json` is a replaceable discovery summary with the display name,
+  bundle type, generation, update time, and resource and file counts. It is a
+  convenience index, not the source of truth.
+- `_head.json` is the only authoritative mutable pointer. It names the current
+  generation, commit, manifest key, and manifest SHA-256. Local storage updates
+  it under the lock; S3/R2 uses a conditional write with the object's ETag.
+- `_manifests/` contains immutable full snapshots. A manifest stores the
+  portable bundle identity, repository fingerprint, selected recipe, capture
+  tool versions, resource descriptors, provenance, apply policy, relative
+  working directories, logical file entries, hashes, sizes, modes, object
+  keys, and tombstones.
+- `_commits/` contains immutable history records. Each record points to its
+  manifest, records the previous commit ID, and counts added, changed, and
+  removed files.
+- `_uploads/` contains immutable selected file bytes. Paths are logical, such
+  as `project/AGENTS.md`, `state/codex/sessions/...`, or
+  `state/claude/projects/...`; source-machine absolute paths are not object
+  keys.
+
+The remote bundle never contains local storage credentials, provider profile
+IDs or paths, checkout paths, restore plans, approval receipts, backups, auth
+state, or trust decisions. It does contain selected conversations and project
+configuration. Known credential fields are excluded, but opaque conversation
+or script content receives only best-effort secret checks.
+
+### Race protection and version history
+
+Agent Sync uses optimistic concurrency and immutable snapshots. This is bundle
+versioning, not a replacement for Git. Git remains responsible for the
+application's source files.
+
+The version fields have separate jobs:
+
+- `schema` and `schema_version` identify the document format. Readers reject
+  unsupported formats instead of guessing.
+- Local `revision` fields protect app settings, recipes, profiles, and
+  bindings from stale edits. A save must still match the revision that was
+  opened, then the revision increments.
+- A `RecipeBase` records the remote generation and manifest hash last reviewed
+  by this local binding, plus its recipe and binding revisions. Push refuses
+  to build on an unknown, missing, or newer remote base.
+- Every successful Push creates a new remote `generation` and `commit_id`.
+  The commit points to a full immutable manifest and to the previous commit.
+- SHA-256 values bind the head to its manifest and each manifest entry to its
+  uploaded bytes. Fetch verifies those hashes before planning or applying.
+
+Two Push operations may start from the same head, but only one can publish the
+next head:
+
+```text
+Pusher A                     Storage                     Pusher B
+read generation 7, ETag E1  <--- _head.json ----------> read generation 7, ETag E1
+write generation 8 objects  ---> immutable objects <--- write alternate objects
+CAS E1 -> generation 8      ---> accepted
+                                                         CAS E1 -> generation 8
+                                                         rejected: E1 is stale
+```
+
+Uploads, manifests, and commits are written before `_head.json`. If a process
+crashes or loses the CAS, its immutable objects may remain as unreachable
+orphans, but the current head never points to a partial generation. In
+local-folder mode, `.bundle-store.lock` serializes the immutable writes and
+head CAS on one filesystem. In S3/R2 mode, conditional requests use the head
+object's ETag.
+
+The current schema-3 Push command also compares `_head.json` with the local
+`RecipeBase` before publication. If another machine already advanced the bundle,
+Push stops and asks for Pull and review. After a successful head CAS, the app
+rechecks the local project and recipe revisions before saving the new base. If
+the recipe changed while Push was running, the remote generation remains
+valid, but the app reports the race and requires a refresh.
+
+Pull has a second set of guards:
+
+```text
+plan = storage + bundle + replica + generation + commit
+     + manifest SHA-256 + binding revision + expiry
+
+apply:
+  1. reload the current binding
+  2. fetch and verify the pinned bundle again
+  3. confirm _head.json still names the planned generation
+  4. confirm each target path and pre-write hash still match the plan
+  5. back up the old bytes, write, then record an apply receipt
+```
+
+If the bundle head, checkout binding, provider profile, or target file changes
+after planning, apply stops instead of writing over the new state. A plan ID
+can be recorded only once. Dependency plans use the same bundle and binding
+pins and keep separate application receipts.
+
+Local app-data updates use a process mutex, revision checks, and a synced
+temporary file followed by atomic replacement. The mutex covers one running
+app process; it is not a cross-process database lock. The local storage lock
+also works only when writers see the same filesystem lock, so Dropbox and
+iCloud folders must not be used for simultaneous multi-machine Push.
+
+Current limitation: a stale Push fails closed, but automatic fetch, three-way
+rebase, and CAS retry are not finished for schema 3. Per-replica baselines and
+class-specific conflict and tombstone rules are also pending. The immutable
+history preserves earlier generations, but the current UI does not expose a
+rollback or orphan cleanup workflow.
+
+## Verify
 
 ```sh
 npm run build
-cd src-tauri && cargo check
-```
-
-The sync integration suite lives in `src-tauri/src/sync_tests`. It runs
-against local temp directories and a filesystem-backed stub S3 server, so it
-does not need a real bucket, credentials, or external network access.
-
-```sh
-cd src-tauri
-cargo test --lib sync_tests
-```
-
-From the repository root, use the manifest path instead:
-
-```sh
-cargo test --manifest-path src-tauri/Cargo.toml --lib sync_tests
-```
-
-Useful variants:
-
-```sh
-# Integration scenarios plus unit tests.
-cargo test --lib
+cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml --lib
-
-# List integration tests.
-cargo test --lib sync_tests -- --list
-cargo test --manifest-path src-tauri/Cargo.toml --lib sync_tests -- --list
-
-# Keep temp cloud/home dirs and print paths for debugging failures.
-KEEP_SYNC_TEST_DIRS=1 cargo test --lib sync_tests -- --nocapture
-KEEP_SYNC_TEST_DIRS=1 cargo test --manifest-path src-tauri/Cargo.toml --lib sync_tests -- --nocapture
 ```
 
-The suite serializes itself internally because `$HOME` is process-global, so
-you do not need to pass `--test-threads=1`. See
-[`src-tauri/src/sync_tests/README.md`](./src-tauri/src/sync_tests/README.md)
-for how the dual-backend harness (stub S3 + local store) works and what each
-scenario (S1–S23) covers.
+At this handoff, the frontend build and Rust check pass, and all 317 Rust tests
+pass. The Rust suite starts a localhost stub S3 server, so a restricted sandbox
+may need permission to bind a local port.
 
-## Collaboration
+## Code map
 
-Full guide: [`AGENTS.md`](./AGENTS.md). Highlights:
+- `src/components/project-sync/`: schema-3 project, profile, storage, resource,
+  and restore UI.
+- `src/components/project-sync/api.ts`: frontend-to-Tauri command contract.
+- `src/types.ts`: frontend DTOs matching Rust response shapes.
+- `src-tauri/src/project_sync_v3/domain.rs`: IDs, config, recipes, manifests,
+  plans, and receipts.
+- `src-tauri/src/project_sync_v3/provider_capture.rs`: Codex and Claude project
+  discovery, filtering, and portable projections.
+- `src-tauri/src/project_sync_v3/bundle_engine.rs`: publish, fetch, CAS,
+  pagination, restore planning, remapping, backups, and apply.
+- `src-tauri/src/project_sync_v3/commands.rs`: Tauri command orchestration.
+- `src-tauri/src/project_sync_v3/s3_store.rs`: S3/R2 transport.
+- `src-tauri/src/project_sync_v3/persistence.rs`: isolated local schema-3 state.
+- `src/App.tsx` and `src-tauri/src/lib.rs`: schema-3 entry point and command
+  registration; legacy code still lives in both files.
 
-- React components in PascalCase (`SyncPanel.tsx`), camelCase variables/functions.
-  Rust command payloads use snake_case fields to match serde output the
-  frontend consumes as-is.
-- Reuse the existing `invoke` command pattern for UI/backend calls instead of
-  adding a state layer. Keep small functions near their callers.
-- Keep comments for non-obvious behavior only — especially file filtering and
-  sync safety decisions.
-- Commits: concise and imperative (`Add sync config validation`). PRs: short
-  problem statement, user-visible behavior changed, verification commands
-  run, and a screenshot/recording for UI changes.
-- Don't commit local secrets, tokens, generated bundles, or personal Codex
-  data. Test destructive restore paths against disposable files or a
-  backed-up `~/.codex` copy.
+## Next work
+
+1. Add focused coverage for materialization receipts, stale bases, plugin
+   command generation, and secret rejection.
+2. Finish plugin provenance and post-install verification. Codex plugin
+   inventory still relies mainly on config, and Claude plugin capture is
+   partial.
+3. Expose selectable global standalone skills. The capture model supports
+   them, but command requests currently pass an empty list.
+4. Finish per-replica baselines, three-way resource reconciliation, CAS retry,
+   and class-specific conflict and tombstone behavior.
+5. Run the full desktop flow against a disposable live S3 or R2 bucket. Local
+   and stub-S3 coverage pass, but a live transport smoke test is still pending.
+
+## References
+
+- [`PLAN_PROJECT_SCOPED_SYNC.md`](./PLAN_PROJECT_SCOPED_SYNC.md): schema-3
+  architecture and safety rules.
+- [`PLAN_PROJECT_PROFILE_ASSOCIATION.md`](./PLAN_PROJECT_PROFILE_ASSOCIATION.md):
+  machine-local provider profile model.
+- [`AGENT_SYNC_FILE_SETS.md`](./AGENT_SYNC_FILE_SETS.md): detailed handoff and
+  legacy file-set evidence.
+- [`src-tauri/src/sync_tests/README.md`](./src-tauri/src/sync_tests/README.md):
+  integration harness and storage coverage.

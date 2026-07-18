@@ -1,5 +1,153 @@
 # Agent Sync File Sets
 
+> **Schema-2 reference.** The project-scoped schema-3 implementation no
+> longer treats either agent home as a sync unit. Its allowlist, resource
+> ownership, and restore policies are defined in
+> [`PLAN_PROJECT_SCOPED_SYNC.md`](./PLAN_PROJECT_SCOPED_SYNC.md), Sections
+> 7–10. This file remains useful for the legacy engine and provider evidence;
+> it is not a schema-3 capture contract.
+
+## Claude Handoff — Project-Scoped Schema 3 (2026-07-17)
+
+This is a **worktree snapshot, not a finished implementation** — but as of the
+2026-07-17 follow-up session the head is verified green (`npm run build`,
+`cargo check`, `cargo fmt --check`, full `cargo test --lib`: 306 tests, 36 of
+them schema-3). The repository already contained overlapping manual-remap and
+legacy sync changes; preserve them and do not revert files merely because they
+are dirty. Untracked schema-3 files are intentional. No migration or backward
+compatibility is required for this redesign, and schema-2 data must remain
+untouched.
+
+### Goal and design boundary
+
+Replace whole-profile synchronization of `~/.codex` and `~/.claude` with an
+explicit project bundle. A bundle owns one logical project and its useful
+portable resources: project conversations and memory, reviewed settings, MCP
+and hook declarations, project skills, plugin/skill installation intent, and
+other project-local files selected by the user. On another machine, the user
+binds the logical project to a different local path, reviews a restore plan,
+then explicitly approves file writes and dependency installation.
+
+The authoritative design is
+[`PLAN_PROJECT_SCOPED_SYNC.md`](./PLAN_PROJECT_SCOPED_SYNC.md). Schema 3 uses
+an isolated app-data `v3/` namespace and cloud `v3/bundles/` keys. The existing
+schema-2 engine remains reference code only.
+
+### Implemented so far
+
+- `src-tauri/src/project_sync_v3/domain.rs` defines validated identifiers,
+  logical paths, config/project/link/binding records, manifests, restore plans,
+  dependency actions, and materialization receipts.
+- `persistence.rs` provides bounded atomic persistence for schema-3 config,
+  projects, links, bindings, plans, backups, baselines, dependency results, and
+  materializations.
+- `provider_capture.rs` discovers project-owned Codex and Claude sessions by
+  working directory, handles nested project roots, captures Claude memory and
+  project skills, and applies an allowlist/secret filter. Portable projections
+  exist for Codex `config.toml`, Claude `settings.json`, `.mcp.json`, hooks, and
+  marketplace declarations. Literal MCP environment/header secrets are replaced
+  with environment-variable references.
+- `bundle_engine.rs` implements local object storage, immutable objects,
+  manifests/commits/tags, compare-and-swap heads, pagination, verified fetch,
+  restore planning, backups, path remapping, and Claude project-bucket mapping.
+  Executable standalone-skill payloads now require both explicit file approval
+  and dependency approval. Approved settings/MCP/hook resources have an initial
+  semantic JSON/TOML composition implementation.
+- `s3_store.rs` adapts S3/R2 to the bundle object-store interface, including
+  immutable put, conditional head updates, get, and paginated listing.
+- `commands.rs` contains schema-3 CRUD, discovery/inventory, remote browsing,
+  fetch/status/push, restore planning/application, dependency planning/
+  application, and readiness commands. It supports local and S3 stores and uses
+  structured argv/cwd/env for native plugin commands.
+- `src/components/project-sync/` contains the project-first React UI: project
+  sidebar and registration, workspace, resource inventory, local-path binding,
+  remote bundle browser, restore/dependency approval, and storage settings.
+- `src/App.tsx` starts in project mode while still exposing legacy mode, and
+  `src/types.ts` contains the schema-3 frontend DTOs.
+
+### Resolved in the 2026-07-17 follow-up session
+
+- **All schema-3 Tauri commands are registered** (formerly blocker 1): the
+  eleven discovery/bundle/restore/dependency/readiness commands were added to
+  both the `generate_handler!` list and the test-only `commands_used_by_run()`
+  list in `src-tauri/src/lib.rs`, and every `invoke()` name and camelCased
+  argument in `src/components/project-sync/api.ts` was verified against the
+  Rust command signatures.
+- **Head verified green** (formerly blocker 2): `npm run build`, `cargo check`,
+  `cargo fmt --check`, and the full `cargo test --lib` (306 passed, 0 failed)
+  all succeed. Schema-3 alone is 36 tests.
+- **Semantic apply coverage** (former blocker 3): two new integration tests in
+  `bundle_engine::tests` drive capture → publish → fetch → plan → apply.
+  `settings_and_mcp_apply_preserve_target_only_fields_and_secrets` asserts that
+  target-only fields (a local `permissions` block, a target-only MCP server)
+  survive composition and that a target-side literal secret is not clobbered by
+  the portable `${NAME}` placeholder, while portable non-secret fields win.
+  `hook_and_toml_settings_apply_merge_by_identity_and_preserve_target_keys`
+  covers the TOML composer (`.codex/config.toml`: portable keys win,
+  target-only keys survive) and hook-array merge-by-name (`.codex/hooks.json`:
+  same-name hooks merge with portable winning, target-only hooks survive,
+  portable-only hooks append without duplicates).
+- Legacy flake fixed: `codex_plugins::tests::plan_for_lock_handles_missing_and_invalid_lock`
+  passed `codex_home: None` and fell back to `$CODEX_HOME`/`$HOME`, which the
+  sync_tests harness swaps process-globally during parallel runs; it now pins
+  an explicit tempdir home.
+
+### Highest-priority blockers
+
+1. Add focused tests for materialization receipts, stale bases, S3
+   CAS/pagination edge cases, plugin argv generation, and secret rejection.
+2. Complete plugin provenance and inventory. Claude project `enabledPlugins`
+   is partially captured; Codex still relies mainly on config rather than the
+   authoritative `codex plugin list --json`. Marketplace source/ref provenance
+   and post-install provider verification are incomplete.
+3. Expose selectable global standalone skills. Capture types support them, but
+   command capture requests currently pass an empty `standalone_skills` list.
+4. Finish reconciliation and restore safety: per-replica baselines, resource
+   three-way rebase/CAS retry, class-specific conflict/quarantine/tombstone
+   behavior, shared-provider contribution ownership/locking, and continuation
+   command UX. A stale recipe-base guard exists, but it is not a full rebase.
+5. Verify S3/R2 outside the restricted sandbox. Socket-based S3 stub tests failed
+   in the sandbox because binding was denied. Also review standard AWS S3 setup:
+   the reused client helper may currently require an endpoint or R2 account ID
+   even though schema-3 validation permits a bucket alone.
+
+### Recommended resume sequence
+
+1. Inspect the dirty tree and preserve all pre-existing edits.
+2. Add the focused tests from blocker 1 above.
+3. Exercise a local end-to-end flow: register project → create recipe/link →
+   inspect inventory → push → browse/fetch → bind a different local path
+   → review/apply restore → approve plugin/skill actions.
+4. Run S3 adapter tests with permission to bind a local stub, then test a
+   disposable R2/S3 bucket if credentials are available.
+5. Implement the remaining inventory/provenance, baseline/rebase, and restore
+   conflict work before changing the plan status from **proposed**.
+
+### Verification commands
+
+```bash
+git status --short
+git diff --check
+npm run build
+cd src-tauri && cargo check
+cd src-tauri && cargo test --lib project_sync_v3::
+cd src-tauri && cargo test --lib
+```
+
+The full Rust suite includes socket-based S3 tests and may require running
+outside the filesystem/network sandbox. Do not treat sandbox bind failures as
+product failures without rerunning them with the needed permission.
+
+### Worktree snapshot
+
+Modified tracked files at handoff include this document, `DESIGN2.md`, the two
+manual path-remap plan documents, `README.md`, legacy Rust readiness/sidebar/
+test-harness files, `src-tauri/src/lib.rs`, `src/App.tsx`, `src/App.css`, legacy
+setup/sync components, and `src/types.ts`. Important untracked additions are
+`PLAN_PROJECT_SCOPED_SYNC.md`, `src-tauri/src/project_paths.rs`, the entire
+`src-tauri/src/project_sync_v3/` module, and `src/components/project-sync/`.
+Use `git status --short` for the exact live list; no handoff commit was created.
+
 Default restore/sync file sets for Codex (`~/.codex`) and Claude Code
 (`~/.claude`), plus the merge policy for files that can safely converge across
 machines. Sync mechanics (state matrix, per-storage opt-ins, SQLite snapshot
@@ -84,6 +232,12 @@ disaster-recovery path only — it is NOT the portable restore path
                                   # (PLAN_CODEX_THREAD_REBUILD_AND_SIDEBAR.md).
                                   # Same ~/.agent-sync/codex/ storage
 ```
+
+**Project-path mappings are machine-local.** `~/.agent-sync/project-path-mappings.json`
+(source project path → local folder, chosen through the Finish-setup picker;
+PLAN_CODEX_MANUAL_PROJECT_PATH_PICKING.md) sits at the top of `~/.agent-sync`,
+outside every remapped subtree, so it is structurally unsyncable — a target
+folder chosen on this Mac never becomes another machine's setting.
 
 **`config.toml` uses logical bytes.** The active physical file is split into a
 portable projection plus a target-local overlay. Local marketplace tables and

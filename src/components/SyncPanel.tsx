@@ -4,7 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 // dialog plugin's async confirm instead.
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { AppTheme, CloudProfileInfo, LocalProfile, ProfileLink, StorageConfig, SyncConfig, SyncLink } from "../types";
+import { AppTheme, CloudProfileInfo, LocalProfile, ProfileLink, ProjectPathMapping, StorageConfig, SyncConfig, SyncLink } from "../types";
 import Icon from "./Icons";
 
 // Settings = the profile × storage link matrix (PLAN_MULTI_STORAGE.md §7):
@@ -17,6 +17,8 @@ interface Props {
   theme: AppTheme;
   onThemeChange: (theme: AppTheme) => void;
   profileStats?: Record<string, { fileCount: number; path: string }>;
+  /** Re-scan local profile folders + cloud state; drives profileStats. */
+  onRefresh?: () => void;
   onSave: (config: SyncConfig) => Promise<void>;
   onClose: () => void;
   /** Per-link sync, from the selected-link panel. Config is saved first. */
@@ -25,6 +27,11 @@ interface Props {
   onSetupLink?: (storage: string, profile: string) => Promise<void>;
   /** Restore missing plugins for one local profile. Config is saved first. */
   onRepairProfile?: (profile: LocalProfile) => Promise<void>;
+  /** Machine-local project-path mappings; editor only — new mappings
+   * originate from Finish setup after a pull. */
+  projectPathMappings?: ProjectPathMapping[];
+  onChangeProjectPath?: (mapping: ProjectPathMapping) => Promise<void>;
+  onRemoveProjectPath?: (mapping: ProjectPathMapping) => Promise<void>;
   focusProfile?: string | null;
   focusStorage?: string | null;
   focusRequestId?: number;
@@ -687,11 +694,15 @@ export default function SyncPanel({
   theme,
   onThemeChange,
   profileStats,
+  onRefresh,
   onSave,
   onClose,
   onSyncLink,
   onSetupLink,
   onRepairProfile,
+  projectPathMappings,
+  onChangeProjectPath,
+  onRemoveProjectPath,
   focusProfile,
   focusStorage,
   focusRequestId,
@@ -1074,6 +1085,45 @@ export default function SyncPanel({
             </div>
           </section>
 
+          {(projectPathMappings?.length ?? 0) > 0 && (
+            <section className="settings-section project-paths-section" aria-labelledby="settings-project-paths">
+              <h2 id="settings-project-paths" className="settings-section-title">Project paths</h2>
+              <div className="settings-note">
+                Folders used for restored sessions on this Mac. Removing a mapping never deletes files or sidebar entries.
+              </div>
+              <div className="project-path-list">
+                {projectPathMappings?.map((mapping) => (
+                  <div key={`${mapping.profile}:${mapping.provider}:${mapping.source_key}`} className="project-path-row">
+                    <span className="project-path-provider">
+                      {mapping.provider === "codex" ? "Codex" : "Claude"}
+                    </span>
+                    <span className="project-path-pair" title={`${mapping.source_path} → ${mapping.target_path}`}>
+                      {compactPath(mapping.source_path)} → {compactPath(mapping.target_path)}
+                    </span>
+                    <div className="project-path-actions">
+                      <button
+                        type="button"
+                        className="btn btn-ghost"
+                        onClick={() => void onChangeProjectPath?.(mapping)}
+                        title="Pick a different local folder for this project"
+                      >
+                        Change
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-ghost"
+                        onClick={() => void onRemoveProjectPath?.(mapping)}
+                        title="Remove only this Mac's saved mapping — never a folder, task, or sidebar entry"
+                      >
+                        Remove
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </section>
+          )}
+
           <section className="settings-section profile-links-section" aria-labelledby="settings-links">
             <div className="profile-links-heading">
               <div className="profile-links-copy">
@@ -1090,9 +1140,14 @@ export default function SyncPanel({
                   <button
                     type="button"
                     className="btn profile-refresh-linkage"
-                    onClick={() => void probeStorages()}
+                    onClick={() => {
+                      // Both sides go stale: the storages' cloud profiles AND
+                      // the local folders (file counts, set-up-vs-sync state).
+                      void probeStorages();
+                      onRefresh?.();
+                    }}
                     disabled={probing}
-                    title="Re-check each storage for its cloud profiles and refresh link status"
+                    title="Re-check each storage for its cloud profiles and re-scan local profile folders"
                     aria-busy={probing}
                   >
                     <Icon name="refresh" size={17} />
