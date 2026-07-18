@@ -5,6 +5,7 @@ import type {
   BundleRecipe,
   BundleSnapshotSummary,
   ConnectProjectBundleRequest,
+  CreateSetupDraftResult,
   DependencyPlan,
   DependencyResult,
   LocalProjectRegistration,
@@ -13,6 +14,7 @@ import type {
   ProjectDetail,
   ProjectOperationResult,
   ProjectProvider,
+  ProjectSetupDraft,
   ProjectStorageLink,
   ProviderProfile,
   ProviderProfileProbe,
@@ -24,6 +26,8 @@ import type {
   RestoreResult,
   SaveProjectBindingRequest,
   SaveProjectLinkRequest,
+  SetupDraftInspection,
+  SetupDraftList,
   SyncConfigV3,
 } from "../../types";
 
@@ -124,4 +128,25 @@ export const projectSyncApi = {
 
   getReadiness: (bundleId: string, binding: ProjectBinding) =>
     invoke<BundleReadiness>("get_bundle_readiness", { bundleId, binding }),
+
+  listSetupDrafts: () =>
+    invoke<SetupDraftList>("list_setup_drafts"),
+
+  createSetupDraft: (projectRoot: string) =>
+    invoke<CreateSetupDraftResult>("create_setup_draft", { projectRoot }),
+
+  getSetupDraft: (draftId: string) =>
+    invoke<ProjectSetupDraft | null>("get_setup_draft", { draftId }),
+
+  updateSetupDraft: (draft: ProjectSetupDraft) =>
+    invoke<ProjectSetupDraft>("update_setup_draft", { draft }),
+
+  discardSetupDraft: (draftId: string) =>
+    invoke<boolean>("discard_setup_draft", { draftId }),
+
+  inspectSetupDraft: (draftId: string) =>
+    invoke<SetupDraftInspection>("inspect_setup_draft", { draftId }),
+
+  finalizeProjectSetup: (draftId: string, expectedRevision: number) =>
+    invoke<ProjectDetail>("finalize_project_setup", { draftId, expectedRevision }),
 };

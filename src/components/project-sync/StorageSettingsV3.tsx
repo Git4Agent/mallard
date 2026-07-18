@@ -50,7 +50,7 @@ export function StorageEditor({
       </header>
       {storage.kind === "local" ? (
         <label className="v3-folder-field compact">
-          <span>Shared folder</span>
+          <span>Location path</span>
           <div>
             <input value={storage.local_dir ?? ""} onChange={(event) => set({ local_dir: event.target.value })} placeholder="/Volumes/backup/agent-sync-v3" disabled={disabled} />
             <button type="button" className="btn" onClick={() => void chooseFolder()} disabled={disabled}>Choose</button>

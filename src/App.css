@@ -176,7 +176,9 @@ summary:focus-visible {
 }
 
 .app.resizing-sidebar,
-.app.resizing-sidebar * {
+.app.resizing-sidebar *,
+.v3-app.resizing-sidebar,
+.v3-app.resizing-sidebar * {
   cursor: col-resize !important;
   user-select: none;
 }
@@ -2659,8 +2661,8 @@ summary:focus-visible {
 
 .v3-sidebar {
   position: relative;
-  width: 278px;
-  min-width: 278px;
+  width: var(--v3-sidebar-width, 318px);
+  min-width: var(--v3-sidebar-width, 318px);
   height: 100%;
   display: flex;
   flex-direction: column;
@@ -3673,9 +3675,39 @@ summary:focus-visible {
 
 /* Project-scoped shell using the established profile-link visual language. */
 .v3-sidebar {
-  width: 318px;
-  min-width: 318px;
+  width: var(--v3-sidebar-width, 318px);
+  min-width: var(--v3-sidebar-width, 318px);
   background: var(--bg-1);
+}
+
+.v3-sidebar-resizer {
+  position: relative;
+  z-index: 7;
+  width: 7px;
+  margin-right: -3px;
+  margin-left: -4px;
+  flex: 0 0 7px;
+  cursor: col-resize;
+  touch-action: none;
+}
+
+.v3-sidebar-resizer::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 3px;
+  width: 1px;
+  background: transparent;
+  transition: background 120ms ease;
+}
+
+.v3-sidebar-resizer:hover::after,
+.v3-sidebar-resizer:active::after,
+.v3-sidebar-resizer:focus-visible::after {
+  background: var(--border-strong);
+}
+
+.v3-sidebar-resizer:focus-visible {
+  outline: none;
 }
 
 .v3-sidebar-drag {
@@ -4098,14 +4130,20 @@ summary:focus-visible {
 }
 
 @media (max-width: 980px) {
-  .v3-sidebar {
-    width: 274px;
-    min-width: 274px;
-  }
-
   .v3-project-links-page {
     padding-left: 20px;
     padding-right: 20px;
+  }
+}
+
+@media (max-width: 720px) {
+  .v3-sidebar {
+    width: 72px;
+    min-width: 72px;
+  }
+
+  .v3-sidebar-resizer {
+    display: none;
   }
 }
 
@@ -4915,6 +4953,7 @@ summary:focus-visible {
 }
 
 .storage-link-block {
+  container-type: inline-size;
   overflow: hidden;
   margin-bottom: 7px;
   border: 1px solid var(--border-mid);
@@ -5124,25 +5163,45 @@ div.storage-link-main {
   white-space: nowrap;
 }
 
+.storage-link-action-group {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-muted);
+}
+
 .storage-link-sync {
-  min-height: 34px;
+  min-height: 30px;
   flex: 0 0 auto;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 0 6px;
+  gap: 5px;
+  padding: 0 8px;
   border: 0;
   border-radius: 7px;
   background: transparent;
   color: var(--text-0);
   font: inherit;
-  font-size: 12px;
+  font-size: 11.5px;
+  font-weight: 540;
   cursor: pointer;
   transition: background 140ms ease, color 140ms ease;
 }
 
 .storage-link-sync:hover:not(:disabled) {
   background: var(--bg-hover);
+}
+
+.storage-link-sync-primary {
+  background: var(--chip-bg);
+  color: var(--text-0);
+}
+
+.storage-link-sync-primary:hover:not(:disabled) {
+  background: var(--chip-strong-bg);
 }
 
 .storage-link-sync:disabled {
@@ -5174,6 +5233,42 @@ div.storage-link-main {
 .storage-link-profile-settings.active {
   background: var(--button-bg-hover);
   color: var(--text-0);
+}
+
+/* The cards share the workspace with a fixed sidebar, so viewport breakpoints
+   do not describe the space this row actually has. Reflow from the link's own
+   width before the storage/profile columns collide with the action labels. */
+@container (max-width: 720px) {
+  .storage-link-row {
+    flex-wrap: wrap;
+  }
+
+  .storage-link-actions {
+    width: 100%;
+    min-height: 48px;
+    flex: 0 0 100%;
+    justify-content: flex-start;
+    padding: 7px 9px 8px;
+    border-top: 1px solid var(--border);
+    border-left: 0;
+  }
+}
+
+@container (max-width: 480px) {
+  .storage-link-storage-section {
+    width: 100%;
+    flex: 0 0 100%;
+  }
+
+  .storage-link-profile-section {
+    min-height: 52px;
+    flex: 1 1 50%;
+    border-top: 1px solid var(--border);
+  }
+
+  .storage-link-storage-section + .storage-link-profile-section {
+    border-left: 0;
+  }
 }
 
 .storage-link-detail {
@@ -5253,6 +5348,129 @@ div.storage-link-main {
 
 .v3-inline-storage-save span {
   margin-right: auto;
+}
+
+.v3-storage-settings-dedicated {
+  margin-top: 26px;
+}
+
+.v3-storage-repositories {
+  border-top: 1px solid var(--border);
+}
+
+.v3-storage-repositories-heading {
+  min-height: 64px;
+  padding: 12px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.v3-storage-repositories-heading > div {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.v3-storage-repositories-heading h2 {
+  margin: 0;
+  color: var(--text-0);
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.v3-storage-repositories-heading span {
+  color: var(--text-2);
+  font-size: 10.5px;
+}
+
+.v3-storage-repositories-heading .btn {
+  width: 32px;
+  min-height: 32px;
+  padding: 0;
+}
+
+.v3-storage-repository-list {
+  border-top: 1px solid var(--border);
+}
+
+.v3-storage-repository-row {
+  min-height: 62px;
+  padding: 10px 16px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.v3-storage-repository-row:last-child {
+  border-bottom: 0;
+}
+
+.v3-storage-repository-icon {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  border-radius: 7px;
+  color: var(--text-1);
+  background: var(--surface-muted);
+}
+
+.v3-storage-repository-copy,
+.v3-storage-repository-meta {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.v3-storage-repository-copy strong,
+.v3-storage-repository-meta strong {
+  overflow: hidden;
+  color: var(--text-0);
+  font-size: 11.5px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.v3-storage-repository-copy code {
+  overflow: hidden;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.v3-storage-repository-meta {
+  align-items: flex-end;
+}
+
+.v3-storage-repository-meta span {
+  color: var(--text-2);
+  font-size: 9.5px;
+  white-space: nowrap;
+}
+
+.v3-storage-repository-state {
+  min-height: 72px;
+  padding: 18px 16px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border-top: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.v3-storage-repositories > .v3-callout {
+  margin: 0 16px 16px;
 }
 
 .v3-inline-bundle-picker {
@@ -5683,7 +5901,7 @@ div.storage-link-main {
   .storage-link-actions {
     width: 100%;
     flex: 0 0 100%;
-    justify-content: flex-end;
+    justify-content: flex-start;
     margin-left: 0;
     padding: 7px 9px 8px;
     border-top: 1px solid var(--border);
@@ -5818,3 +6036,55 @@ div.storage-link-main {
     flex-basis: 100%;
   }
 }
+
+/* Project setup workspace (resumable drafts) */
+.v3-setup-workspace .v3-modal-body { display: flex; flex-direction: column; gap: 10px; }
+.v3-setup-section { display: flex; flex-direction: column; gap: 8px; }
+.v3-setup-heading-actions { display: flex; align-items: center; gap: 8px; }
+.v3-setup-state {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  background: var(--surface-muted);
+}
+.v3-setup-state.ready { color: var(--green); background: color-mix(in srgb, var(--green) 10%, transparent); }
+.v3-setup-state.attention { color: var(--yellow); background: var(--warning-soft); }
+.v3-setup-state.blocked { color: var(--red); background: color-mix(in srgb, var(--red) 10%, transparent); }
+.v3-setup-hint { color: var(--text-3); font-size: 9.5px; }
+.v3-setup-acknowledge {
+  margin-top: 8px;
+  padding: 8px;
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--warning-soft);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+.v3-setup-acknowledge input { margin-top: 2px; }
+.v3-setup-footer {
+  position: sticky;
+  bottom: 0;
+  background: var(--surface-card);
+  border-top: 1px solid var(--border);
+}
+.v3-setup-save-state { color: var(--text-3); font-size: 10px; }
+.v3-draft-badge {
+  margin-left: auto;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 8.5px;
+  font-weight: 600;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-2);
+  background: var(--surface-muted);
+}
+.v3-draft-badge.attention { color: var(--yellow); background: var(--warning-soft); }
+.v3-sidebar-draft .sidebar-profile-main span:first-of-type { overflow: hidden; text-overflow: ellipsis; }

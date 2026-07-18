@@ -1,11 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { MouseEvent as ReactMouseEvent } from "react";
+import type {
+  CSSProperties,
+  KeyboardEvent as ReactKeyboardEvent,
+  MouseEvent as ReactMouseEvent,
+  PointerEvent as ReactPointerEvent,
+} from "react";
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import type {
   AppTheme,
   BundleReadiness,
-  BundleRecipe,
   BundleSnapshotSummary,
   DependencyPlan,
   DependencyResult,
@@ -14,7 +18,6 @@ import type {
   LogLine,
   ProjectBinding,
   ProjectDetail,
-  ProjectDiscovery,
   ProjectProvider,
   ProjectStorageLink,
   ProviderProfile,
@@ -23,15 +26,15 @@ import type {
   ResourceStatusReport,
   RestorePlan,
   RestoreResult,
+  SetupDraftSummary,
   SyncConfigV3,
 } from "../../types";
 import Icon from "../Icons";
 import LogPanel from "../LogPanel";
-import AddProjectDialog from "./AddProjectDialog";
 import BundleConnectionDialog from "./BundleConnectionDialog";
 import ProjectBindingEditor, { type ProjectBindingDraft } from "./ProjectBindingEditor";
 import ProjectLinksWorkspace from "./ProjectLinksWorkspace";
-import ProjectProfilePicker from "./ProjectProfilePicker";
+import ProjectSetupWorkspace, { type SetupCompletion } from "./ProjectSetupWorkspace";
 import ProjectSidebar from "./ProjectSidebar";
 import RestorePlanView from "./RestorePlanView";
 import { projectSyncApi } from "./api";
@@ -57,6 +60,33 @@ const EMPTY_CONFIG: SyncConfigV3 = {
   projects: [],
   links: [],
 };
+
+const PROJECT_SIDEBAR_WIDTH_KEY = "agent-sync.project-sidebar-width";
+const DEFAULT_PROJECT_SIDEBAR_WIDTH = 318;
+const MIN_PROJECT_SIDEBAR_WIDTH = 220;
+const MAX_PROJECT_SIDEBAR_WIDTH = 560;
+
+function clampSidebarWidth(width: number, maxWidth = MAX_PROJECT_SIDEBAR_WIDTH): number {
+  return Math.min(maxWidth, Math.max(MIN_PROJECT_SIDEBAR_WIDTH, width));
+}
+
+function availableProjectSidebarWidth(): number {
+  return Math.max(
+    MIN_PROJECT_SIDEBAR_WIDTH,
+    Math.min(MAX_PROJECT_SIDEBAR_WIDTH, window.innerWidth - 420),
+  );
+}
+
+function storedSidebarWidth(): number {
+  try {
+    const value = Number.parseInt(window.localStorage.getItem(PROJECT_SIDEBAR_WIDTH_KEY) ?? "", 10);
+    return Number.isFinite(value)
+      ? clampSidebarWidth(value, window.innerWidth > 720 ? availableProjectSidebarWidth() : MAX_PROJECT_SIDEBAR_WIDTH)
+      : DEFAULT_PROJECT_SIDEBAR_WIDTH;
+  } catch {
+    return DEFAULT_PROJECT_SIDEBAR_WIDTH;
+  }
+}
 
 interface PendingBundleConnection {
   projectId: string;
@@ -86,21 +116,6 @@ function defaultProfileIds(): Partial<Record<ProjectProvider, string>> {
   return {};
 }
 
-function snapshotRecipe(snapshot: BundleSnapshotSummary): BundleRecipe {
-  if (snapshot.recipe) return snapshot.recipe;
-  return {
-    schema_version: 1,
-    revision: 0,
-    entries: Object.fromEntries((snapshot.resources ?? [])
-      .filter((resource) => resource.apply_policy !== "never")
-      .map((resource) => [resource.resource_id, {
-        resource_id: resource.resource_id,
-        apply_policy: resource.apply_policy,
-        required: false,
-      }])),
-  };
-}
-
 export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Props) {
   const [config, setConfig] = useState<SyncConfigV3>(EMPTY_CONFIG);
   const [registrations, setRegistrations] = useState<LocalProjectRegistration[]>([]);
@@ -115,12 +130,13 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const [readiness, setReadiness] = useState<BundleReadiness | null>(null);
   const [activeStorageByProject, setActiveStorageByProject] = useState<Record<string, string>>({});
   const [storageEditorRequest, setStorageEditorRequest] = useState<
-    | { mode: "edit"; storageId: string; requestId: number }
+    | { mode: "toggle"; storageId: string; requestId: number }
     | { mode: "create"; storageKind: "local" | "s3"; requestId: number }
+    | { mode: "close"; requestId: number }
     | null
   >(null);
   const [projectEditorRequest, setProjectEditorRequest] = useState<
-    { projectId: string; requestId: number } | null
+    { mode: "toggle" | "close"; projectId: string; requestId: number } | null
   >(null);
 
   const [loading, setLoading] = useState(true);
@@ -133,14 +149,15 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const [activityOpen, setActivityOpen] = useState(false);
   const [logHeight, setLogHeight] = useState(240);
   const [resizingLog, setResizingLog] = useState(false);
+  const [sidebarWidth, setSidebarWidth] = useState(storedSidebarWidth);
+  const [resizingSidebar, setResizingSidebar] = useState(false);
   const [unreadLogs, setUnreadLogs] = useState(0);
   const activityOpenRef = useRef(false);
+  const sidebarResizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
 
-  const [discovery, setDiscovery] = useState<ProjectDiscovery | null>(null);
-  const [pendingProjectRoot, setPendingProjectRoot] = useState<string | null>(null);
-  const [addError, setAddError] = useState<string | null>(null);
+  const [setupDrafts, setSetupDrafts] = useState<SetupDraftSummary[]>([]);
+  const [setupDraftId, setSetupDraftId] = useState<string | null>(null);
   const [editingBinding, setEditingBinding] = useState<ProjectBindingDraft | null>(null);
-  const discoveryRequest = useRef(0);
 
   const [restorePlan, setRestorePlan] = useState<RestorePlan | null>(null);
   const [restoreBinding, setRestoreBinding] = useState<ProjectBinding | null>(null);
@@ -154,6 +171,23 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   useEffect(() => {
     activityOpenRef.current = activityOpen;
   }, [activityOpen]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(PROJECT_SIDEBAR_WIDTH_KEY, String(sidebarWidth));
+    } catch {
+      // Persistence is a convenience; resizing still works if storage is unavailable.
+    }
+  }, [sidebarWidth]);
+
+  useEffect(() => {
+    const fitSidebarToWindow = () => {
+      if (window.innerWidth <= 720) return;
+      setSidebarWidth((current) => clampSidebarWidth(current, availableProjectSidebarWidth()));
+    };
+    window.addEventListener("resize", fitSidebarToWindow);
+    return () => window.removeEventListener("resize", fitSidebarToWindow);
+  }, []);
 
   useEffect(() => {
     const unlisten = listen<LogLine>("sync-log", (event) => {
@@ -192,6 +226,47 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
 
     document.addEventListener("mousemove", handleMouseMove);
     document.addEventListener("mouseup", handleMouseUp);
+  };
+
+  const startSidebarResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+    sidebarResizeRef.current = {
+      pointerId: event.pointerId,
+      startX: event.clientX,
+      startWidth: sidebarWidth,
+    };
+    setResizingSidebar(true);
+  };
+
+  const continueSidebarResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    const resize = sidebarResizeRef.current;
+    if (!resize || resize.pointerId !== event.pointerId) return;
+    setSidebarWidth(clampSidebarWidth(
+      resize.startWidth + event.clientX - resize.startX,
+      availableProjectSidebarWidth(),
+    ));
+  };
+
+  const finishSidebarResize = (event: ReactPointerEvent<HTMLDivElement>) => {
+    if (sidebarResizeRef.current?.pointerId !== event.pointerId) return;
+    sidebarResizeRef.current = null;
+    setResizingSidebar(false);
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+  };
+
+  const resizeSidebarWithKeyboard = (event: ReactKeyboardEvent<HTMLDivElement>) => {
+    let nextWidth: number | null = null;
+    if (event.key === "ArrowLeft") nextWidth = sidebarWidth - 16;
+    if (event.key === "ArrowRight") nextWidth = sidebarWidth + 16;
+    if (event.key === "Home") nextWidth = MIN_PROJECT_SIDEBAR_WIDTH;
+    if (event.key === "End") nextWidth = availableProjectSidebarWidth();
+    if (nextWidth === null) return;
+    event.preventDefault();
+    setSidebarWidth(clampSidebarWidth(nextWidth, availableProjectSidebarWidth()));
   };
 
   const binding = detail?.binding ?? null;
@@ -260,12 +335,15 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       setConfig(EMPTY_CONFIG);
     }
     try {
+      // Listing projects also completes any interrupted setup finalization,
+      // so drafts are refreshed afterwards to reflect consumed drafts.
       nextProjects = await projectSyncApi.listProjects();
       setRegistrations(nextProjects);
     } catch (reason) {
       failures.push(`Projects: ${errorMessage(reason)}`);
       setRegistrations([]);
     }
+    await refreshSetupDrafts();
     try {
       nextProfiles = await projectSyncApi.listProviderProfiles();
       setProfiles(nextProfiles);
@@ -385,7 +463,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     if (!path.trim()) return null;
     setBusy(true);
     setError(null);
-    setAddError(null);
     try {
       const probe = await projectSyncApi.probeProviderProfile(provider, path.trim());
       const currentProfiles = await projectSyncApi.listProviderProfiles();
@@ -400,9 +477,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       setProfiles(existing ? currentProfiles : await projectSyncApi.listProviderProfiles());
       return profile;
     } catch (reason) {
-      const message = errorMessage(reason);
-      setError(message);
-      setAddError(message);
+      setError(errorMessage(reason));
       return null;
     } finally {
       setBusy(false);
@@ -415,107 +490,81 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     return createProfileAtPath(provider, picked);
   };
 
-  const discoverForProfiles = async (
-    projectRoot: string,
-    profileIds: Partial<Record<ProjectProvider, string>>,
-  ): Promise<boolean> => {
-    const requestId = ++discoveryRequest.current;
-    setBusy(true);
-    setAddError(null);
+  const refreshSetupDrafts = async () => {
     try {
-      const nextDiscovery = await projectSyncApi.discoverProject(projectRoot, profileIds);
-      if (requestId !== discoveryRequest.current) return false;
-      setDiscovery(nextDiscovery);
-      return true;
-    } catch (reason) {
-      if (requestId === discoveryRequest.current) setAddError(errorMessage(reason));
-      return false;
-    } finally {
-      if (requestId === discoveryRequest.current) setBusy(false);
+      const listed = await projectSyncApi.listSetupDrafts();
+      setSetupDrafts(listed.drafts);
+    } catch {
+      // Drafts are a convenience surface; the projects list stays usable.
     }
   };
 
   const beginAddProject = async () => {
     const picked = await open({ directory: true, multiple: false });
     if (typeof picked !== "string" || !picked) return;
-    setAddError(null);
-    setPendingProjectRoot(picked);
-  };
-
-  const continueAddProject = async (profileIds: Partial<Record<ProjectProvider, string>>) => {
-    if (!pendingProjectRoot) return;
-    if (await discoverForProfiles(pendingProjectRoot, profileIds)) {
-      setPendingProjectRoot(null);
+    setBusy(true);
+    setError(null);
+    try {
+      const created = await projectSyncApi.createSetupDraft(picked);
+      setSetupDraftId(created.draft.draft_id);
+      if (created.resumed) {
+        setNotice(`Resumed the saved setup draft for ${created.draft.display_name}.`);
+      }
+      await refreshSetupDrafts();
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
     }
   };
 
-  const createProject = async (
-    displayName: string,
-    projectRoot: string,
-    profileIds: Partial<Record<ProjectProvider, string>>,
-    recipe: BundleRecipe,
-    storageIds: string[],
-    remoteBundle: BundleSnapshotSummary | null,
-  ) => {
+  const openSetupDraft = (draftId: string) => {
+    setError(null);
+    setSetupDraftId(draftId);
+  };
+
+  const closeSetupDraft = async () => {
+    setSetupDraftId(null);
+    await refreshSetupDrafts();
+  };
+
+  const discardSetupDraft = async (draftId: string) => {
+    const summary = setupDrafts.find((candidate) => candidate.draft_id === draftId);
+    const approved = await confirm(
+      `Discard the setup draft for “${summary?.display_name ?? "this project"}”?\n\nOnly the draft is removed. No project files are touched.`,
+      { title: "Discard draft" },
+    );
+    if (!approved) return;
     setBusy(true);
-    setAddError(null);
-    let registered: LocalProjectRegistration | null = null;
+    setError(null);
     try {
-      registered = await projectSyncApi.registerProject({
-        display_name: remoteBundle?.display_name ?? displayName,
-        // A manually selected remote repo owns the portable identity. Keep a
-        // local fingerprint only when the remote manifest does not have one.
-        repository_fingerprint: remoteBundle?.repository_fingerprint
-          ?? discovery?.repository_fingerprint
-          ?? null,
-        bundle_id: remoteBundle?.bundle_id ?? null,
-      });
-      const selectedRecipe = remoteBundle ? snapshotRecipe(remoteBundle) : recipe;
-      const savedProject = await projectSyncApi.saveRecipe(registered.local_project_id, {
-        ...selectedRecipe,
-        revision: registered.recipe.revision,
-      });
-      const savedBinding = await projectSyncApi.saveBinding({
-        local_project_id: registered.local_project_id,
-        project_root: projectRoot,
-        profile_ids: profileIds,
-        expected_revision: null,
-      });
-      for (const storageId of storageIds) {
-        await projectSyncApi.saveLink({
-          local_project_id: savedProject.local_project_id,
-          storage_id: storageId,
-          pinned: true,
-        });
-      }
-      setDiscovery(null);
-      setNotice(remoteBundle
-        ? `${savedProject.display_name} connected to the existing remote repo. Review Pull before files are applied.`
-        : `${savedProject.display_name} added locally${storageIds.length > 0 ? " and linked to storage" : " — link storage when ready"}.`);
-      const { nextConfig } = await loadShell();
-      setBindings((current) => upsertBinding(current, savedBinding));
-      setActiveProjectId(savedProject.local_project_id);
-      await loadProjectData(savedProject.local_project_id, nextConfig, storageIds[0]);
-      if (remoteBundle) {
-        await planRestore(
-          remoteBundle.storage_id,
-          remoteBundle.bundle_id,
-          savedBinding,
-          remoteBundle.display_name,
-        );
-      }
+      await projectSyncApi.discardSetupDraft(draftId);
+      if (setupDraftId === draftId) setSetupDraftId(null);
+      await refreshSetupDrafts();
+      setNotice("Setup draft discarded. Project files were not touched.");
     } catch (reason) {
-      if (registered) {
-        setDiscovery(null);
-        setError(`The project was registered, but setup is incomplete: ${errorMessage(reason)}`);
-        const { nextConfig } = await loadShell();
-        setActiveProjectId(registered.local_project_id);
-        await loadProjectData(registered.local_project_id, nextConfig);
-      } else {
-        setAddError(errorMessage(reason));
-      }
+      setError(errorMessage(reason));
     } finally {
       setBusy(false);
+    }
+  };
+
+  const completeSetup = async (detail: ProjectDetail, completion: SetupCompletion) => {
+    setSetupDraftId(null);
+    const projectId = detail.project.local_project_id;
+    const storageId = detail.links[0]?.storage_id ?? null;
+    setNotice(completion === "pull"
+      ? `${detail.project.display_name} connected. Review Pull before files are applied.`
+      : `${detail.project.display_name} is set up${storageId ? "" : " — link storage when ready"}.`);
+    const { nextConfig } = await loadShell();
+    await refreshSetupDrafts();
+    setActiveProjectId(projectId);
+    if (detail.binding) setBindings((current) => upsertBinding(current, detail.binding as ProjectBinding));
+    await loadProjectData(projectId, nextConfig, storageId);
+    if (completion === "pull" && storageId && detail.binding) {
+      await planRestore(storageId, detail.project.bundle_id, detail.binding, detail.project.display_name);
+    } else if (completion === "push" && storageId) {
+      await pushProject(projectId, storageId);
     }
   };
 
@@ -944,11 +993,18 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     await planRestore(restorePlan.storage_id, restorePlan.bundle_id, restoreBinding, restoreProjectName);
   };
 
-  const saveStorageConfig = async (next: SyncConfigV3) => {
+  const saveStorageConfig = async (
+    update: (current: SyncConfigV3) => SyncConfigV3,
+    successNotice = "Project storage settings saved.",
+  ): Promise<boolean> => {
     setBusy(true);
     setError(null);
     try {
-      const saved = await projectSyncApi.saveConfig(next);
+      // Focused project operations can advance the global config revision.
+      // Rebase this storage-only edit on the latest document instead of the
+      // potentially stale React snapshot used to render the editor.
+      const current = await projectSyncApi.getConfig();
+      const saved = await projectSyncApi.saveConfig(update(current));
       setConfig(saved);
       setRegistrations(saved.projects);
       setDetail((current) => {
@@ -967,37 +1023,91 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
           link.local_project_id === localProjectId && link.storage_id === storageId
         )),
       )));
-      setNotice("Project storage settings saved.");
+      setNotice(successNotice);
+      return true;
     } catch (reason) {
       setError(errorMessage(reason));
+      return false;
     } finally {
       setBusy(false);
     }
   };
 
   const saveInlineStorage = async (storage: SyncConfigV3["storages"][number]) => {
-    const exists = config.storages.some((candidate) => candidate.id === storage.id);
-    await saveStorageConfig({
-      ...config,
-      storages: exists
-        ? config.storages.map((candidate) => candidate.id === storage.id ? storage : candidate)
-        : [...config.storages, storage],
+    await saveStorageConfig((current) => {
+      const exists = current.storages.some((candidate) => candidate.id === storage.id);
+      return {
+        ...current,
+        storages: exists
+          ? current.storages.map((candidate) => candidate.id === storage.id ? storage : candidate)
+          : [...current.storages, storage],
+      };
     });
   };
 
+  const removeStorage = async (storageId: string) => {
+    const storage = config.storages.find((candidate) => candidate.id === storageId);
+    if (!storage) return;
+    const storageName = storage.name || "Storage";
+    const linkedProjects = config.links.filter((link) => link.storage_id === storageId).length;
+    if (linkedProjects > 0) {
+      setError(`${storageName} is linked to ${linkedProjects} project${linkedProjects === 1 ? "" : "s"}. Unlink it before removing the storage.`);
+      return;
+    }
+    const approved = await confirm(
+      `Remove “${storageName}” from Agent Sync?\n\nFiles already written to the storage location will not be deleted.`,
+      { title: "Remove storage" },
+    );
+    if (!approved) return;
+    const removed = await saveStorageConfig((current) => {
+      if (current.links.some((link) => link.storage_id === storageId)) {
+        throw new Error(`${storageName} is linked to a project. Unlink it before removing the storage.`);
+      }
+      return {
+        ...current,
+        storages: current.storages.filter((candidate) => candidate.id !== storageId),
+      };
+    }, `${storageName} removed. Stored files were not deleted.`);
+    if (removed) {
+      setStorageEditorRequest((current) => ({
+        mode: "close",
+        requestId: (current?.requestId ?? 0) + 1,
+      }));
+    }
+  };
+
   return (
-    <div className="v3-app">
+    <div
+      className={`v3-app${resizingSidebar ? " resizing-sidebar" : ""}`}
+      style={{ "--v3-sidebar-width": `${sidebarWidth}px` } as CSSProperties}
+    >
       <ProjectSidebar
         projects={projects}
+        drafts={setupDrafts}
+        activeDraftId={setupDraftId}
+        onSelectDraft={(draftId) => openSetupDraft(draftId)}
+        onDiscardDraft={(draftId) => void discardSetupDraft(draftId)}
         storages={config.storages}
+        storageUsage={Object.fromEntries(config.storages.map((storage) => [
+          storage.id,
+          config.links.filter((link) => link.storage_id === storage.id).length,
+        ]))}
         activeProjectId={activeProjectId}
         loading={loading}
         busy={busy}
         activityOpen={activityOpen}
         unreadLogs={unreadLogs}
-        onSelectProject={(id) => void selectProject(id)}
+        onSelectProject={(id) => {
+          setProjectEditorRequest((current) => ({
+            mode: "close",
+            projectId: id,
+            requestId: (current?.requestId ?? 0) + 1,
+          }));
+          void selectProject(id);
+        }}
         onConfigureProject={(projectId) => {
           setProjectEditorRequest((current) => ({
+            mode: "toggle",
             projectId,
             requestId: (current?.requestId ?? 0) + 1,
           }));
@@ -1013,11 +1123,12 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         onRefresh={() => void refresh()}
         onOpenStorage={(storageId) => {
           setStorageEditorRequest((current) => ({
-            mode: "edit",
+            mode: "toggle",
             storageId,
             requestId: (current?.requestId ?? 0) + 1,
           }));
         }}
+        onRemoveStorage={(storageId) => void removeStorage(storageId)}
         onAddStorage={() => {
           setStorageEditorRequest((current) => ({
             mode: "create",
@@ -1026,6 +1137,23 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
           }));
         }}
         onOpenLegacy={onOpenLegacy}
+      />
+
+      <div
+        className="v3-sidebar-resizer"
+        role="separator"
+        aria-label="Resize sidebar"
+        aria-orientation="vertical"
+        aria-valuemin={MIN_PROJECT_SIDEBAR_WIDTH}
+        aria-valuemax={availableProjectSidebarWidth()}
+        aria-valuenow={sidebarWidth}
+        tabIndex={0}
+        onPointerDown={startSidebarResize}
+        onPointerMove={continueSidebarResize}
+        onPointerUp={finishSidebarResize}
+        onPointerCancel={finishSidebarResize}
+        onKeyDown={resizeSidebarWithKeyboard}
+        onDoubleClick={() => setSidebarWidth(DEFAULT_PROJECT_SIDEBAR_WIDTH)}
       />
 
       <div className={`v3-workspace${resizingLog ? " resizing-log" : ""}`}>
@@ -1090,42 +1218,20 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
               }));
             }}
             onSaveStorage={saveInlineStorage}
-            onSelectBundle={connectStorageBundle}
             storageEditorRequest={storageEditorRequest}
             onStorageEditorRequestHandled={() => setStorageEditorRequest(null)}
             projectEditorRequest={projectEditorRequest}
             onProjectEditorRequestHandled={() => setProjectEditorRequest(null)}
-            newProjectSetup={pendingProjectRoot ? (
-              <ProjectProfilePicker
-                inline
-                projectRoot={pendingProjectRoot}
-                profiles={profiles}
-                initialProfileIds={defaultProfileIds()}
-                busy={busy}
-                error={addError}
-                onAddProfile={chooseAndCreateProfile}
-                onCancel={() => {
-                  setPendingProjectRoot(null);
-                  setAddError(null);
-                }}
-                onContinue={(profileIds) => void continueAddProject(profileIds)}
-              />
-            ) : discovery ? (
-              <AddProjectDialog
-                inline
-                discovery={discovery}
+            newProjectSetup={setupDraftId ? (
+              <ProjectSetupWorkspace
+                key={setupDraftId}
+                draftId={setupDraftId}
                 profiles={profiles}
                 storages={config.storages}
                 busy={busy}
-                error={addError}
-                onCancel={() => setDiscovery(null)}
-                onCreate={(displayName, projectRoot, profileIds, recipe, storageIds, remoteBundle) => (
-                  void createProject(displayName, projectRoot, profileIds, recipe, storageIds, remoteBundle)
-                )}
-                onProfilesChange={(profileIds) => {
-                  void discoverForProfiles(discovery.project_root, profileIds);
-                }}
-                onAddProfile={chooseAndCreateProfile}
+                onClose={() => void closeSetupDraft()}
+                onDiscard={(draftId) => void discardSetupDraft(draftId)}
+                onFinalized={(detail, completion) => void completeSetup(detail, completion)}
               />
             ) : null}
         />

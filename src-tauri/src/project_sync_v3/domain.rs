@@ -16,6 +16,9 @@ pub const BUNDLE_SCHEMA_V3: u32 = 3;
 pub const RECIPE_SCHEMA_V1: u32 = 1;
 pub const RESTORE_PLAN_SCHEMA_V1: u32 = 1;
 pub const DEPENDENCY_PLAN_SCHEMA_V1: u32 = 1;
+pub const SETUP_DRAFT_SCHEMA_V1: u32 = 1;
+pub const SETUP_TRANSACTION_SCHEMA_V1: u32 = 1;
+pub const MAX_SETUP_DRAFTS: usize = 64;
 
 pub const MAX_PROJECTS: usize = 1_024;
 pub const MAX_STORAGES: usize = 128;
@@ -106,6 +109,7 @@ named_id!(PlanId, "plan id");
 named_id!(ActionId, "action id");
 named_id!(MaterializationId, "materialization id");
 named_id!(LocalProviderProfileId, "local provider profile id");
+named_id!(SetupDraftId, "setup draft id");
 
 /// A bundle ID is an opaque, generated 128-bit value.  Requiring its exact
 /// lowercase hexadecimal representation makes it safe as one cloud key
@@ -956,6 +960,203 @@ impl MachineProjectState {
         self.bindings.iter().find(|binding| {
             &binding.local_project_id == id && binding.state == BindingState::Active
         })
+    }
+}
+
+/// Which local provider profile a setup draft intends to use.  A pending
+/// selection stays draft-only; the profile record is created during
+/// finalization so an abandoned draft never pollutes the profile catalog.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DraftProfileSelection {
+    Existing {
+        profile_id: LocalProviderProfileId,
+    },
+    Pending {
+        path: String,
+        #[serde(default)]
+        display_name: String,
+    },
+}
+
+/// Which storage a setup draft intends to link.  Pending storage carries the
+/// full (possibly still incomplete) configuration, including credentials, so
+/// drafts require the same private file permissions as the config itself.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DraftStorageSelection {
+    Existing { storage_id: StorageId },
+    Pending { storage: StorageConfigV3 },
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DraftRepositoryChoice {
+    /// Publish a new remote repo under the draft's preallocated bundle ID.
+    New,
+    /// Connect to an existing remote bundle.  A fingerprint mismatch between
+    /// checkout and remote must be explicitly acknowledged before finalize.
+    Existing {
+        storage_id: StorageId,
+        bundle_id: BundleId,
+        #[serde(default)]
+        display_name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        repository_fingerprint: Option<String>,
+        #[serde(default)]
+        mismatch_acknowledged: bool,
+    },
+}
+
+/// A resumable, machine-local project setup draft.  Drafts hold selections
+/// and preallocated identities only — never discovered file contents, remote
+/// listings, or resource payloads; those are rescanned on resume.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ProjectSetupDraft {
+    pub schema: u32,
+    pub draft_id: SetupDraftId,
+    /// Preallocated so every finalize retry reconciles to the same records
+    /// instead of creating duplicates.
+    pub local_project_id: LocalProjectId,
+    /// Bundle identity used when `repository` is `New`.
+    pub new_bundle_id: BundleId,
+    pub project_root: String,
+    pub canonical_project_root: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository_fingerprint: Option<String>,
+    #[serde(default)]
+    pub profiles: BTreeMap<Provider, DraftProfileSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<DraftStorageSelection>,
+    pub repository: DraftRepositoryChoice,
+    /// Resource IDs checked in the setup inventory.
+    #[serde(default)]
+    pub selected_resource_ids: Vec<ResourceId>,
+    /// Digest over the discovered candidate IDs at selection time.  A changed
+    /// signature flags the saved selection for re-review, never silent reuse.
+    #[serde(default)]
+    pub discovery_signature: String,
+    pub revision: u64,
+    pub created_at: u64,
+    pub updated_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+impl ProjectSetupDraft {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != SETUP_DRAFT_SCHEMA_V1 {
+            return Err(format!(
+                "unsupported setup draft schema {} (expected {})",
+                self.schema, SETUP_DRAFT_SCHEMA_V1
+            ));
+        }
+        validate_display_text("draft display name", &self.display_name, false)?;
+        validate_absolute_clean_path("draft project root", &self.project_root)?;
+        validate_absolute_clean_path("draft canonical project root", &self.canonical_project_root)?;
+        if let Some(fingerprint) = &self.repository_fingerprint {
+            validate_sha256("draft repository fingerprint", fingerprint)?;
+        }
+        for selection in self.profiles.values() {
+            if let DraftProfileSelection::Pending { path, display_name } = selection {
+                validate_absolute_clean_path("draft profile path", path)?;
+                validate_display_text("draft profile name", display_name, true)?;
+            }
+        }
+        if let Some(DraftStorageSelection::Pending { storage }) = &self.storage {
+            // A draft may hold a half-edited storage; bound the text instead
+            // of demanding completeness.  Finalize runs the strict validation.
+            validate_display_text("draft storage name", &storage.name, true)?;
+            for value in [
+                &storage.bucket,
+                &storage.account_id,
+                &storage.s3_endpoint,
+                &storage.region,
+                &storage.local_dir,
+            ] {
+                if value.len() > 4_096 || value.chars().any(char::is_control) {
+                    return Err("invalid draft storage field".to_string());
+                }
+            }
+        }
+        if let DraftRepositoryChoice::Existing {
+            display_name,
+            repository_fingerprint,
+            ..
+        } = &self.repository
+        {
+            validate_display_text("draft repository name", display_name, true)?;
+            if let Some(fingerprint) = repository_fingerprint {
+                validate_sha256("draft remote repository fingerprint", fingerprint)?;
+            }
+        }
+        if self.selected_resource_ids.len() > MAX_RESOURCES {
+            return Err(format!("draft exceeds {} resources", MAX_RESOURCES));
+        }
+        if !self.discovery_signature.is_empty() {
+            validate_sha256("draft discovery signature", &self.discovery_signature)?;
+        }
+        if let Some(error) = &self.last_error {
+            if error.len() > 4_096 || error.chars().any(char::is_control) {
+                return Err("invalid draft error text".to_string());
+            }
+        }
+        if self.created_at > self.updated_at {
+            return Err(format!("draft '{}' has invalid timestamps", self.draft_id));
+        }
+        Ok(())
+    }
+}
+
+/// The deterministic records one finalize attempt will create.  Written
+/// before the first document mutation so an interrupted finalization can be
+/// completed (or safely discarded when nothing was applied) on recovery.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct SetupTransaction {
+    pub schema: u32,
+    pub draft_id: SetupDraftId,
+    pub draft_revision: u64,
+    pub created_at: u64,
+    #[serde(default)]
+    pub profiles: Vec<ProviderProfile>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageConfigV3>,
+    pub project: LocalProjectRegistration,
+    #[serde(default)]
+    pub links: Vec<ProjectStorageLink>,
+    pub binding: ProjectBinding,
+}
+
+impl SetupTransaction {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema != SETUP_TRANSACTION_SCHEMA_V1 {
+            return Err(format!(
+                "unsupported setup transaction schema {} (expected {})",
+                self.schema, SETUP_TRANSACTION_SCHEMA_V1
+            ));
+        }
+        for profile in &self.profiles {
+            profile.validate_structure()?;
+        }
+        if let Some(storage) = &self.storage {
+            storage.validate()?;
+        }
+        self.project.validate()?;
+        for link in &self.links {
+            if link.local_project_id != self.project.local_project_id
+                || link.bundle_id != self.project.bundle_id
+            {
+                return Err("setup transaction link does not match its project".to_string());
+            }
+        }
+        self.binding.validate_structure()?;
+        if self.binding.local_project_id != self.project.local_project_id
+            || self.binding.bundle_id != self.project.bundle_id
+        {
+            return Err("setup transaction binding does not match its project".to_string());
+        }
+        Ok(())
     }
 }
 

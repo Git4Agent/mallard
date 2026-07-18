@@ -463,6 +463,82 @@ export interface ProjectDiscovery {
   warnings?: string[];
 }
 
+export type DraftProfileSelection =
+  | { kind: "existing"; profile_id: string }
+  | { kind: "pending"; path: string; display_name: string };
+
+export type DraftStorageSelection =
+  | { kind: "existing"; storage_id: string }
+  | { kind: "pending"; storage: StorageConfigV3 };
+
+export type DraftRepositoryChoice =
+  | { kind: "new" }
+  | {
+    kind: "existing";
+    storage_id: string;
+    bundle_id: string;
+    display_name: string;
+    repository_fingerprint?: string | null;
+    mismatch_acknowledged: boolean;
+  };
+
+/** Machine-local, resumable project setup draft (schema-3 `project_drafts`). */
+export interface ProjectSetupDraft {
+  schema: number;
+  draft_id: string;
+  local_project_id: string;
+  new_bundle_id: string;
+  project_root: string;
+  canonical_project_root: string;
+  display_name: string;
+  repository_fingerprint?: string | null;
+  profiles: Partial<Record<ProjectProvider, DraftProfileSelection>>;
+  storage?: DraftStorageSelection | null;
+  repository: DraftRepositoryChoice;
+  selected_resource_ids: string[];
+  discovery_signature: string;
+  revision: number;
+  created_at: number;
+  updated_at: number;
+  last_error?: string | null;
+}
+
+export interface SetupDraftSummary {
+  draft_id: string;
+  display_name: string;
+  project_root: string;
+  updated_at: number;
+  revision: number;
+  status: "draft" | "attention" | string;
+  last_error?: string | null;
+}
+
+export interface SetupDraftList {
+  drafts: SetupDraftSummary[];
+  warnings?: string[];
+}
+
+export interface CreateSetupDraftResult {
+  draft: ProjectSetupDraft;
+  resumed: boolean;
+}
+
+export interface SetupSectionStatus {
+  section: "project" | "profiles" | "storage" | "repository" | "resources" | string;
+  state: "ready" | "attention" | "blocked" | string;
+  message?: string | null;
+}
+
+export interface SetupDraftInspection {
+  draft: ProjectSetupDraft;
+  sections: SetupSectionStatus[];
+  inventory?: ResourceInventory | null;
+  fresh_discovery_signature?: string | null;
+  selection_stale: boolean;
+  can_finalize: boolean;
+  warnings?: string[];
+}
+
 export interface ProviderProfile {
   profile_id: string;
   provider: ProjectProvider;

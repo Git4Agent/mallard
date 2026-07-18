@@ -13,11 +13,14 @@ use super::domain::{
     generated_named_id, validate_absolute_clean_path, ActionId, ActionStatus, ApplyPolicy,
     BindingState, BundleId, BundleIdentity, BundleKind, BundleRecipe, BundleSnapshot, CapturedWith,
     DependencyAction, DependencyActionKind, DependencyApplicationRecord, DependencyApplyReceipt,
-    DependencyPlan, LocalProjectId, LocalProjectRegistration, LocalProviderProfileId,
+    DependencyPlan, DraftProfileSelection, DraftRepositoryChoice, DraftStorageSelection,
+    LocalProjectId, LocalProjectRegistration, LocalProviderProfileId, MachineProjectState,
     MaterializationId, MaterializationRecord, MaterializationStatus, PlanId, ProjectBinding,
-    ProjectStorageLink, Provenance, Provider, ProviderProfile, RecipeBase, RecipeEntry, ReplicaId,
-    ResourceDescriptor, ResourceId, ResourceKind, ResourceScope, RestoreActionType, RestorePlan,
-    StorageConfigV3, StorageId, StorageKind, SyncConfigV3, DEPENDENCY_PLAN_SCHEMA_V1,
+    ProjectSetupDraft, ProjectStorageLink, Provenance, Provider, ProviderProfile, RecipeBase,
+    RecipeEntry, ReplicaId, ResourceDescriptor, ResourceId, ResourceKind, ResourceScope,
+    RestoreActionType, RestorePlan, SetupDraftId, SetupTransaction, StorageConfigV3, StorageId,
+    StorageKind, SyncConfigV3, DEPENDENCY_PLAN_SCHEMA_V1, SETUP_DRAFT_SCHEMA_V1,
+    SETUP_TRANSACTION_SCHEMA_V1,
 };
 use super::persistence::V3Repository;
 use super::provider_capture::{
@@ -379,7 +382,13 @@ fn save_project_sync_config_with_repository(
 pub async fn list_local_projects(
     app: tauri::AppHandle,
 ) -> Result<Vec<LocalProjectRegistration>, String> {
-    Ok(repository(&app)?.load_config()?.projects)
+    let repository = repository(&app)?;
+    // The shell lists projects first on every launch, so an interrupted
+    // finalization heals here before any project data is rendered.
+    for warning in recover_setup_state(&repository) {
+        emit_log(&app, "warn", &warning);
+    }
+    Ok(repository.load_config()?.projects)
 }
 
 #[tauri::command]
@@ -1286,6 +1295,18 @@ fn discover_project_with_repository(
     selected_path: &str,
     profile_ids: &BTreeMap<Provider, LocalProviderProfileId>,
 ) -> Result<ProjectDiscovery, String> {
+    let profile_paths = resolve_profile_paths(repository, profile_ids)?;
+    discover_project_at(repository, selected_path, &profile_paths, profile_ids)
+}
+
+/// Discovery core shared by profile-ID discovery and setup drafts, which may
+/// mix existing profiles with pending, not-yet-created profile paths.
+fn discover_project_at(
+    repository: &V3Repository,
+    selected_path: &str,
+    profile_paths: &BTreeMap<Provider, String>,
+    profile_ids: &BTreeMap<Provider, LocalProviderProfileId>,
+) -> Result<ProjectDiscovery, String> {
     validate_absolute_clean_path("project root", selected_path)?;
     let project_root = fs_canonicalize(Path::new(selected_path))?;
     if !project_root.is_dir() {
@@ -1314,8 +1335,10 @@ fn discover_project_with_repository(
         }
     }
 
-    let profile_paths = resolve_profile_paths(repository, profile_ids)?;
-    for (provider, path) in &profile_paths {
+    if profile_paths.is_empty() {
+        return Err("choose at least one local provider profile".to_string());
+    }
+    for (provider, path) in profile_paths {
         let path = fs_canonicalize(Path::new(path))?;
         if paths_overlap(&project_root, &path) {
             return Err(format!(
@@ -1554,6 +1577,17 @@ fn persist_auto_selected_conversations(
             ))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    let current = repository
+        .load_config()?
+        .project(local_project_id)
+        .cloned()
+        .ok_or_else(|| format!("unknown local project '{}'", local_project_id))?;
+    if additions
+        .iter()
+        .all(|(resource_id, _)| current.recipe.entries.contains_key(resource_id))
+    {
+        return Ok(current);
+    }
     repository.mutate_config(|config| {
         let project = config
             .projects
@@ -2870,15 +2904,22 @@ fn storage_engine(
         .ok_or_else(|| format!("unknown storage '{}'", storage_id))?;
     let machine = repository.load_bindings()?;
     validate_config_storage_isolation(repository, &config, &machine.bindings, &machine.profiles)?;
+    let engine = engine_for_storage_config(&storage)?;
+    Ok((storage, engine))
+}
+
+/// Build an engine directly from a storage configuration.  Setup drafts use
+/// this for pending storage that is not part of the saved config yet.
+fn engine_for_storage_config(storage: &StorageConfigV3) -> Result<StorageEngine, String> {
     let store = match storage.kind {
         StorageKind::Local => {
             ConfiguredStore::Local(LocalBundleObjectStore::open(&storage.local_dir)?)
         }
         StorageKind::S3 => {
-            ConfiguredStore::S3(S3BundleObjectStore::from_current_runtime(&storage)?)
+            ConfiguredStore::S3(S3BundleObjectStore::from_current_runtime(storage)?)
         }
     };
-    Ok((storage, BundleEngine::new(store, storage_id.clone())))
+    Ok(BundleEngine::new(store, storage.id.clone()))
 }
 
 fn fetch_from_linked_storage(
@@ -3558,6 +3599,1077 @@ fn remove_local_project_with_repository(
     })
 }
 
+// ---------------------------------------------------------------------------
+// Project setup drafts and transactional finalization
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone, Debug)]
+pub struct SetupDraftSummary {
+    pub draft_id: SetupDraftId,
+    pub display_name: String,
+    pub project_root: String,
+    pub updated_at: u64,
+    pub revision: u64,
+    /// `draft` when every referenced record still exists; `attention` when a
+    /// referenced profile or storage disappeared since the draft was saved.
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct SetupDraftList {
+    pub drafts: Vec<SetupDraftSummary>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct CreateSetupDraftResult {
+    pub draft: ProjectSetupDraft,
+    /// True when an existing draft for the same canonical folder was resumed
+    /// instead of creating a duplicate.
+    pub resumed: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct SetupSectionStatus {
+    pub section: String,
+    pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct SetupDraftInspection {
+    pub draft: ProjectSetupDraft,
+    pub sections: Vec<SetupSectionStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub inventory: Option<ResourceInventory>,
+    /// Signature of the fresh discovery; differs from the draft's stored
+    /// signature when the discovered candidate set changed since selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fresh_discovery_signature: Option<String>,
+    pub selection_stale: bool,
+    pub can_finalize: bool,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[tauri::command]
+pub async fn list_setup_drafts(app: tauri::AppHandle) -> Result<SetupDraftList, String> {
+    list_setup_drafts_with_repository(&repository(&app)?)
+}
+
+#[tauri::command]
+pub async fn create_setup_draft(
+    app: tauri::AppHandle,
+    project_root: String,
+) -> Result<CreateSetupDraftResult, String> {
+    let repository = repository(&app)?;
+    run_blocking(move || create_setup_draft_with_repository(&repository, &project_root)).await
+}
+
+#[tauri::command]
+pub async fn get_setup_draft(
+    app: tauri::AppHandle,
+    draft_id: SetupDraftId,
+) -> Result<Option<ProjectSetupDraft>, String> {
+    repository(&app)?.load_setup_draft(&draft_id)
+}
+
+#[tauri::command]
+pub async fn update_setup_draft(
+    app: tauri::AppHandle,
+    draft: ProjectSetupDraft,
+) -> Result<ProjectSetupDraft, String> {
+    let repository = repository(&app)?;
+    run_blocking(move || update_setup_draft_with_repository(&repository, draft)).await
+}
+
+#[tauri::command]
+pub async fn discard_setup_draft(
+    app: tauri::AppHandle,
+    draft_id: SetupDraftId,
+) -> Result<bool, String> {
+    discard_setup_draft_with_repository(&repository(&app)?, &draft_id)
+}
+
+#[tauri::command]
+pub async fn inspect_setup_draft(
+    app: tauri::AppHandle,
+    draft_id: SetupDraftId,
+) -> Result<SetupDraftInspection, String> {
+    let repository = repository(&app)?;
+    run_blocking(move || inspect_setup_draft_with_repository(&repository, &draft_id)).await
+}
+
+#[tauri::command]
+pub async fn finalize_project_setup(
+    app: tauri::AppHandle,
+    draft_id: SetupDraftId,
+    expected_revision: u64,
+) -> Result<ProjectDetail, String> {
+    let repository = repository(&app)?;
+    emit_log(&app, "info", "Finalizing project setup…");
+    let result = run_blocking(move || {
+        finalize_project_setup_with_repository(&repository, &draft_id, expected_revision)
+    })
+    .await;
+    match &result {
+        Ok(detail) => emit_log(
+            &app,
+            "ok",
+            &format!("Project {} is set up", detail.project.display_name),
+        ),
+        Err(error) => emit_log(&app, "error", &format!("Project setup failed: {}", error)),
+    }
+    result
+}
+
+fn list_setup_drafts_with_repository(repository: &V3Repository) -> Result<SetupDraftList, String> {
+    let (drafts, warnings) = repository.list_setup_drafts()?;
+    let config = repository.load_config()?;
+    let machine = repository.load_bindings()?;
+    let summaries = drafts
+        .into_iter()
+        .map(|draft| {
+            let status = if draft_references_are_present(&draft, &config, &machine) {
+                "draft"
+            } else {
+                "attention"
+            };
+            SetupDraftSummary {
+                status: status.to_string(),
+                draft_id: draft.draft_id,
+                display_name: draft.display_name,
+                project_root: draft.project_root,
+                updated_at: draft.updated_at,
+                revision: draft.revision,
+                last_error: draft.last_error,
+            }
+        })
+        .collect();
+    Ok(SetupDraftList {
+        drafts: summaries,
+        warnings,
+    })
+}
+
+fn draft_references_are_present(
+    draft: &ProjectSetupDraft,
+    config: &SyncConfigV3,
+    machine: &MachineProjectState,
+) -> bool {
+    let profiles_present = draft.profiles.values().all(|selection| match selection {
+        DraftProfileSelection::Existing { profile_id } => machine
+            .profiles
+            .iter()
+            .any(|profile| &profile.profile_id == profile_id),
+        DraftProfileSelection::Pending { .. } => true,
+    });
+    let storage_present = match &draft.storage {
+        Some(DraftStorageSelection::Existing { storage_id }) => {
+            config.storages.iter().any(|storage| &storage.id == storage_id)
+        }
+        _ => true,
+    };
+    profiles_present && storage_present
+}
+
+fn create_setup_draft_with_repository(
+    repository: &V3Repository,
+    project_root: &str,
+) -> Result<CreateSetupDraftResult, String> {
+    validate_absolute_clean_path("project root", project_root)?;
+    let canonical = fs_canonicalize(Path::new(project_root))?;
+    if !canonical.is_dir() {
+        return Err(format!("project root '{}' is not a directory", project_root));
+    }
+    let repository_root = prospective_canonical(repository.root())?;
+    if paths_overlap(&canonical, &repository_root) {
+        return Err("project root overlaps schema-3 application data".to_string());
+    }
+    let machine = repository.load_bindings()?;
+    for binding in machine
+        .bindings
+        .iter()
+        .filter(|binding| binding.state == BindingState::Active)
+    {
+        if Path::new(&binding.canonical_project_root) == canonical {
+            return Err(format!(
+                "this folder is already set up as project '{}'",
+                binding.local_project_id
+            ));
+        }
+    }
+    let canonical_text = canonical.to_string_lossy().into_owned();
+    let (existing, _) = repository.list_setup_drafts()?;
+    if let Some(found) = existing
+        .into_iter()
+        .find(|draft| draft.canonical_project_root == canonical_text)
+    {
+        return Ok(CreateSetupDraftResult {
+            draft: found,
+            resumed: true,
+        });
+    }
+
+    ensure_default_provider_profiles(repository)?;
+    let machine = repository.load_bindings()?;
+    let config = repository.load_config()?;
+    // Start setup with at most one agent enabled. Codex may use its single
+    // unambiguous profile as a convenience default; Claude remains opt-in so
+    // a machine with both default homes does not scan both automatically.
+    let mut profiles = BTreeMap::new();
+    let mut codex_candidates = machine
+        .profiles
+        .iter()
+        .filter(|profile| profile.provider == Provider::Codex);
+    if let (Some(only), None) = (codex_candidates.next(), codex_candidates.next()) {
+        profiles.insert(
+            Provider::Codex,
+            DraftProfileSelection::Existing {
+                profile_id: only.profile_id.clone(),
+            },
+        );
+    }
+    let storage = if config.storages.len() == 1 {
+        Some(DraftStorageSelection::Existing {
+            storage_id: config.storages[0].id.clone(),
+        })
+    } else {
+        None
+    };
+    let display_name = canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("Project")
+        .to_string();
+    let now = now_secs();
+    let draft = ProjectSetupDraft {
+        schema: SETUP_DRAFT_SCHEMA_V1,
+        draft_id: SetupDraftId::parse(generated_named_id("draft")?)?,
+        local_project_id: LocalProjectId::parse(generated_named_id("project")?)?,
+        new_bundle_id: BundleId::generate()?,
+        project_root: project_root.to_string(),
+        canonical_project_root: canonical_text,
+        display_name,
+        repository_fingerprint: repository_fingerprint(&canonical),
+        profiles,
+        storage,
+        repository: DraftRepositoryChoice::New,
+        selected_resource_ids: Vec::new(),
+        discovery_signature: String::new(),
+        revision: 0,
+        created_at: now,
+        updated_at: now,
+        last_error: None,
+    };
+    let saved = repository.save_setup_draft(draft)?;
+    Ok(CreateSetupDraftResult {
+        draft: saved,
+        resumed: false,
+    })
+}
+
+fn update_setup_draft_with_repository(
+    repository: &V3Repository,
+    submitted: ProjectSetupDraft,
+) -> Result<ProjectSetupDraft, String> {
+    let stored = repository
+        .load_setup_draft(&submitted.draft_id)?
+        .ok_or_else(|| format!("setup draft '{}' does not exist", submitted.draft_id))?;
+    validate_absolute_clean_path("project root", &submitted.project_root)?;
+    let canonical = fs_canonicalize(Path::new(&submitted.project_root))?;
+    if !canonical.is_dir() {
+        return Err(format!(
+            "project root '{}' is not a directory",
+            submitted.project_root
+        ));
+    }
+    // Editable fields come from the client; identity, timestamps, and derived
+    // path facts stay server-owned.
+    let draft = ProjectSetupDraft {
+        schema: SETUP_DRAFT_SCHEMA_V1,
+        draft_id: stored.draft_id,
+        local_project_id: stored.local_project_id,
+        new_bundle_id: stored.new_bundle_id,
+        project_root: submitted.project_root,
+        canonical_project_root: canonical.to_string_lossy().into_owned(),
+        display_name: submitted.display_name,
+        repository_fingerprint: repository_fingerprint(&canonical),
+        profiles: submitted.profiles,
+        storage: submitted.storage,
+        repository: submitted.repository,
+        selected_resource_ids: submitted.selected_resource_ids,
+        discovery_signature: submitted.discovery_signature,
+        revision: submitted.revision,
+        created_at: stored.created_at,
+        updated_at: now_secs(),
+        last_error: stored.last_error,
+    };
+    repository.save_setup_draft(draft)
+}
+
+fn discard_setup_draft_with_repository(
+    repository: &V3Repository,
+    draft_id: &SetupDraftId,
+) -> Result<bool, String> {
+    if repository.load_setup_transaction(draft_id)?.is_some() {
+        return Err(
+            "a finalization for this draft is still recovering; retry Finish setup first"
+                .to_string(),
+        );
+    }
+    repository.delete_setup_draft(draft_id)
+}
+
+/// Resolve each draft profile selection to the concrete provider home path,
+/// plus the profile record to create when the selection is still pending.
+struct ResolvedDraftProfiles {
+    paths: BTreeMap<Provider, String>,
+    profile_ids: BTreeMap<Provider, LocalProviderProfileId>,
+    pending_records: Vec<ProviderProfile>,
+}
+
+fn resolve_draft_profiles(
+    repository: &V3Repository,
+    draft: &ProjectSetupDraft,
+) -> Result<ResolvedDraftProfiles, String> {
+    if draft.profiles.is_empty() {
+        return Err("choose at least one local provider profile".to_string());
+    }
+    let machine = repository.load_bindings()?;
+    let now = now_secs();
+    let mut resolved = ResolvedDraftProfiles {
+        paths: BTreeMap::new(),
+        profile_ids: BTreeMap::new(),
+        pending_records: Vec::new(),
+    };
+    for (provider, selection) in &draft.profiles {
+        match selection {
+            DraftProfileSelection::Existing { profile_id } => {
+                let profile = machine
+                    .profiles
+                    .iter()
+                    .find(|profile| &profile.profile_id == profile_id)
+                    .ok_or_else(|| format!("unknown provider profile '{}'", profile_id))?;
+                if &profile.provider != provider {
+                    return Err(format!(
+                        "{} cannot use {} profile '{}'",
+                        provider_name(*provider),
+                        provider_name(profile.provider),
+                        profile.display_name
+                    ));
+                }
+                let (available, readable, _, error) = inspect_provider_profile(profile);
+                if !available || !readable {
+                    return Err(error.unwrap_or_else(|| {
+                        format!(
+                            "{} profile '{}' is not readable",
+                            provider_name(*provider),
+                            profile.path
+                        )
+                    }));
+                }
+                resolved.paths.insert(*provider, profile.path.clone());
+                resolved
+                    .profile_ids
+                    .insert(*provider, profile.profile_id.clone());
+            }
+            DraftProfileSelection::Pending { path, display_name } => {
+                let probe = probe_provider_profile_with_repository(repository, *provider, path)?;
+                if !probe.readable {
+                    return Err(format!(
+                        "{} profile '{}' is not readable",
+                        provider_name(*provider),
+                        probe.resolved_path
+                    ));
+                }
+                if let Some(profile_id) = probe.existing_profile_id {
+                    resolved.paths.insert(*provider, probe.resolved_path);
+                    resolved.profile_ids.insert(*provider, profile_id);
+                    continue;
+                }
+                let profile = ProviderProfile {
+                    profile_id: LocalProviderProfileId::parse(generated_named_id("profile")?)?,
+                    provider: *provider,
+                    display_name: if display_name.trim().is_empty() {
+                        probe.suggested_name
+                    } else {
+                        display_name.trim().to_string()
+                    },
+                    path: probe.resolved_path.clone(),
+                    canonical_path: probe.canonical_path,
+                    revision: 0,
+                    created_at: now,
+                    updated_at: now,
+                };
+                profile.validate_structure()?;
+                resolved.paths.insert(*provider, probe.resolved_path);
+                resolved
+                    .profile_ids
+                    .insert(*provider, profile.profile_id.clone());
+                resolved.pending_records.push(profile);
+            }
+        }
+    }
+    Ok(resolved)
+}
+
+/// The storage a draft finalization will link, if any.
+struct ResolvedDraftStorage {
+    storage: StorageConfigV3,
+    pending: bool,
+}
+
+fn resolve_draft_storage(
+    repository: &V3Repository,
+    draft: &ProjectSetupDraft,
+) -> Result<Option<ResolvedDraftStorage>, String> {
+    match &draft.storage {
+        None => Ok(None),
+        Some(DraftStorageSelection::Existing { storage_id }) => {
+            let config = repository.load_config()?;
+            let storage = config
+                .storages
+                .iter()
+                .find(|storage| &storage.id == storage_id)
+                .cloned()
+                .ok_or_else(|| format!("unknown storage '{}'", storage_id))?;
+            Ok(Some(ResolvedDraftStorage {
+                storage,
+                pending: false,
+            }))
+        }
+        Some(DraftStorageSelection::Pending { storage }) => {
+            storage.validate()?;
+            let config = repository.load_config()?;
+            if config
+                .storages
+                .iter()
+                .any(|existing| existing.id == storage.id)
+            {
+                // The preallocated ID landed in an earlier finalize attempt;
+                // treat it as existing so retries stay idempotent.
+                return Ok(Some(ResolvedDraftStorage {
+                    storage: storage.clone(),
+                    pending: false,
+                }));
+            }
+            if storage.kind == StorageKind::Local
+                && !Path::new(&storage.local_dir).is_dir()
+            {
+                return Err(format!(
+                    "local storage folder '{}' does not exist",
+                    storage.local_dir
+                ));
+            }
+            Ok(Some(ResolvedDraftStorage {
+                storage: storage.clone(),
+                pending: true,
+            }))
+        }
+    }
+}
+
+/// Only a matching pair of fingerprints verifies that the remote repo and
+/// the local checkout describe the same Git repository.  A missing
+/// fingerprint on either side is "unidentified", never a silent match.
+fn verified_repository_match(remote: &Option<String>, local: &Option<String>) -> bool {
+    matches!((remote, local), (Some(remote), Some(local)) if remote == local)
+}
+
+fn discovery_signature(inventory: &ResourceInventory) -> String {
+    let mut ids: Vec<&str> = inventory
+        .resources
+        .iter()
+        .map(|resource| resource.descriptor.resource_id.as_str())
+        .collect();
+    ids.sort_unstable();
+    let mut hasher = Sha256::new();
+    for id in ids {
+        hasher.update(id.as_bytes());
+        hasher.update(b"\n");
+    }
+    hex_digest(&hasher.finalize())
+}
+
+fn inspect_setup_draft_with_repository(
+    repository: &V3Repository,
+    draft_id: &SetupDraftId,
+) -> Result<SetupDraftInspection, String> {
+    let draft = repository
+        .load_setup_draft(draft_id)?
+        .ok_or_else(|| format!("setup draft '{}' does not exist", draft_id))?;
+    let mut sections = Vec::new();
+    let mut warnings = Vec::new();
+    let mut blocked = false;
+
+    // Project folder.
+    let project_state = match fs_canonicalize(Path::new(&draft.project_root)) {
+        Ok(canonical) if canonical.to_string_lossy() == draft.canonical_project_root => {
+            SetupSectionStatus {
+                section: "project".to_string(),
+                state: "ready".to_string(),
+                message: None,
+            }
+        }
+        Ok(_) => SetupSectionStatus {
+            section: "project".to_string(),
+            state: "blocked".to_string(),
+            message: Some("The folder now resolves to a different location; choose it again.".to_string()),
+        },
+        Err(error) => SetupSectionStatus {
+            section: "project".to_string(),
+            state: "blocked".to_string(),
+            message: Some(format!("Project folder is unavailable: {}", error)),
+        },
+    };
+    blocked |= project_state.state == "blocked";
+    sections.push(project_state);
+
+    // Profiles, discovery, and the resource selection.
+    let mut inventory = None;
+    let mut fresh_signature = None;
+    let mut selection_stale = false;
+    match resolve_draft_profiles(repository, &draft) {
+        Ok(resolved) => {
+            sections.push(SetupSectionStatus {
+                section: "profiles".to_string(),
+                state: "ready".to_string(),
+                message: None,
+            });
+            match discover_project_at(
+                repository,
+                &draft.project_root,
+                &resolved.paths,
+                &resolved.profile_ids,
+            ) {
+                Ok(discovery) => {
+                    let signature = discovery_signature(&discovery.inventory);
+                    selection_stale = !draft.discovery_signature.is_empty()
+                        && draft.discovery_signature != signature;
+                    let state = if selection_stale { "attention" } else { "ready" };
+                    sections.push(SetupSectionStatus {
+                        section: "resources".to_string(),
+                        state: state.to_string(),
+                        message: selection_stale.then(|| {
+                            "Discovered resources changed since this selection was saved; review it."
+                                .to_string()
+                        }),
+                    });
+                    warnings.extend(discovery.warnings.clone());
+                    fresh_signature = Some(signature);
+                    inventory = Some(discovery.inventory);
+                }
+                Err(error) => {
+                    blocked = true;
+                    sections.push(SetupSectionStatus {
+                        section: "resources".to_string(),
+                        state: "blocked".to_string(),
+                        message: Some(format!("Discovery failed: {}", error)),
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            blocked = true;
+            sections.push(SetupSectionStatus {
+                section: "profiles".to_string(),
+                state: "blocked".to_string(),
+                message: Some(error),
+            });
+            sections.push(SetupSectionStatus {
+                section: "resources".to_string(),
+                state: "blocked".to_string(),
+                message: Some("Resources are discovered once agent profiles are chosen.".to_string()),
+            });
+        }
+    }
+
+    // Storage.
+    match resolve_draft_storage(repository, &draft) {
+        Ok(Some(_)) => sections.push(SetupSectionStatus {
+            section: "storage".to_string(),
+            state: "ready".to_string(),
+            message: None,
+        }),
+        Ok(None) => sections.push(SetupSectionStatus {
+            section: "storage".to_string(),
+            state: "attention".to_string(),
+            message: Some(
+                "No storage linked; the project will not sync until one is added.".to_string(),
+            ),
+        }),
+        Err(error) => {
+            blocked = true;
+            sections.push(SetupSectionStatus {
+                section: "storage".to_string(),
+                state: "blocked".to_string(),
+                message: Some(error),
+            });
+        }
+    }
+
+    // Repository choice.
+    let repository_state = match &draft.repository {
+        DraftRepositoryChoice::New => SetupSectionStatus {
+            section: "repository".to_string(),
+            state: "ready".to_string(),
+            message: None,
+        },
+        DraftRepositoryChoice::Existing {
+            storage_id,
+            repository_fingerprint: remote_fingerprint,
+            mismatch_acknowledged,
+            ..
+        } => {
+            let selected_storage_id = match &draft.storage {
+                Some(DraftStorageSelection::Existing { storage_id }) => Some(storage_id.clone()),
+                Some(DraftStorageSelection::Pending { storage }) => Some(storage.id.clone()),
+                None => None,
+            };
+            if selected_storage_id.as_ref() != Some(storage_id) {
+                SetupSectionStatus {
+                    section: "repository".to_string(),
+                    state: "blocked".to_string(),
+                    message: Some(
+                        "The chosen remote repo lives in a different storage than the one selected."
+                            .to_string(),
+                    ),
+                }
+            } else if !verified_repository_match(remote_fingerprint, &draft.repository_fingerprint)
+                && !mismatch_acknowledged
+            {
+                SetupSectionStatus {
+                    section: "repository".to_string(),
+                    state: "blocked".to_string(),
+                    message: Some(
+                        "The remote repo is not verified to match this folder's Git remote; acknowledge this to continue."
+                            .to_string(),
+                    ),
+                }
+            } else {
+                SetupSectionStatus {
+                    section: "repository".to_string(),
+                    state: "ready".to_string(),
+                    message: Some(
+                        "The remote repo is revalidated against storage during Finish setup."
+                            .to_string(),
+                    ),
+                }
+            }
+        }
+    };
+    blocked |= repository_state.state == "blocked";
+    sections.push(repository_state);
+
+    Ok(SetupDraftInspection {
+        can_finalize: !blocked,
+        draft,
+        sections,
+        inventory,
+        fresh_discovery_signature: fresh_signature,
+        selection_stale,
+        warnings,
+    })
+}
+
+fn build_setup_transaction(
+    repository: &V3Repository,
+    draft: &ProjectSetupDraft,
+) -> Result<(SetupTransaction, Vec<String>), String> {
+    let mut warnings = Vec::new();
+    let canonical = fs_canonicalize(Path::new(&draft.project_root))?;
+    if canonical.to_string_lossy() != draft.canonical_project_root {
+        return Err("the project folder moved since this draft was saved; choose it again".to_string());
+    }
+    let resolved_profiles = resolve_draft_profiles(repository, draft)?;
+    let resolved_storage = resolve_draft_storage(repository, draft)?;
+    let local_fingerprint = repository_fingerprint(&canonical);
+
+    // Existing remote repos are revalidated against storage now, not at draft
+    // time: the bundle must still exist and mismatches must be acknowledged.
+    let (bundle_id, display_name, fingerprint, recipe) = match &draft.repository {
+        DraftRepositoryChoice::New => {
+            let discovery = discover_project_at(
+                repository,
+                &draft.project_root,
+                &resolved_profiles.paths,
+                &resolved_profiles.profile_ids,
+            )?;
+            let candidates: BTreeMap<&str, &InventoryResource> = discovery
+                .inventory
+                .resources
+                .iter()
+                .map(|resource| (resource.descriptor.resource_id.as_str(), resource))
+                .collect();
+            let mut recipe = BundleRecipe::default();
+            for resource_id in &draft.selected_resource_ids {
+                match candidates.get(resource_id.as_str()) {
+                    Some(resource) if resource.blocked_reason.is_none() => {
+                        recipe.entries.insert(
+                            resource_id.clone(),
+                            RecipeEntry {
+                                resource_id: resource_id.clone(),
+                                apply_policy: resource.descriptor.apply_policy,
+                                required: false,
+                            },
+                        );
+                    }
+                    Some(resource) => warnings.push(format!(
+                        "'{}' is blocked and was left out: {}",
+                        resource.descriptor.display_name,
+                        resource
+                            .blocked_reason
+                            .clone()
+                            .unwrap_or_else(|| "blocked".to_string())
+                    )),
+                    None => warnings.push(format!(
+                        "selected resource '{}' is not available right now and was left out",
+                        resource_id
+                    )),
+                }
+            }
+            recipe.revision = 1;
+            recipe.validate()?;
+            (
+                draft.new_bundle_id.clone(),
+                draft.display_name.clone(),
+                local_fingerprint,
+                recipe,
+            )
+        }
+        DraftRepositoryChoice::Existing {
+            storage_id,
+            bundle_id,
+            mismatch_acknowledged,
+            ..
+        } => {
+            let storage = resolved_storage
+                .as_ref()
+                .filter(|resolved| &resolved.storage.id == storage_id)
+                .ok_or_else(|| {
+                    "the chosen remote repo lives in a different storage than the one selected"
+                        .to_string()
+                })?;
+            let engine = engine_for_storage_config(&storage.storage)?;
+            let fetched = engine.fetch(bundle_id)?;
+            let summary = bundle_snapshot_summary(fetched)?;
+            if !verified_repository_match(&summary.repository_fingerprint, &local_fingerprint)
+                && !mismatch_acknowledged
+            {
+                return Err(
+                    "the remote repo is not verified to match this folder's Git remote; acknowledge the mismatch first"
+                        .to_string(),
+                );
+            }
+            (
+                bundle_id.clone(),
+                summary.display_name.clone(),
+                summary.repository_fingerprint.clone().or(local_fingerprint),
+                summary.recipe.clone(),
+            )
+        }
+    };
+
+    let now = now_secs();
+    let project = LocalProjectRegistration {
+        local_project_id: draft.local_project_id.clone(),
+        bundle_id: bundle_id.clone(),
+        display_name,
+        repository_fingerprint: fingerprint,
+        recipe,
+        recipe_bases: BTreeMap::new(),
+        revision: 0,
+        created_at: now,
+        updated_at: now,
+    };
+    project.validate()?;
+
+    let links = resolved_storage
+        .as_ref()
+        .map(|resolved| ProjectStorageLink {
+            local_project_id: draft.local_project_id.clone(),
+            storage_id: resolved.storage.id.clone(),
+            bundle_id: bundle_id.clone(),
+            pinned: true,
+            created_at: now,
+        })
+        .into_iter()
+        .collect();
+
+    let binding = ProjectBinding {
+        replica_id: ReplicaId::parse(generated_named_id("replica")?)?,
+        local_project_id: draft.local_project_id.clone(),
+        bundle_id,
+        project_root: draft.project_root.clone(),
+        canonical_project_root: draft.canonical_project_root.clone(),
+        profile_ids: resolved_profiles.profile_ids.clone(),
+        codex_home: None,
+        claude_home: None,
+        state: BindingState::Active,
+        revision: 0,
+        updated_at: now,
+    };
+    binding.validate_structure()?;
+
+    let transaction = SetupTransaction {
+        schema: SETUP_TRANSACTION_SCHEMA_V1,
+        draft_id: draft.draft_id.clone(),
+        draft_revision: draft.revision,
+        created_at: now,
+        profiles: resolved_profiles.pending_records,
+        storage: resolved_storage
+            .filter(|resolved| resolved.pending)
+            .map(|resolved| resolved.storage),
+        project,
+        links,
+        binding,
+    };
+    transaction.validate()?;
+
+    // Prove prospective isolation before anything is written: the new records
+    // must not overlap application data, local storages, or each other.
+    let mut prospective_config = repository.load_config()?;
+    if let Some(storage) = &transaction.storage {
+        prospective_config.storages.push(storage.clone());
+    }
+    let machine = repository.load_bindings()?;
+    let mut prospective_profiles = machine.profiles.clone();
+    prospective_profiles.extend(transaction.profiles.iter().cloned());
+    let mut prospective_bindings = machine.bindings.clone();
+    prospective_bindings.push(transaction.binding.clone());
+    validate_config_storage_isolation(
+        repository,
+        &prospective_config,
+        &prospective_bindings,
+        &prospective_profiles,
+    )?;
+    Ok((transaction, warnings))
+}
+
+/// Apply a setup transaction's records in dependency order, skipping records
+/// that already exist so every retry reconciles instead of duplicating.
+fn apply_setup_transaction(
+    repository: &V3Repository,
+    transaction: &SetupTransaction,
+) -> Result<(), String> {
+    // 1. Provider profiles (machine state; no dependency on config).
+    let profile_id_map = repository.mutate_bindings(|_, machine| {
+        let mut map: BTreeMap<LocalProviderProfileId, LocalProviderProfileId> = BTreeMap::new();
+        for profile in &transaction.profiles {
+            if machine
+                .profiles
+                .iter()
+                .any(|existing| existing.profile_id == profile.profile_id)
+            {
+                continue;
+            }
+            if let Some(existing) = machine.profiles.iter().find(|existing| {
+                existing.provider == profile.provider
+                    && existing.canonical_path == profile.canonical_path
+            }) {
+                // Someone created the same profile concurrently; reconcile to
+                // the surviving record instead of failing on overlap.
+                map.insert(profile.profile_id.clone(), existing.profile_id.clone());
+                continue;
+            }
+            machine.profiles.push(profile.clone());
+        }
+        Ok(map)
+    })?;
+
+    // 2. Storage, project, and links (one atomic config mutation).
+    repository.mutate_config(|config| {
+        if let Some(storage) = &transaction.storage {
+            if !config.storages.iter().any(|existing| existing.id == storage.id) {
+                config.storages.push(storage.clone());
+            }
+        }
+        if config.project(&transaction.project.local_project_id).is_none() {
+            config.projects.push(transaction.project.clone());
+        }
+        for link in &transaction.links {
+            if !config.links.iter().any(|existing| {
+                existing.local_project_id == link.local_project_id
+                    && existing.storage_id == link.storage_id
+            }) {
+                config.links.push(link.clone());
+            }
+        }
+        Ok(())
+    })?;
+
+    // 3. Machine binding (requires the project to exist in config).
+    repository.mutate_bindings(|_, machine| {
+        if machine
+            .bindings
+            .iter()
+            .any(|binding| binding.local_project_id == transaction.binding.local_project_id)
+        {
+            return Ok(());
+        }
+        let mut binding = transaction.binding.clone();
+        for profile_id in binding.profile_ids.values_mut() {
+            if let Some(mapped) = profile_id_map.get(profile_id) {
+                *profile_id = mapped.clone();
+            }
+        }
+        machine.bindings.push(binding);
+        Ok(())
+    })?;
+
+    // Confirm both documents contain the expected records before the caller
+    // removes the transaction.
+    let config = repository.load_config()?;
+    if config.project(&transaction.project.local_project_id).is_none() {
+        return Err("project registration did not persist".to_string());
+    }
+    if repository
+        .load_bindings()?
+        .active_for(&transaction.project.local_project_id)
+        .is_none()
+    {
+        return Err("project binding did not persist".to_string());
+    }
+    Ok(())
+}
+
+/// True when any of the transaction's records already landed in a document.
+fn setup_transaction_partially_applied(
+    repository: &V3Repository,
+    transaction: &SetupTransaction,
+) -> Result<bool, String> {
+    let config = repository.load_config()?;
+    if config.project(&transaction.project.local_project_id).is_some() {
+        return Ok(true);
+    }
+    if let Some(storage) = &transaction.storage {
+        if config.storages.iter().any(|existing| existing.id == storage.id) {
+            return Ok(true);
+        }
+    }
+    let machine = repository.load_bindings()?;
+    if machine
+        .bindings
+        .iter()
+        .any(|binding| binding.local_project_id == transaction.project.local_project_id)
+    {
+        return Ok(true);
+    }
+    if transaction.profiles.iter().any(|profile| {
+        machine
+            .profiles
+            .iter()
+            .any(|existing| existing.profile_id == profile.profile_id)
+    }) {
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// Complete or clean up interrupted finalizations.  Runs before the shell's
+/// first project listing and before every finalize, so a crash between the
+/// config and binding writes heals on the next app start.
+pub(crate) fn recover_setup_state(repository: &V3Repository) -> Vec<String> {
+    let (transactions, mut warnings) = match repository.list_setup_transactions() {
+        Ok(listed) => listed,
+        Err(error) => return vec![format!("setup recovery unavailable: {}", error)],
+    };
+    for transaction in transactions {
+        match apply_setup_transaction(repository, &transaction) {
+            Ok(()) => {
+                if let Err(error) = repository.delete_setup_transaction(&transaction.draft_id) {
+                    warnings.push(error);
+                    continue;
+                }
+                if let Err(error) = repository.delete_setup_draft(&transaction.draft_id) {
+                    warnings.push(error);
+                }
+            }
+            Err(error) => match setup_transaction_partially_applied(repository, &transaction) {
+                // Nothing landed; return to the draft state and keep the
+                // reason on the draft instead of wedging future finalizes.
+                Ok(false) => {
+                    if let Err(delete_error) =
+                        repository.delete_setup_transaction(&transaction.draft_id)
+                    {
+                        warnings.push(delete_error);
+                    }
+                    record_draft_error(repository, &transaction.draft_id, &error);
+                    warnings.push(format!(
+                        "setup for draft '{}' was rolled back: {}",
+                        transaction.draft_id, error
+                    ));
+                }
+                _ => warnings.push(format!(
+                    "setup for draft '{}' is incomplete and will retry: {}",
+                    transaction.draft_id, error
+                )),
+            },
+        }
+    }
+    warnings
+}
+
+fn record_draft_error(repository: &V3Repository, draft_id: &SetupDraftId, error: &str) {
+    let Ok(Some(mut draft)) = repository.load_setup_draft(draft_id) else {
+        return;
+    };
+    let mut message: String = error.chars().filter(|c| !c.is_control()).collect();
+    message.truncate(4_000);
+    draft.last_error = Some(message);
+    let _ = repository.save_setup_draft(draft);
+}
+
+fn finalize_project_setup_with_repository(
+    repository: &V3Repository,
+    draft_id: &SetupDraftId,
+    expected_revision: u64,
+) -> Result<ProjectDetail, String> {
+    // Complete anything interrupted first; this may finish this very draft.
+    let recovery_warnings = recover_setup_state(repository);
+    let Some(draft) = repository.load_setup_draft(draft_id)? else {
+        return Err(format!(
+            "setup draft '{}' does not exist (it may have just finished; refresh the project list)",
+            draft_id
+        ));
+    };
+    if let Some(warning) = recovery_warnings
+        .iter()
+        .find(|warning| warning.contains(draft_id.as_str()))
+    {
+        return Err(warning.clone());
+    }
+    if draft.revision != expected_revision {
+        return Err(format!(
+            "setup draft changed (expected revision {}, current {})",
+            expected_revision, draft.revision
+        ));
+    }
+
+    let result = (|| {
+        let (transaction, _warnings) = build_setup_transaction(repository, &draft)?;
+        repository.save_setup_transaction(&transaction)?;
+        apply_setup_transaction(repository, &transaction).map(|()| transaction)
+    })();
+    let transaction = match result {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            record_draft_error(repository, draft_id, &error);
+            return Err(error);
+        }
+    };
+    repository.delete_setup_transaction(draft_id)?;
+    repository.delete_setup_draft(draft_id)?;
+    get_project_with_repository(repository, &transaction.project.local_project_id)?
+        .ok_or_else(|| "project disappeared after setup".to_string())
+}
+
 fn paths_overlap(left: &Path, right: &Path) -> bool {
     left == right || left.starts_with(right) || right.starts_with(left)
 }
@@ -3604,7 +4716,7 @@ mod tests {
     use crate::project_sync_v3::domain::{StorageConfigV3, StorageKind};
 
     fn repository(temp: &tempfile::TempDir) -> V3Repository {
-        V3Repository::from_app_data_dir(temp.path()).unwrap()
+        V3Repository::from_home_dir(temp.path()).unwrap()
     }
 
     fn register(repo: &V3Repository) -> LocalProjectRegistration {
@@ -3677,7 +4789,7 @@ mod tests {
     #[test]
     fn refresh_and_push_auto_select_new_project_conversations() {
         let temp = tempfile::tempdir().unwrap();
-        let repo = V3Repository::from_app_data_dir(temp.path().join("app-data")).unwrap();
+        let repo = V3Repository::from_home_dir(temp.path().join("home")).unwrap();
         let storage_id = StorageId::parse("shared").unwrap();
         let mut config = repo.load_config().unwrap();
         config.storages.push(StorageConfigV3 {
@@ -3759,6 +4871,14 @@ mod tests {
                 .entries
                 .contains_key(&ResourceId::parse(resource_id).unwrap()));
         }
+
+        let revision_after_selection = repo.load_config().unwrap().revision;
+        get_bundle_inventory_with_repository(&repo, &project.local_project_id).unwrap();
+        assert_eq!(
+            repo.load_config().unwrap().revision,
+            revision_after_selection,
+            "an unchanged inventory must not invalidate the config revision"
+        );
 
         // A newly-created conversation is also reconciled at Push time, even
         // when the UI has not refreshed since it appeared.
@@ -3900,7 +5020,7 @@ mod tests {
     #[test]
     fn unlinked_project_can_adopt_a_matching_remote_bundle_when_storage_is_added_later() {
         let temp = tempfile::tempdir().unwrap();
-        let repo = V3Repository::from_app_data_dir(temp.path().join("app-data")).unwrap();
+        let repo = V3Repository::from_home_dir(temp.path().join("home")).unwrap();
         let storage_id = StorageId::parse("shared").unwrap();
         let mut config = repo.load_config().unwrap();
         config.storages.push(StorageConfigV3 {
@@ -4407,7 +5527,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
-        let repo = V3Repository::from_app_data_dir(temp.path().join("app-data")).unwrap();
+        let repo = V3Repository::from_home_dir(temp.path().join("home")).unwrap();
         let project = register(&repo);
         let codex_profile = add_profile(&repo, Provider::Codex, &temp.path().join("codex-home"));
 
@@ -4429,7 +5549,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
-        let repo = V3Repository::from_app_data_dir(temp.path().join("app-data")).unwrap();
+        let repo = V3Repository::from_home_dir(temp.path().join("home")).unwrap();
         let project = register(&repo);
         let profile_id = add_profile(&repo, Provider::Codex, &temp.path().join("codex-home"));
         save_project_binding_with_repository(
@@ -4456,8 +5576,8 @@ mod tests {
         let second_root = temp.path().join("second");
         std::fs::create_dir_all(&first_root).unwrap();
         std::fs::create_dir_all(&second_root).unwrap();
-        let app_data = temp.path().join("app-data");
-        let repo = V3Repository::from_app_data_dir(&app_data).unwrap();
+        let home = temp.path().join("home");
+        let repo = V3Repository::from_home_dir(&home).unwrap();
         let project = register(&repo);
         let profile_id = add_profile(&repo, Provider::Codex, &temp.path().join("codex-home"));
         let profile_ids = BTreeMap::from([(Provider::Codex, profile_id)]);
@@ -4491,8 +5611,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
-        let app_data = temp.path().join("app-data");
-        let repo = V3Repository::from_app_data_dir(&app_data).unwrap();
+        let home = temp.path().join("home");
+        let repo = V3Repository::from_home_dir(&home).unwrap();
         let project = register(&repo);
         let profile_id = add_profile(&repo, Provider::Codex, &temp.path().join("codex-home"));
         let mut config = repo.load_config().unwrap();
@@ -4529,8 +5649,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
         std::fs::create_dir_all(&project_root).unwrap();
-        let app_data = temp.path().join("app-data");
-        let repo = V3Repository::from_app_data_dir(&app_data).unwrap();
+        let home = temp.path().join("home");
+        let repo = V3Repository::from_home_dir(&home).unwrap();
         let project = register(&repo);
         let error = save_project_binding_with_repository(
             &repo,
@@ -4576,8 +5696,8 @@ mod tests {
         for directory in [&project_root, &codex_home, &claude_home] {
             std::fs::create_dir_all(directory).unwrap();
         }
-        let app_data = temp.path().join("app-data");
-        let repo = V3Repository::from_app_data_dir(&app_data).unwrap();
+        let home = temp.path().join("home");
+        let repo = V3Repository::from_home_dir(&home).unwrap();
         let project = register(&repo);
         let codex_profile = add_profile(&repo, Provider::Codex, &codex_home);
         let claude_profile = add_profile(&repo, Provider::Claude, &claude_home);
@@ -4615,5 +5735,298 @@ mod tests {
         });
         let error = save_project_sync_config_with_repository(&repo, config).unwrap_err();
         assert!(error.contains("overlaps project root"));
+    }
+
+    // ------------------------------------------------------------------
+    // Project setup drafts and transactional finalization
+    // ------------------------------------------------------------------
+
+    struct SetupFixture {
+        _temp: tempfile::TempDir,
+        repo: V3Repository,
+        project_dir: PathBuf,
+        codex_home: PathBuf,
+        storage_dir: PathBuf,
+    }
+
+    fn setup_fixture() -> SetupFixture {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = V3Repository::from_home_dir(temp.path().join("home")).unwrap();
+        let project_dir = temp.path().join("work/app");
+        let codex_home = temp.path().join("codex-profile/.codex");
+        let storage_dir = temp.path().join("bucket");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::create_dir_all(&codex_home).unwrap();
+        std::fs::create_dir_all(&storage_dir).unwrap();
+        SetupFixture {
+            _temp: temp,
+            repo,
+            project_dir,
+            codex_home,
+            storage_dir,
+        }
+    }
+
+    fn local_storage(fixture: &SetupFixture, id: &str) -> StorageConfigV3 {
+        StorageConfigV3 {
+            id: StorageId::parse(id).unwrap(),
+            name: "Local test storage".to_string(),
+            kind: StorageKind::Local,
+            bucket: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            account_id: String::new(),
+            s3_endpoint: String::new(),
+            region: String::new(),
+            local_dir: fixture.storage_dir.to_string_lossy().into_owned(),
+            included_default_exclusions: Vec::new(),
+            supports_conditional_writes: None,
+        }
+    }
+
+    /// Create a draft and point it at the fixture's pending Codex profile and
+    /// pending local storage, ignoring host-dependent default preselection.
+    fn draft_ready_to_finalize(fixture: &SetupFixture) -> ProjectSetupDraft {
+        let created = create_setup_draft_with_repository(
+            &fixture.repo,
+            &fixture.project_dir.to_string_lossy(),
+        )
+        .unwrap();
+        assert!(!created.resumed);
+        let mut draft = created.draft;
+        draft.profiles = BTreeMap::from([(
+            Provider::Codex,
+            DraftProfileSelection::Pending {
+                path: fixture.codex_home.to_string_lossy().into_owned(),
+                display_name: String::new(),
+            },
+        )]);
+        draft.storage = Some(DraftStorageSelection::Pending {
+            storage: local_storage(fixture, "storage-setup-test"),
+        });
+        draft.repository = DraftRepositoryChoice::New;
+        update_setup_draft_with_repository(&fixture.repo, draft).unwrap()
+    }
+
+    #[test]
+    fn setup_draft_resumes_for_the_same_canonical_folder() {
+        let fixture = setup_fixture();
+        let first = create_setup_draft_with_repository(
+            &fixture.repo,
+            &fixture.project_dir.to_string_lossy(),
+        )
+        .unwrap();
+        let second = create_setup_draft_with_repository(
+            &fixture.repo,
+            &fixture.project_dir.to_string_lossy(),
+        )
+        .unwrap();
+        assert!(!first.resumed);
+        assert!(!first.draft.profiles.contains_key(&Provider::Claude));
+        assert!(second.resumed);
+        assert_eq!(first.draft.draft_id, second.draft.draft_id);
+        let (drafts, warnings) = fixture.repo.list_setup_drafts().unwrap();
+        assert_eq!(drafts.len(), 1);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn setup_draft_updates_are_revision_guarded() {
+        let fixture = setup_fixture();
+        let draft = draft_ready_to_finalize(&fixture);
+        let stale = draft.clone();
+        let saved = update_setup_draft_with_repository(&fixture.repo, draft).unwrap();
+        assert_eq!(saved.revision, stale.revision + 1);
+        let error = update_setup_draft_with_repository(&fixture.repo, stale).unwrap_err();
+        assert!(error.contains("changed"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn finalize_creates_every_record_exactly_once() {
+        let fixture = setup_fixture();
+        let draft = draft_ready_to_finalize(&fixture);
+        let expected_project_id = draft.local_project_id.clone();
+        let expected_bundle_id = draft.new_bundle_id.clone();
+
+        let detail =
+            finalize_project_setup_with_repository(&fixture.repo, &draft.draft_id, draft.revision)
+                .unwrap();
+        assert_eq!(detail.project.local_project_id, expected_project_id);
+        assert_eq!(detail.project.bundle_id, expected_bundle_id);
+        assert_eq!(detail.links.len(), 1);
+        assert_eq!(detail.links[0].storage_id.as_str(), "storage-setup-test");
+        let binding = detail.binding.expect("binding created");
+        assert_eq!(binding.state, BindingState::Active);
+        assert_eq!(binding.revision, 0);
+
+        let config = fixture.repo.load_config().unwrap();
+        assert_eq!(config.projects.len(), 1);
+        assert!(config.storages.iter().any(|s| s.id.as_str() == "storage-setup-test"));
+        let machine = fixture.repo.load_bindings().unwrap();
+        assert!(machine.active_for(&expected_project_id).is_some());
+        assert!(machine.profiles.iter().any(|profile| {
+            profile.provider == Provider::Codex
+                && Path::new(&profile.canonical_path)
+                    == fs_canonicalize(&fixture.codex_home).unwrap()
+        }));
+
+        // The draft and its transaction are consumed by success.
+        assert!(fixture.repo.load_setup_draft(&draft.draft_id).unwrap().is_none());
+        assert!(fixture
+            .repo
+            .load_setup_transaction(&draft.draft_id)
+            .unwrap()
+            .is_none());
+
+        // A retry cannot duplicate anything.
+        let error =
+            finalize_project_setup_with_repository(&fixture.repo, &draft.draft_id, draft.revision)
+                .unwrap_err();
+        assert!(error.contains("does not exist"), "unexpected error: {error}");
+        assert_eq!(fixture.repo.load_config().unwrap().projects.len(), 1);
+    }
+
+    #[test]
+    fn interrupted_finalize_recovers_on_next_project_listing() {
+        let fixture = setup_fixture();
+        let draft = draft_ready_to_finalize(&fixture);
+        let (transaction, warnings) =
+            build_setup_transaction(&fixture.repo, &draft).unwrap();
+        assert!(warnings.is_empty());
+        fixture.repo.save_setup_transaction(&transaction).unwrap();
+
+        // Simulate a crash after the profile and config writes landed but
+        // before the machine binding write.
+        fixture
+            .repo
+            .mutate_bindings(|_, machine| {
+                machine.profiles.extend(transaction.profiles.iter().cloned());
+                Ok(())
+            })
+            .unwrap();
+        fixture
+            .repo
+            .mutate_config(|config| {
+                config.storages.push(transaction.storage.clone().unwrap());
+                config.projects.push(transaction.project.clone());
+                config.links.extend(transaction.links.iter().cloned());
+                Ok(())
+            })
+            .unwrap();
+        assert!(fixture
+            .repo
+            .load_bindings()
+            .unwrap()
+            .active_for(&draft.local_project_id)
+            .is_none());
+
+        let recovery_warnings = recover_setup_state(&fixture.repo);
+        assert!(recovery_warnings.is_empty(), "{recovery_warnings:?}");
+
+        let machine = fixture.repo.load_bindings().unwrap();
+        assert!(machine.active_for(&draft.local_project_id).is_some());
+        assert_eq!(fixture.repo.load_config().unwrap().projects.len(), 1);
+        assert!(fixture.repo.load_setup_draft(&draft.draft_id).unwrap().is_none());
+        assert!(fixture
+            .repo
+            .load_setup_transaction(&draft.draft_id)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn failed_transaction_with_nothing_applied_returns_to_draft() {
+        let fixture = setup_fixture();
+        let draft = draft_ready_to_finalize(&fixture);
+
+        // A profile record nested under an existing profile fails machine
+        // validation in the first apply step, before anything persists.
+        let existing = add_profile(&fixture.repo, Provider::Claude, &fixture._temp.path().join("claude-profile/.claude"));
+        let nested = fixture._temp.path().join("claude-profile/.claude/nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let _ = existing;
+        let now = now_secs();
+        let bad_profile = ProviderProfile {
+            profile_id: LocalProviderProfileId::parse("profile-bad").unwrap(),
+            provider: Provider::Claude,
+            display_name: "Nested".to_string(),
+            path: nested.to_string_lossy().into_owned(),
+            canonical_path: fs_canonicalize(&nested).unwrap().to_string_lossy().into_owned(),
+            revision: 0,
+            created_at: now,
+            updated_at: now,
+        };
+        let (mut transaction, _) = build_setup_transaction(&fixture.repo, &draft).unwrap();
+        transaction.profiles.push(bad_profile);
+        fixture.repo.save_setup_transaction(&transaction).unwrap();
+
+        let recovery_warnings = recover_setup_state(&fixture.repo);
+        assert!(recovery_warnings
+            .iter()
+            .any(|warning| warning.contains("rolled back")));
+        // Nothing was created; the draft survives and records the failure.
+        assert_eq!(fixture.repo.load_config().unwrap().projects.len(), 0);
+        assert!(fixture
+            .repo
+            .load_setup_transaction(&draft.draft_id)
+            .unwrap()
+            .is_none());
+        let draft = fixture
+            .repo
+            .load_setup_draft(&draft.draft_id)
+            .unwrap()
+            .expect("draft survives");
+        assert!(draft.last_error.is_some());
+    }
+
+    #[test]
+    fn discard_removes_only_draft_metadata() {
+        let fixture = setup_fixture();
+        let draft = draft_ready_to_finalize(&fixture);
+        assert!(discard_setup_draft_with_repository(&fixture.repo, &draft.draft_id).unwrap());
+        assert!(fixture.repo.load_setup_draft(&draft.draft_id).unwrap().is_none());
+        assert!(fixture.project_dir.is_dir());
+        assert!(fixture.codex_home.is_dir());
+        // Discarding again reports that nothing was there.
+        assert!(!discard_setup_draft_with_repository(&fixture.repo, &draft.draft_id).unwrap());
+    }
+
+    #[test]
+    fn discard_refuses_while_a_finalization_is_recovering() {
+        let fixture = setup_fixture();
+        let draft = draft_ready_to_finalize(&fixture);
+        let (transaction, _) = build_setup_transaction(&fixture.repo, &draft).unwrap();
+        fixture.repo.save_setup_transaction(&transaction).unwrap();
+        let error =
+            discard_setup_draft_with_repository(&fixture.repo, &draft.draft_id).unwrap_err();
+        assert!(error.contains("recovering"), "unexpected error: {error}");
+    }
+
+    #[test]
+    fn finalize_requires_the_reviewed_draft_revision() {
+        let fixture = setup_fixture();
+        let draft = draft_ready_to_finalize(&fixture);
+        let error = finalize_project_setup_with_repository(
+            &fixture.repo,
+            &draft.draft_id,
+            draft.revision + 7,
+        )
+        .unwrap_err();
+        assert!(error.contains("changed"), "unexpected error: {error}");
+        assert_eq!(fixture.repo.load_config().unwrap().projects.len(), 0);
+    }
+
+    #[test]
+    fn unidentified_remote_repository_requires_acknowledgement() {
+        assert!(verified_repository_match(
+            &Some("a".repeat(64)),
+            &Some("a".repeat(64))
+        ));
+        assert!(!verified_repository_match(&Some("a".repeat(64)), &None));
+        assert!(!verified_repository_match(&None, &None));
+        assert!(!verified_repository_match(
+            &Some("a".repeat(64)),
+            &Some("b".repeat(64))
+        ));
     }
 }

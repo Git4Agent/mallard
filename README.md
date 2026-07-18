@@ -13,6 +13,7 @@ supports:
   discovery;
 - project resource inventory and persistent selection recipes;
 - project links to local-folder and S3/R2 storage;
+- global schema-3 machine metadata stored directly under `~/.mallard`;
 - remote bundle browsing and repository-fingerprint matching;
 - push, verified fetch, restore planning, explicit apply approval, dependency
   planning, and readiness checks; and
@@ -108,8 +109,10 @@ This example assumes the current checkout is at
 
 Bundle IDs are opaque. Checkout paths, provider profile paths, credentials,
 trust decisions, and apply receipts stay on the local machine. Schema 3 uses
-its own app-data `v3/` directory and cloud keys under
-`v3/bundles/<bundle-id>/`; it does not migrate or overwrite schema-2 state.
+the global `~/.mallard/` directory directly—not a nested Tauri app-data `v3/`
+directory—and cloud keys under `v3/bundles/<bundle-id>/`. It does not migrate
+or overwrite schema-2 state, and schema-3 files from the former Tauri app-data
+location are not imported automatically.
 
 ## Metadata layout
 
@@ -129,12 +132,12 @@ manifest from the selected fields and captured resources.
 
 ### Machine-local metadata
 
-On macOS, `<Tauri app-data>` is normally
-`~/Library/Application Support/com.hequ.agent-sync`. Files are created as the
-corresponding feature is used:
+Global machine metadata is stored directly in `~/.mallard`, without an
+application-data or nested `v3/` wrapper. Files are created as the corresponding
+feature is used:
 
 ```text
-<Tauri app-data>/v3/
+~/.mallard/
 |-- sync_config.json
 |-- machine_projects.json
 |-- materializations.json
@@ -281,11 +284,12 @@ after planning, apply stops instead of writing over the new state. A plan ID
 can be recorded only once. Dependency plans use the same bundle and binding
 pins and keep separate application receipts.
 
-Local app-data updates use a process mutex, revision checks, and a synced
-temporary file followed by atomic replacement. The mutex covers one running
-app process; it is not a cross-process database lock. The local storage lock
-also works only when writers see the same filesystem lock, so Dropbox and
-iCloud folders must not be used for simultaneous multi-machine Push.
+Global metadata updates under `~/.mallard` use a process mutex, revision
+checks, and a synced temporary file followed by atomic replacement. The mutex
+covers one running app process; it is not a cross-process database lock. The
+local storage lock also works only when writers see the same filesystem lock,
+so Dropbox and iCloud folders must not be used for simultaneous multi-machine
+Push.
 
 Current limitation: a stale Push fails closed, but automatic fetch, three-way
 rebase, and CAS retry are not finished for schema 3. Per-replica baselines and
@@ -323,7 +327,8 @@ need permission to bind a local port.
   pagination, restore planning, remapping, backups, and apply.
 - `src-tauri/src/project_sync_v3/commands.rs`: Tauri command orchestration.
 - `src-tauri/src/project_sync_v3/s3_store.rs`: S3/R2 transport.
-- `src-tauri/src/project_sync_v3/persistence.rs`: isolated local schema-3 state.
+- `src-tauri/src/project_sync_v3/persistence.rs`: global schema-3 state under
+  `~/.mallard`.
 - `src/App.tsx` and `src-tauri/src/lib.rs`: schema-3 entry point and command
   registration; legacy code still lives in both files.
 
