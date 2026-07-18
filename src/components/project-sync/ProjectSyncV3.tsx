@@ -35,6 +35,7 @@ import ProjectProfilePicker from "./ProjectProfilePicker";
 import ProjectSidebar from "./ProjectSidebar";
 import RestorePlanView from "./RestorePlanView";
 import { projectSyncApi } from "./api";
+import { beginPullReview } from "./pullReviewFlow";
 import {
   errorMessage,
   inventoryResources,
@@ -148,6 +149,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
   const [dependencyResult, setDependencyResult] = useState<DependencyResult | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
+  const restoreRequest = useRef(0);
 
   useEffect(() => {
     activityOpenRef.current = activityOpen;
@@ -707,6 +709,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     targetBinding: ProjectBinding,
     displayName: string,
   ) => {
+    const requestId = ++restoreRequest.current;
     openActivity();
     setBusy(true);
     setRestoreError(null);
@@ -718,40 +721,42 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     setRestoreBinding(targetBinding);
     setRestoreProjectName(displayName);
     try {
-      await projectSyncApi.fetchBundle(storageId, bundleId);
       // The file review is the primary Pull surface. Render it as soon as it
       // is ready; optional dependency/readiness checks must never hide a valid
       // restore plan or its Apply button.
-      const nextRestore = await projectSyncApi.planRestore(storageId, bundleId, targetBinding);
-      setRestorePlan(nextRestore);
+      const request = { storageId, bundleId, binding: targetBinding };
+      const review = await beginPullReview(projectSyncApi, request);
+      if (restoreRequest.current !== requestId) return null;
+      setRestorePlan(review.restorePlan);
       setNotice(`Pull review ready for ${displayName}. Nothing has been applied yet.`);
 
-      const [dependencies, nextReadiness] = await Promise.allSettled([
-        projectSyncApi.planDependencies(bundleId, targetBinding),
-        projectSyncApi.getReadiness(bundleId, targetBinding),
-      ]);
-      const supportingErrors: string[] = [];
-      if (dependencies.status === "fulfilled") {
-        setDependencyPlan(dependencies.value);
-      } else {
-        supportingErrors.push(`Dependency checks: ${errorMessage(dependencies.reason)}`);
-      }
-      if (nextReadiness.status === "fulfilled") {
-        setReadiness(nextReadiness.value);
-      } else {
-        supportingErrors.push(`Readiness checks: ${errorMessage(nextReadiness.reason)}`);
-      }
-      if (supportingErrors.length > 0) {
-        setRestoreError(`The file actions are ready to apply. ${supportingErrors.join(" ")}`);
-      }
+      // Supporting context fills in asynchronously after the modal is usable.
+      // Its lifecycle is request-scoped so closing or replanning cannot apply
+      // stale results to another review.
+      void review.support
+        .then((support) => {
+          if (restoreRequest.current !== requestId) return;
+          setDependencyPlan(support.dependencyPlan);
+          setReadiness(support.readiness);
+          if (support.errors.length > 0) {
+            setRestoreError(`The file actions are ready to apply. ${support.errors.join(" ")}`);
+          }
+        })
+        .catch((reason) => {
+          if (restoreRequest.current === requestId) {
+            setRestoreError(`The file actions are ready to apply. Supporting checks: ${errorMessage(reason)}`);
+          }
+        });
       return null;
     } catch (reason) {
       const message = errorMessage(reason);
-      setRestoreError(message);
-      setError(message);
+      if (restoreRequest.current === requestId) {
+        setRestoreError(message);
+        setError(message);
+      }
       return message;
     } finally {
-      setBusy(false);
+      if (restoreRequest.current === requestId) setBusy(false);
     }
   };
 
@@ -1199,6 +1204,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
           onApplyDependencies={(ids) => void applyDependencies(ids)}
           onRefresh={() => void refreshRestore()}
           onClose={() => {
+            restoreRequest.current += 1;
             setRestorePlan(null);
             setRestoreBinding(null);
             setDependencyPlan(null);

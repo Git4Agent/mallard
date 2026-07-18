@@ -4185,6 +4185,173 @@ mod tests {
     }
 
     #[test]
+    fn pull_review_apply_flow_materializes_a_codex_session_for_the_replica() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp);
+        let storage_id = StorageId::parse("pull-store").unwrap();
+        let bundle_id = BundleId::parse("df29babc833808e68ad0efa4d01d7d6d").unwrap();
+        let mut config = repo.load_config().unwrap();
+        config.storages.push(StorageConfigV3 {
+            id: storage_id.clone(),
+            name: "Pull store".to_string(),
+            kind: StorageKind::Local,
+            bucket: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            account_id: String::new(),
+            s3_endpoint: String::new(),
+            region: String::new(),
+            local_dir: temp.path().join("store").to_string_lossy().into_owned(),
+            included_default_exclusions: Vec::new(),
+            supports_conditional_writes: None,
+        });
+        repo.save_config(config).unwrap();
+
+        let source = register_local_project_with_repository(
+            &repo,
+            RegisterLocalProjectRequest {
+                display_name: "healthGame".to_string(),
+                repository_fingerprint: Some("a".repeat(64)),
+                bundle_id: Some(bundle_id.clone()),
+            },
+        )
+        .unwrap();
+        let source_root = temp.path().join("healthGame");
+        let source_codex = temp.path().join("source-codex");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(&source_codex).unwrap();
+        let session_id = "019f0fb9-b140-7af3-8b7c-5d75c974b230";
+        let session_relative = format!(
+            "sessions/2026/07/18/rollout-2026-07-18T00-00-00-{}.jsonl",
+            session_id
+        );
+        let source_cwd = source_root.to_string_lossy().into_owned();
+        let transcript = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": { "id": session_id, "cwd": source_cwd },
+            }),
+            serde_json::json!({
+                "type": "turn_context",
+                "payload": { "cwd": source_cwd },
+            }),
+        );
+        let source_session = source_codex.join(&session_relative);
+        std::fs::create_dir_all(source_session.parent().unwrap()).unwrap();
+        std::fs::write(&source_session, transcript).unwrap();
+        std::fs::write(
+            source_codex.join("session_index.jsonl"),
+            format!(
+                "{{\"id\":\"{}\",\"thread_name\":\"Change glb color to yellow\"}}\n",
+                session_id
+            ),
+        )
+        .unwrap();
+        let source_profile = add_profile(&repo, Provider::Codex, &source_codex);
+        save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: source.local_project_id.clone(),
+                project_root: source_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, source_profile)]),
+                expected_revision: None,
+            },
+        )
+        .unwrap();
+        save_project_link_with_repository(
+            &repo,
+            SaveProjectLinkRequest {
+                local_project_id: source.local_project_id.clone(),
+                storage_id: storage_id.clone(),
+                pinned: true,
+            },
+        )
+        .unwrap();
+        push_bundle_with_repository(&repo, &source.local_project_id, &storage_id).unwrap();
+
+        let target = register_local_project_with_repository(
+            &repo,
+            RegisterLocalProjectRequest {
+                display_name: "gam2".to_string(),
+                repository_fingerprint: Some("a".repeat(64)),
+                bundle_id: Some(bundle_id.clone()),
+            },
+        )
+        .unwrap();
+        let target_root = temp.path().join("gam2");
+        let target_codex = temp.path().join("target-codex");
+        std::fs::create_dir_all(&target_root).unwrap();
+        std::fs::create_dir_all(&target_codex).unwrap();
+        let target_profile = add_profile(&repo, Provider::Codex, &target_codex);
+        save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: target.local_project_id.clone(),
+                project_root: target_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, target_profile)]),
+                expected_revision: None,
+            },
+        )
+        .unwrap();
+        save_project_link_with_repository(
+            &repo,
+            SaveProjectLinkRequest {
+                local_project_id: target.local_project_id.clone(),
+                storage_id: storage_id.clone(),
+                pinned: true,
+            },
+        )
+        .unwrap();
+        let target_binding = repo
+            .load_bindings()
+            .unwrap()
+            .active_for(&target.local_project_id)
+            .cloned()
+            .unwrap();
+
+        let restore =
+            plan_bundle_restore_with_repository(&repo, &storage_id, &bundle_id, &target_binding)
+                .unwrap();
+        assert_eq!(restore.actions.len(), 2, "session plus filtered index");
+        let dependencies =
+            plan_dependencies_with_repository(&repo, &bundle_id, &target_binding).unwrap();
+        assert!(dependencies.actions.is_empty());
+        let before =
+            get_bundle_readiness_with_repository(&repo, &bundle_id, &target_binding).unwrap();
+        assert_eq!(before.state, "needs_setup");
+
+        let approved = restore
+            .actions
+            .iter()
+            .map(|action| action.action_id.clone())
+            .collect::<Vec<_>>();
+        let applied =
+            apply_bundle_restore_with_repository(&repo, &restore.plan_id, approved).unwrap();
+        assert!(applied.success, "{}", applied.message);
+        assert_eq!(applied.applied_action_ids.len(), 2);
+
+        let restored_session =
+            std::fs::read_to_string(target_codex.join(session_relative)).unwrap();
+        let rows = restored_session
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows[0]["payload"]["cwd"], target_root.to_str().unwrap());
+        assert_eq!(rows[1]["payload"]["cwd"], target_root.to_str().unwrap());
+        assert!(target_codex.join("session_index.jsonl").is_file());
+        let materializations = repo.load_materializations().unwrap();
+        assert_eq!(materializations.records.len(), 1);
+        assert_eq!(
+            materializations.records[0].status,
+            MaterializationStatus::Complete
+        );
+        let after =
+            get_bundle_readiness_with_repository(&repo, &bundle_id, &target_binding).unwrap();
+        assert_eq!(after.state, "ready");
+    }
+
+    #[test]
     fn profile_probe_resolves_a_provider_child_and_deduplicates_it() {
         let temp = tempfile::tempdir().unwrap();
         let repo = repository(&temp);

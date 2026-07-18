@@ -296,14 +296,18 @@ rollback or orphan cleanup workflow.
 ## Verify
 
 ```sh
+npm run test:integration
 npm run build
 cargo check --manifest-path src-tauri/Cargo.toml
 cargo test --manifest-path src-tauri/Cargo.toml --lib
 ```
 
-At this handoff, the frontend build and Rust check pass, and all 317 Rust tests
-pass. The Rust suite starts a localhost stub S3 server, so a restricted sandbox
-may need permission to bind a local port.
+`test:integration` covers the Pull review boundary in both layers: the
+frontend keeps a valid restore plan and enabled Apply action visible when
+supporting checks fail, while the Rust command workflow publishes, plans,
+persists, applies, remaps, and records a Codex conversation restore. The full
+Rust suite also starts a localhost stub S3 server, so a restricted sandbox may
+need permission to bind a local port.
 
 ## Code map
 
