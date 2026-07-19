@@ -378,6 +378,8 @@ export interface LocalProjectRegistration {
     manifest_sha256: string;
     recipe_revision: number;
     binding_revision?: number | null;
+    last_pull_at?: number | null;
+    last_push_at?: number | null;
   }>;
   revision: number;
   created_at: number;
@@ -418,6 +420,7 @@ export interface LocalProjectSummary {
   selected_resource_count?: number;
   linked_storage_ids?: string[];
   readiness_state?: "ready" | "needs_setup" | "blocked" | string;
+  is_git_repository?: boolean;
 }
 
 export interface ApplyReceipt {
@@ -784,8 +787,6 @@ export interface BundleReadiness {
   generated_at?: number;
 }
 
-export type ThreadMatchKind = "during_session" | "after_session" | "started_from";
-
 export interface CodexThreadSummary {
   thread_id: string;
   title: string;
@@ -795,11 +796,38 @@ export interface CodexThreadSummary {
   branch?: string | null;
   recorded_sha?: string | null;
   is_active?: boolean;
+  user_round_count: number;
+  agent_message_count: number;
+  tool_call_count: number;
+  total_tokens?: number | null;
+  metrics_complete: boolean;
+  commit_occurrence_count: number;
 }
 
 export interface CommitThreadReference {
   thread_id: string;
-  match_kind: ThreadMatchKind;
+}
+
+export type ChatTurnRole = "user" | "assistant";
+
+export interface ChatTurnPreview {
+  ordinal: number;
+  role: ChatTurnRole;
+  timestamp?: number | null;
+  preview: string;
+}
+
+export interface CodexThreadDetailsPage {
+  thread_id: string;
+  turns: ChatTurnPreview[];
+  next_cursor?: number | null;
+}
+
+export interface StorageSyncSummary {
+  storage_id: string;
+  storage_name: string;
+  last_pull_at?: number | null;
+  last_push_at?: number | null;
 }
 
 export interface GitCommitSummary {
@@ -832,8 +860,13 @@ export interface UnmappedThreadReference {
 
 export interface ProjectChatHistory {
   project_id: string;
+  codex_home: string;
   threads: CodexThreadSummary[];
   git?: GitHistoryPage | null;
   unmapped: UnmappedThreadReference[];
   warnings: string[];
+  window_start: number;
+  window_end: number;
+  next_before?: number | null;
+  storage_sync: StorageSyncSummary[];
 }

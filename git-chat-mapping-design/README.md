@@ -1,69 +1,58 @@
-# Git–Codex History Mapping
+# Project Activity and Codex Session History
 
-## Approved behavior
+## Implemented behavior
 
-The selected completed project now opens its history page by default. The landed `Git Info` placeholder in `ProjectLinksWorkspace` is replaced in place; there is no second navigation state and no Back button. Clicking a project name or its Git-branch action invokes the same project-selection callback. Project and Storage Settings remain dedicated alternate pages, and closing either returns to the selected project's history.
+A completed project row is the single navigation target for project activity. The separate Git action has been removed. Each bound completed row now has a compact, non-interactive `Git Based` or `Non-Git Based` indicator; it communicates repository type but is not another navigation target. Setup drafts remain non-project rows and cannot call history APIs. Project and Storage Settings stay dedicated pages; closing them returns to the selected project activity page. A successful Pull increments the existing refresh epoch so restored sessions are rescanned.
 
-The primary display name is always `projectLabel(project)`, so a machine-local alias wins. When an alias is active, the shared repository name is shown as `Repository: <shared name>` beneath the title. Setup drafts stay separate from completed projects: they have no history action and cannot reach the history command.
-
-After setup finalization, normal project selection mounts a fresh history page. A successful Pull apply increments a refresh epoch so newly restored conversations are loaded without a manual page change.
-
-## Annotated UI structure
+The title uses `projectLabel(project)`: a machine-local alias is primary and the shared repository name is secondary. The compact header shows the canonical project directory, bound Codex configuration path, and per-storage last Pull/Push timestamps. Git projects add Branch and Refresh controls; non-Git projects omit them.
 
 ```text
-Resizable project sidebar                 Selected-project destination
-┌─────────────────────────────┐          ┌────────────────────────────────────┐
-│ Project row                 │          │ <local alias> history    [Refresh] │
-│ [folder] name [branch][⚙][×]├─────────▶│ ~/compact/path          [Branch ▾]│
-│                             │ same     │ Repository: shared-name (optional) │
-│ Draft row                   │ handler  ├────────────────────────────────────┤
-│ [folder] name [Draft]    [×]│          │ First-parent history               │
-└─────────────────────────────┘          │ ● abc123  timestamp  subject       │
-                                         │   ┌ thread title  [confidence] ┐   │
-                                         │   │ dates · recorded SHA       │   │
-                                         │   │ [Open Codex] [Terminal]    │   │
-                                         │   └────────────────────────────┘   │
-                                         │ ● older commit …                   │
-                                         ├────────────────────────────────────┤
-                                         │ Unmapped threads + explicit reason │
-                                         └────────────────────────────────────┘
+Project Name          Local alias or repository name
+Directory             /canonical/local/path
+Codex configuration   /project/profile/.codex                  [Settings]
+
+Storage sync
+  Storage 1           Last Pull …                 Last Push …
+
+Uncommitted Changes
+  Session title                         [Open in Codex] [Open in Terminal]
+  Started …  Ended …  User rounds …  Tokens …  Agent messages …  Tool calls …
+  Appears under 3 commits
+  [› Show chat details]
+
+abc1234  Jul 18, 10:00 PM  Commit subject
+  same compact session card, ordered by last activity
 ```
 
-- Header controls use the existing button/select language and theme tokens.
-- The branch selector stays with the sticky page header while commit content scrolls.
-- The one new visual signature is the restrained one-pixel first-parent rail. It encodes real commit order; it is not a decorative timeline or a full Git DAG.
-- Thread confidence is written as text as well as color: `during session`, `after session`, or `started from`.
-- Loading, empty, warning, error, missing-profile, non-Git, unavailable-branch, and pagination states keep the same page geometry.
-- For a non-Git directory, the Git selector/rail are omitted and a flat `Codex threads` list is ordered by last update.
+The `Uncommitted Changes` label means no overlapping commit and no qualifying follow-up commit on the recorded branch. It does not describe current `git status`.
 
-## Mapping semantics
+## Session and mapping semantics
 
-For the selected branch's bounded first-parent history, each project-owned thread is classified in this order:
+Each rollout JSONL file is one Codex session. Mallard streams the complete file and derives authoritative start/end dates from its first and last timestamped records. It counts genuine `user_message` rounds, visible `agent_message` events, tool calls, and the maximum reported cumulative token total. Malformed or individually oversized lines are skipped without stopping the file; the session becomes partial and diagnostics go to Sync Log.
 
-Threads with a recorded branch are considered only on that branch. Older threads without branch metadata remain eligible as a best-effort fallback; a named thread is never attached to an unrelated branch.
+For a selected first-parent branch:
 
-1. Attach it to every commit whose commit time falls inclusively between the thread start and end times (`during_session`).
-2. If no commit matched, attach only the first subsequent commit within 24 hours (`after_session`).
-3. If still unmatched, attach its recorded SHA when that commit resolves on the selected branch (`started_from`).
-4. Otherwise return it in `unmapped` with an explicit reason.
+1. A session is attached to every commit timestamp inclusively inside its start/end range.
+2. With no overlap, it is attached once to the first commit within 24 hours after its end.
+3. Otherwise it appears under `Uncommitted Changes`.
 
-A recorded SHA is session context, not proof that the conversation authored a commit. `unique_thread_count` counts thread IDs once; `reference_count` counts every commit attachment.
+Recorded SHA remains visible session context but is not an attachment rule. One session spanning three commits is one unique session and three commit occurrences. It intentionally renders under all three commits; all occurrences share metrics, launch target, and a frontend detail cache keyed by thread ID.
 
-## Main-branch findings incorporated
+The initial response is the latest exclusive 30-day window. `Load previous 30 days` appends the next complete `[before − 30 days, before)` window. Boundary commits carrying a mapped session are returned as needed and merged by SHA/thread ID so cross-window sessions remain visible at every occurrence.
 
-The current branch already contains main through merge `2edc284`. The relevant main commits are:
+## Chat details and privacy
 
-- `826d890` — schema-3 setup/synchronization changes, resumable setup drafts, and global persistence.
-- `60e0ea5` — local project aliases.
-- `d4d794a` — dedicated project settings and profile-management UI.
+`Show chat details` lazily loads genuine User and Codex message previews, 50 at a time, chronologically. Each preview is normalized and capped at 240 characters. System/developer content, injected context, reasoning, and raw tool payloads are excluded. Full chat text and derived metadata stay local and never enter bundle manifests. The on-disk cache under `~/.mallard/chat_history_cache.json` contains only parsed metadata/metrics, keyed by profile, rollout path, size, and modification time.
 
-This implementation preserves the resizable sidebar, dedicated settings render branches, `~/.mallard` repository, optimistic revisions, active bindings, resumable setup workflow, and the landed default `Git Info` destination. It does not add `links | chat-history` state.
+## Main-branch compatibility
 
-## Decisions made while the requester was away
+The work preserves the main changes already merged through `2edc284`, including the relevant `826d890`, `60e0ea5`, and `d4d794a` work: global `~/.mallard` persistence, resumable setup, optimistic revisions, resizable sidebar, local aliases, and dedicated settings layouts. The landed `Git Info` fallback is replaced in place; no parallel `links | chat-history` state is introduced.
 
-- Kept the existing compact native desktop aesthetic in both themes; introduced no font, icon package, or new palette.
-- Used a focused page component with a pure content renderer so Git/non-Git/error states can be tested without a Tauri runtime.
-- Kept all summary extraction local and recomputed; no bundle manifest or sync-schema fields were added.
-- Limited commit pages to 50 and bounded full-rail correlation to 10,000 first-parent commits.
-- Disabled launch buttons for malformed thread IDs and revalidated UUID/project ownership again in Rust before Terminal launch.
-- Continued implementation from the user-approved plan when the Superdesign service required an interactive login. No substitute or invented export was placed in `assets/`.
+## Design decisions made autonomously
+
+- Kept the existing dense desktop theme tokens and outline icons; added no gradients, badges, fonts, palettes, or icon dependencies.
+- Used a neutral metric grid and explicit Started/Ended values instead of prompt extracts or mapping-confidence labels.
+- Kept repeated cards visually identical and explained repetition with subdued occurrence text.
+- Used semantic disclosure buttons, visible focus rings, per-occurrence DOM IDs, and browser viewport containment for long lists.
+- Put scan diagnostics and exact launch commands in Sync Log instead of a page-wide technical warning.
+- Superdesign CLI 0.6.0 was reachable on 2026-07-19, but `auth status --json` returned `authenticated: false`; no unapproved substitute export was placed in `assets/`.

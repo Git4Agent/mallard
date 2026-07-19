@@ -39,6 +39,7 @@ return (
     <button className="sidebar-profile-main" onClick={() => onSelectProject(project.local_project_id)}>
       <Icon name="folder" size={15} />
       <span>{label}</span>
+      <span className="v3-repository-kind">Git Based</span>
     </button>
     <div className="sidebar-profile-actions">
       <button aria-label={`Project settings for ${label}`}><Icon name="settings" size={13}/></button>
@@ -51,20 +52,9 @@ return (
 ## Current default destination
 
 - Path: `src/components/project-sync/ProjectLinksWorkspace.tsx`
-- Description: landed main-branch placeholder that the history component replaces.
+- Description: implemented project activity page replacing the landed placeholder.
 
 ```tsx
-if (!settingsProject && !editingStorage && !newProjectSetup) {
-  return (
-    <main className="v3-main v3-project-links-page v3-git-info-page">
-      <section className="profile-links-section" aria-labelledby="git-info-heading">
-        <div className="profile-links-heading">
-          <div className="profile-links-copy">
-            <h1 id="git-info-heading" className="settings-section-title">Git Info</h1>
-          </div>
-        </div>
-      </section>
-    </main>
-  );
-}
+return <ProjectChatHistoryPage project={activeProject} binding={activeBinding}
+  refreshEpoch={historyRefreshEpoch} onOpenProjectSettings={openSettings} />;
 ```

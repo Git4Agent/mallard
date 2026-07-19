@@ -29,6 +29,12 @@ const history = {
     ended_at: 1_752_803_600,
     branch: "main",
     recorded_sha: "a".repeat(40),
+    user_round_count: 3,
+    agent_message_count: 5,
+    tool_call_count: 8,
+    total_tokens: 24800,
+    metrics_complete: true,
+    commit_occurrence_count: 2,
   }],
   git: {
     selected_branch: "main",
@@ -38,10 +44,7 @@ const history = {
       short_sha: "bbbbbbb",
       committed_at: 1_752_802_000,
       subject: "Add project-scoped history",
-      thread_refs: [{
-        thread_id: "019f7798-5437-7632-9dbc-5b589cf68bf0",
-        match_kind: "during_session",
-      }],
+      thread_refs: [{ thread_id: "019f7798-5437-7632-9dbc-5b589cf68bf0" }],
     }],
     unique_thread_count: 1,
     reference_count: 1,
@@ -49,6 +52,16 @@ const history = {
   },
   unmapped: [],
   warnings: [],
+  window_start: 1_750_000_000,
+  window_end: 1_753_000_000,
+  next_before: 1_750_000_000,
+  codex_home: "/Users/test/config/mallard/.codex",
+  storage_sync: [{
+    storage_id: "storage-1",
+    storage_name: "Local storage 1",
+    last_pull_at: 1_752_700_000,
+    last_push_at: 1_752_800_000,
+  }],
 };
 
 test("history content uses the local alias and renders commit/thread actions", () => {
@@ -79,10 +92,20 @@ test("history content uses the local alias and renders commit/thread actions", (
       onOpenTerminal={() => undefined}
     />,
   );
-  assert.match(html, /Mallard local history/);
+  assert.match(html, /Project Name/);
+  assert.match(html, /Mallard local/);
+  assert.match(html, /Codex configuration/);
+  assert.match(html, /\/Users\/test\/config\/mallard\/\.codex/);
+  assert.match(html, /Local storage 1/);
+  assert.match(html, /Last Pull/);
   assert.match(html, /Repository: mallard/);
   assert.match(html, /Add project-scoped history/);
-  assert.match(html, /during session/);
+  assert.match(html, /User rounds/);
+  assert.match(html, />3</);
+  assert.match(html, /24\.8K/);
+  assert.match(html, /Appears under 2 commits/);
+  assert.doesNotMatch(html, /during session|after session|started from/);
+  assert.doesNotMatch(html, /Map project-owned Codex sessions onto/);
   assert.match(html, /Open in Codex/);
   assert.match(html, /Open in Terminal/);
 });
@@ -151,10 +174,13 @@ test("an invalid persisted Codex profile offers Project Settings recovery", () =
   assert.match(html, /Open Project Settings/);
 });
 
-test("completed projects have a history action while setup drafts do not", () => {
+test("completed projects use their main row for history and show a non-interactive repository type", () => {
   const html = renderToStaticMarkup(
     <ProjectSidebar
-      projects={[project]}
+      projects={[
+        { ...project, is_git_repository: true },
+        { ...project, local_project_id: "project-folder", local_alias: "Plain folder", is_git_repository: false },
+      ]}
       drafts={[{
         draft_id: "draft-1",
         display_name: "draft repo",
@@ -185,7 +211,11 @@ test("completed projects have a history action while setup drafts do not", () =>
       onOpenLegacy={() => undefined}
     />,
   );
-  assert.match(html, /aria-label="View history for Mallard local"/);
+  assert.doesNotMatch(html, /aria-label="View history for Mallard local"/);
+  assert.match(html, /Git Based/);
+  assert.match(html, /title="Git based project"/);
+  assert.match(html, /Non-Git Based/);
+  assert.match(html, /Project settings for Mallard local/);
   assert.doesNotMatch(html, /View history for draft repo/);
 });
 

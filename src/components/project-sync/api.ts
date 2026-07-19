@@ -5,6 +5,7 @@ import type {
   BundleRecipe,
   BundleSnapshotSummary,
   ConnectProjectBundleRequest,
+  CodexThreadDetailsPage,
   CreateSetupDraftResult,
   DependencyPlan,
   DependencyResult,
@@ -57,6 +58,9 @@ export const projectSyncApi = {
 
   listProjects: () =>
     invoke<LocalProjectRegistration[]>("list_local_projects"),
+
+  listProjectRepositoryKinds: () =>
+    invoke<Record<string, boolean>>("list_project_repository_kinds"),
 
   getProject: (localProjectId: string) =>
     invoke<ProjectDetail | null>("get_project", { localProjectId }),
@@ -157,14 +161,31 @@ export const projectSyncApi = {
   getProjectChatHistory: (
     localProjectId: string,
     branch?: string | null,
-    beforeCommit?: string | null,
-    limit = 50,
+    beforeTime?: number | null,
+    windowDays = 30,
+    forceRevalidate = false,
   ) => invoke<ProjectChatHistory>("get_project_chat_history", {
     localProjectId,
     branch: branch ?? null,
-    beforeCommit: beforeCommit ?? null,
+    beforeTime: beforeTime ?? null,
+    windowDays,
+    forceRevalidate,
+  }),
+
+  getProjectChatThreadDetails: (
+    localProjectId: string,
+    threadId: string,
+    cursor?: number | null,
+    limit = 50,
+  ) => invoke<CodexThreadDetailsPage>("get_project_chat_thread_details", {
+    localProjectId,
+    threadId,
+    cursor: cursor ?? null,
     limit,
   }),
+
+  openCodexThreadInApp: (localProjectId: string, threadId: string) =>
+    invoke<void>("open_codex_thread_in_app", { localProjectId, threadId }),
 
   openCodexThreadInTerminal: (localProjectId: string, threadId: string) =>
     invoke<void>("open_codex_thread_in_terminal", { localProjectId, threadId }),

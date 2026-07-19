@@ -1,79 +1,53 @@
 # Gaps and Validation
 
-## Compatibility and assumptions
+## Assumptions and intentional limitations
 
-- V1 is Codex-only and scans only local/restored rollouts belonging to the bound profile. Claude and remote-only conversations are deferred.
-- Aliases are machine-local presentation and never influence repository fingerprinting, branch selection, Git identity, or synced metadata.
-- Setup drafts are not registered projects; history is unavailable until finalization succeeds.
-- Session/commit correlation is best effort. Recorded SHA means “session started from this context,” not “thread authored this commit.”
-- The first-parent rail intentionally suppresses the rest of the Git DAG.
-- Rebase/amend/cherry-pick operations, shallow history, deleted branches, timestamp skew, and active sessions can reduce confidence or leave a thread unmapped.
-- Restored rollouts can be visible to Mallard before Codex rebuilds its own desktop index.
+- V1 remains Codex-only and local/restored-only. Claude and remote-only sessions are deferred.
+- Each rollout JSONL file is treated as one Codex session; duplicate thread IDs keep the latest complete parsed instance.
+- `Uncommitted Changes` is temporal classification, not a claim about current working-tree modifications.
+- Recorded SHA is context only and never proves authorship or controls attachment.
+- First-parent history is intentionally not the full Git DAG. Rebases, amended/cherry-picked commits, shallow clones, deleted branches, clock skew, and active sessions can alter or remove temporal relationships.
+- Commit correlation remains bounded to the newest 10,000 first-parent commits to prevent an unbounded Git subprocess result. Rollout files and session counts themselves are not capped.
+- A single JSONL record over 1 MiB is skipped so corrupted input cannot allocate without bound; the rest of that session is still streamed and marked partial.
+- The session index still has a defensive 16 MiB cap. It affects preferred titles only, not rollout discovery, dates, metrics, details, or pagination.
+- Token totals are maximum Codex-reported cumulative usage, not billing estimates.
+- Restored sessions may be visible before Codex rebuilds its own index.
+- Windows/Linux terminal automation, Claude launch actions, full-text search, causal attribution, remote merge semantics, and sync-schema conversation content are out of scope.
 
-## Functional and technical limitations
+## Known validation gaps
 
-- `codex://threads/<id>` is not confirmed by current public Codex documentation. The opener is narrowly scoped and failure has a supported Terminal fallback, but the URI must be verified against the installed desktop app.
-- macOS Terminal is the only automated terminal target. Windows/Linux launchers are deferred.
-- History is recomputed on request. The 10,000-commit and 10,000-rollout guards prevent unbounded work but very large projects may produce a truncation warning.
-- Full-text search, author/causal attribution, full-DAG visualization, remote merge semantics, Claude launch actions, and sync-schema changes are out of scope.
-- Commit timestamps can be rewritten and session clocks can skew. Confidence labels communicate the rule used, not a probability.
-- A deleted recorded branch is retained as unavailable context; it cannot produce a commit rail unless the ref becomes available again.
+- `codex://threads/<uuid>` remains unconfirmed by public Codex documentation. The implemented app command follows the project-scoped `CODEX_HOME` requirement and must be tested against the installed desktop build.
+- macOS is the only implemented automated launch platform.
+- The Superdesign CLI was validated at version 0.6.0 but was not authenticated. An interactive `superdesign login` is required before generating the one approved remote export. `assets/` intentionally contains no fabricated design.
+- Manual Tauri verification is still required for real long rollouts, a profile path/project path containing quotes and spaces, both themes, launch actions, shallow/worktree repositories, and a Pull-restored task.
 
-## Automated validation
+## Automated evidence
 
-Baseline before implementation:
+Focused Rust coverage includes:
 
-- `npm run build` — passed.
-- `npm run test:frontend-integration` — 2/2 passed.
-- `npm run test:backend-integration` — 27/27 passed.
-- `cd src-tauri && cargo check` — passed.
+- parsing beyond 256 records with first/last timestamp precedence;
+- malformed and oversized individual records continuing as partial;
+- injected context excluded from user metrics/details;
+- user, agent, tool, token, active-session, fallback, and summary behavior;
+- inclusive multi-commit attachment, 24-hour fallback, uncommitted classification, branch isolation, and no recorded-SHA attachment;
+- first-parent Git pagination and hostile input validation;
+- detail pagination and role filtering;
+- UUID, quoting, project-scoped `CODEX_HOME`, app command, and Terminal command construction;
+- backward-compatible RecipeBase sync timestamps.
 
-Added frontend integration coverage:
+Frontend integration coverage includes alias/repository presentation, project/profile/storage metadata, neutral metrics, explicit dates, absence of mapping badges/raw extracts, Git/non-Git flows, launch actions, removal of the sidebar Git action, and the replacement non-interactive repository-type indicator. Repeated occurrences use stable SHA/thread keys and shared detail data in implementation.
 
-- alias as the primary history title and shared repository name as secondary metadata,
-- commit/thread/confidence/launch action rendering,
-- non-Git flat thread rendering,
-- completed-project history action and absence on draft rows,
-- existing Pull review behavior remains green.
+Latest verified during implementation:
 
-Added focused Rust coverage includes:
-
-- rollout metadata aliases and fallback first-user-message summary,
-- session-index title/time precedence,
-- malformed/oversized JSONL partial warnings,
-- canonical ownership boundaries,
-- inclusive multi-commit session mapping and unique/reference counts,
-- first subsequent commit with the 24-hour cutoff,
-- recorded-SHA fallback,
-- named-branch isolation while allowing legacy sessions with missing branch metadata,
-- first-parent pagination and hostile branch/cursor rejection,
-- terminal UUID and shell quoting safety,
-- recorded historical branch availability behavior.
-
-Final verification after review fixes:
-
-- `npm run build` — passed (the existing Vite large-chunk advisory remains).
 - `npm run test:frontend-integration` — 6/6 passed.
-- existing schema-3 command integration tests — 27/27 passed.
-- focused `project_sync_v3::chat_history::tests` — 13/13 passed.
+- focused `project_sync_v3::chat_history::tests` — 25/25 passed, including a rollout larger than 16 MiB, bounded oversized-line discard, timestamp precedence under partial parsing, injected-message filtering, duplicate rollout selection, and private cache persistence.
+- schema-3 command integration tests — 28/28 passed, including successful/failed Pull timestamp semantics.
+- frontend integration tests — 6/6 passed.
 - `cd src-tauri && cargo check` — passed.
-- focused `rustfmt --check` for the new Rust module and `git diff --check` — passed.
-
-## Manual validation still required
-
-- Open the macOS Tauri build and verify dense/long commit histories in dark and light themes.
-- Resize the sidebar to its 220px minimum and confirm the branch/settings/remove actions remain operable.
-- Test `Open in Codex` against an installed Codex app and a real UUID.
-- Test `Open in Terminal` with a project path containing spaces and a single quote.
-- Pull a restored rollout, apply it, close the review, and confirm the visible history refreshes.
-- Verify a shallow clone, linked Git worktree, detached HEAD, merge commit, and deleted historical branch fixture with real repositories.
+- `npm run build` — passed (the existing Vite large-chunk advisory remains).
 
 ## Design-skill notes
 
-`frontend-design` kept the page subject-specific: commit order is the structural device, and the single visual signature is the first-parent rail. The page avoids generic dashboard cards, gradients, new fonts, and decorative metrics.
+`frontend-design` kept commit structure, timestamps, and session metrics as the visual hierarchy instead of generic dashboard decoration. `ui-ux-pro-max` informed the dense desktop spacing, disclosure semantics, focus treatment, one-line previews, accessible loading/error announcements, and viewport containment. Existing light/dark tokens and the outline icon component remain the only visual system.
 
-`ui-ux-pro-max` informed the dense developer-tool layout, stable list keys, visible loading/empty/error recovery, text-backed confidence labels, keyboard focus, and restrained motion. Its suggested generic green-on-slate palette and oversized minimalism were rejected because they conflict with the merged application's established theme tokens.
-
-Superdesign initialization was completed against the merged UI in `.superdesign/init/`, including the landed `Git Info` branch, resizable sidebar, icon system, current tokens, state-driven routes, and local-alias conventions. The local design system is in `.superdesign/design-system.md`.
-
-The required remote Superdesign project/export could not be created because the CLI returned `Not authenticated. Run superdesign login first.` The requester had said they would be away and delegated decisions, so implementation proceeded from the explicitly approved plan. `git-chat-mapping-design/assets/` is intentionally empty: no fabricated or unapproved export was substituted. After login, reproduce the landed placeholder first, create the single compact history variant from the initialized context, and place only that approved export in the folder.
+Local Superdesign context in `.superdesign/init/` was refreshed for the activity destination, removal of the sidebar Git action, profile/storage metadata, neutral session cards, repeated occurrences, lazy details, and 30-day paging. Remote export generation is blocked solely by authentication; after login, generate one compact variant from the implemented page and retain only that approved export in `assets/`.

@@ -167,18 +167,16 @@ export default function ProjectSidebar({
                 >
                   <Icon name="folder" size={15} />
                   <span>{label}</span>
+                  {project.is_git_repository != null && (
+                    <span className={`v3-repository-kind${project.is_git_repository ? " git" : " folder"}`}
+                      title={project.is_git_repository ? "Git based project" : "Non-Git based project"}>
+                      {project.is_git_repository ? <Icon name="git-branch" size={10} /> : <Icon name="folder" size={10} />}
+                      {project.is_git_repository ? "Git Based" : "Non-Git Based"}
+                    </span>
+                  )}
                   {profileRequired && <Icon name="alert-triangle" size={12} className="v3-sidebar-profile-warning" />}
                 </button>
                 <div className="sidebar-profile-actions">
-                  <button
-                    type="button"
-                    onClick={() => onSelectProject(project.local_project_id)}
-                    disabled={busy}
-                    title={`View history for ${label}`}
-                    aria-label={`View history for ${label}`}
-                  >
-                    <Icon name="git-branch" size={13} />
-                  </button>
                   <button
                     type="button"
                     onClick={() => onConfigureProject(project.local_project_id)}

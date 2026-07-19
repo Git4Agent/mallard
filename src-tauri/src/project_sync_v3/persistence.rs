@@ -555,6 +555,18 @@ impl V3Repository {
                 )
             })?;
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700)).map_err(
+                |error| {
+                    format!(
+                        "secure metadata directory '{}': {error}",
+                        self.root.display()
+                    )
+                },
+            )?;
+        }
         ensure_no_symlinks(&self.root, &self.root)
     }
 
@@ -646,7 +658,7 @@ fn ensure_no_symlinks(root: &Path, destination: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn read_json_bounded<T: DeserializeOwned>(
+pub(crate) fn read_json_bounded<T: DeserializeOwned>(
     root: &Path,
     path: &Path,
     max_bytes: u64,
@@ -685,7 +697,7 @@ fn read_json_bounded<T: DeserializeOwned>(
         .map_err(|error| format!("parse '{}': {}", path.display(), error))
 }
 
-fn write_json_atomic<T: Serialize>(
+pub(crate) fn write_json_atomic<T: Serialize>(
     root: &Path,
     path: &Path,
     value: &T,

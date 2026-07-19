@@ -9,7 +9,7 @@ use super::bundle_engine::{
     ImmutablePutOutcome, LocalBundleObjectStore, ObjectKey, ObjectPrefix, PublishBundleRequest,
     PublishExpectation, RemoteBundlePage, StoreListPage, StoredObject,
 };
-use super::chat_history::{self, ProjectChatHistory};
+use super::chat_history::{self, CodexThreadDetailsPage, ProjectChatHistory};
 use super::domain::{
     generated_named_id, validate_absolute_clean_path, ActionId, ActionStatus, ApplyPolicy,
     BindingState, BundleId, BundleIdentity, BundleKind, BundleRecipe, BundleSnapshot, CapturedWith,
@@ -413,20 +413,74 @@ pub async fn get_local_project(
 }
 
 #[tauri::command]
+pub async fn list_project_repository_kinds(
+    app: tauri::AppHandle,
+) -> Result<BTreeMap<String, bool>, String> {
+    let repository = repository(&app)?;
+    run_blocking(move || chat_history::list_project_repository_kinds(&repository)).await
+}
+
+#[tauri::command]
 pub async fn get_project_chat_history(
     app: tauri::AppHandle,
     local_project_id: LocalProjectId,
     branch: Option<String>,
-    before_commit: Option<String>,
-    limit: Option<usize>,
+    before_time: Option<u64>,
+    window_days: Option<u64>,
+    force_revalidate: Option<bool>,
 ) -> Result<ProjectChatHistory, String> {
     let repository = repository(&app)?;
-    run_blocking(move || {
+    emit_log(
+        &app,
+        "info",
+        &format!("Scanning Codex session history for project {local_project_id}…"),
+    );
+    let result = run_blocking(move || {
         chat_history::get_project_chat_history(
             &repository,
             &local_project_id,
             branch.as_deref(),
-            before_commit.as_deref(),
+            before_time,
+            window_days,
+            force_revalidate.unwrap_or(false),
+        )
+    })
+    .await;
+    match &result {
+        Ok(history) => {
+            for warning in &history.warnings {
+                emit_log(&app, "warn", warning);
+            }
+            emit_log(
+                &app,
+                "ok",
+                &format!(
+                    "Session history scan complete: {} sessions in this {}-day window",
+                    history.threads.len(),
+                    history.window_end.saturating_sub(history.window_start) / (24 * 60 * 60)
+                ),
+            );
+        }
+        Err(error) => emit_log(&app, "error", &format!("Session history scan failed: {error}")),
+    }
+    result
+}
+
+#[tauri::command]
+pub async fn get_project_chat_thread_details(
+    app: tauri::AppHandle,
+    local_project_id: LocalProjectId,
+    thread_id: String,
+    cursor: Option<usize>,
+    limit: Option<usize>,
+) -> Result<CodexThreadDetailsPage, String> {
+    let repository = repository(&app)?;
+    run_blocking(move || {
+        chat_history::get_project_chat_thread_details(
+            &repository,
+            &local_project_id,
+            &thread_id,
+            cursor,
             limit,
         )
     })
@@ -440,11 +494,32 @@ pub async fn open_codex_thread_in_terminal(
     thread_id: String,
 ) -> Result<(), String> {
     let repository = repository(&app)?;
+    let worker_app = app.clone();
     run_blocking(move || {
         chat_history::open_codex_thread_in_terminal(
             &repository,
             &local_project_id,
             &thread_id,
+            |command| emit_log(&worker_app, "info", &format!("$ {command}")),
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn open_codex_thread_in_app(
+    app: tauri::AppHandle,
+    local_project_id: LocalProjectId,
+    thread_id: String,
+) -> Result<(), String> {
+    let repository = repository(&app)?;
+    let worker_app = app.clone();
+    run_blocking(move || {
+        chat_history::open_codex_thread_in_app(
+            &repository,
+            &local_project_id,
+            &thread_id,
+            |command| emit_log(&worker_app, "info", &format!("$ {command}")),
         )
     })
     .await
@@ -2084,6 +2159,7 @@ fn push_bundle_with_repository(
             )
         }
     };
+    let pushed_at = now_secs();
     let published = engine.publish(PublishBundleRequest {
         identity: BundleIdentity {
             bundle_id: project.bundle_id.clone(),
@@ -2100,7 +2176,7 @@ fn push_bundle_with_repository(
         },
         captured: capture,
         expected_head,
-        updated_at: now_secs(),
+        updated_at: pushed_at,
     })?;
     let generation = published.snapshot.head.generation;
     let commit_id = published.snapshot.head.commit_id.clone();
@@ -2123,6 +2199,10 @@ fn push_bundle_with_repository(
                     .to_string(),
             );
         }
+        let last_pull_at = current
+            .recipe_bases
+            .get(storage_id)
+            .and_then(|base| base.last_pull_at);
         current.recipe_bases.insert(
             storage_id.clone(),
             RecipeBase {
@@ -2130,10 +2210,12 @@ fn push_bundle_with_repository(
                 manifest_sha256: manifest_sha256.clone(),
                 recipe_revision,
                 binding_revision: Some(binding.revision),
+                last_pull_at,
+                last_push_at: Some(pushed_at),
             },
         );
         current.revision = current.revision.saturating_add(1);
-        current.updated_at = now_secs();
+        current.updated_at = pushed_at;
         Ok(())
     })?;
     let results = published
@@ -2249,6 +2331,9 @@ fn apply_bundle_restore_with_repository(
         materializations.records.push(record);
         Ok(())
     })?;
+    let overall_success = !applied.receipts.iter().any(|receipt| {
+        matches!(receipt.status, ActionStatus::Failed | ActionStatus::Blocked)
+    });
     if files_complete {
         repository.mutate_config(|config| {
             let project = config
@@ -2256,6 +2341,14 @@ fn apply_bundle_restore_with_repository(
                 .iter_mut()
                 .find(|project| project.local_project_id == binding.local_project_id)
                 .ok_or_else(|| "bound project was removed while applying restore".to_string())?;
+            let last_push_at = project
+                .recipe_bases
+                .get(&plan.storage_id)
+                .and_then(|base| base.last_push_at);
+            let previous_pull_at = project
+                .recipe_bases
+                .get(&plan.storage_id)
+                .and_then(|base| base.last_pull_at);
             project.recipe_bases.insert(
                 plan.storage_id.clone(),
                 RecipeBase {
@@ -2263,6 +2356,12 @@ fn apply_bundle_restore_with_repository(
                     manifest_sha256: plan.manifest_sha256.clone(),
                     recipe_revision: project.recipe.revision,
                     binding_revision: Some(binding.revision),
+                    last_pull_at: successful_pull_timestamp(
+                        previous_pull_at,
+                        applied_at,
+                        overall_success,
+                    ),
+                    last_push_at,
                 },
             );
             project.revision = project.revision.saturating_add(1);
@@ -2288,7 +2387,7 @@ fn apply_bundle_restore_with_repository(
                 .unwrap_or_else(|| "Action was not materialized".to_string()),
         })
         .collect::<Vec<_>>();
-    let success = failed_actions.is_empty();
+    let success = overall_success;
     Ok(RestoreResult {
         success,
         message: if success {
@@ -2304,6 +2403,14 @@ fn apply_bundle_restore_with_repository(
         applied_action_ids,
         failed_actions,
     })
+}
+
+fn successful_pull_timestamp(
+    previous: Option<u64>,
+    applied_at: u64,
+    overall_success: bool,
+) -> Option<u64> {
+    overall_success.then_some(applied_at).or(previous)
 }
 
 fn plan_dependencies_with_repository(
@@ -4818,6 +4925,13 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_pull_preserves_the_previous_success_timestamp() {
+        assert_eq!(successful_pull_timestamp(Some(100), 200, false), Some(100));
+        assert_eq!(successful_pull_timestamp(None, 200, false), None);
+        assert_eq!(successful_pull_timestamp(Some(100), 200, true), Some(200));
+    }
     use crate::project_sync_v3::domain::{StorageConfigV3, StorageKind};
 
     fn repository(temp: &tempfile::TempDir) -> V3Repository {
@@ -5027,6 +5141,15 @@ mod tests {
             .map(ToString::to_string)
             .collect::<BTreeSet<_>>();
         assert!(persisted.contains(&format!("codex:session:{}", third_id)));
+        let config = repo.load_config().unwrap();
+        let base = config
+            .project(&project.local_project_id)
+            .unwrap()
+            .recipe_bases
+            .get(&storage_id)
+            .unwrap();
+        assert!(base.last_push_at.is_some());
+        assert_eq!(base.last_pull_at, None);
     }
 
     #[test]
@@ -5612,6 +5735,15 @@ mod tests {
             materializations.records[0].status,
             MaterializationStatus::Complete
         );
+        let config = repo.load_config().unwrap();
+        let target_base = config
+            .project(&target.local_project_id)
+            .unwrap()
+            .recipe_bases
+            .get(&storage_id)
+            .unwrap();
+        assert!(target_base.last_pull_at.is_some());
+        assert_eq!(target_base.last_push_at, None);
         let after =
             get_bundle_readiness_with_repository(&repo, &bundle_id, &target_binding).unwrap();
         assert_eq!(after.state, "ready");

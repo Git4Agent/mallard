@@ -1,120 +1,93 @@
 # Technical Design
 
-## Component and data flow
+## Data flow
 
 ```mermaid
 flowchart LR
-  Sidebar["Project name or Git-branch action"] --> Select["Existing selectProject handler"]
-  Select --> Workspace["ProjectLinksWorkspace default branch"]
-  Workspace --> Page["ProjectChatHistoryPage"]
-  Page --> API["get_project_chat_history"]
-  API --> Repo["V3Repository at ~/.mallard"]
-  Repo --> Binding["Registered project + active binding + Codex profile"]
-  Binding --> Scan["Bound profile sessions / archived_sessions / session_index.jsonl"]
-  Binding --> Git["Structured git -C validated-root argv"]
-  Scan --> Map["Bounded temporal mapper"]
-  Git --> Map
-  Map --> Page
-  Pull["Successful restore apply"] --> Epoch["historyRefreshEpoch + 1"]
-  Epoch --> Page
+  Row["Completed project row"] --> Page["ProjectChatHistoryPage"]
+  Page --> History["get_project_chat_history"]
+  Page --> Details["get_project_chat_thread_details"]
+  History --> Repo["V3Repository / ~/.mallard"]
+  Repo --> Binding["Active binding + Codex profile"]
+  Binding --> Cache["Metadata cache"]
+  Binding --> Rollouts["Fully streamed rollout JSONL"]
+  Binding --> Git["git -C canonical-root"]
+  Rollouts --> Mapping["Temporal mapping"]
+  Git --> Mapping
+  Mapping --> Page
+  Page --> Launch["Validated app / Terminal launch"]
+  Launch --> Log["Exact command in Sync Log"]
 ```
 
-## Backend module
+## Backend contracts
 
-`project_sync_v3::chat_history` owns this local-only feature instead of expanding the large command or capture modules. Its public entry points are:
+`project_sync_v3::chat_history` contains scanning, parsing, Git discovery, temporal mapping, details, caching, and launch construction. Commands run blocking filesystem/process work off the async Tauri thread and are registered in both command handler lists.
 
 ```rust
 get_project_chat_history(
-    repository: &V3Repository,
-    local_project_id: &LocalProjectId,
-    branch: Option<&str>,
-    before_commit: Option<&str>,
-    limit: Option<usize>,
-) -> Result<ProjectChatHistory, String>
+    repository,
+    local_project_id,
+    branch,
+    before_time,
+    window_days,
+    force_revalidate,
+) -> ProjectChatHistory
 
-open_codex_thread_in_terminal(
-    repository: &V3Repository,
-    local_project_id: &LocalProjectId,
-    thread_id: &str,
-) -> Result<(), String>
+get_project_chat_thread_details(
+    repository,
+    local_project_id,
+    thread_id,
+    cursor,
+    limit,
+) -> CodexThreadDetailsPage
 ```
 
-The Tauri wrappers move filesystem/Git/process work to `spawn_blocking`. They are registered in both the production handler and test keepalive lists.
+The history response contains `codex_home`, window bounds, `next_before`, storage activity, thread summaries, optional Git history, uncommitted references, and technical warnings. The command emits warnings to Sync Log. Display name, alias, and directory presentation remain in existing project/binding DTOs.
 
-The two feature commands in the approved interface are accompanied by a narrow `validate_codex_thread_ownership(local_project_id, thread_id)` launch guard. This avoids invoking full Git discovery/mapping before a desktop deep link while still enforcing the plan's requirement to revalidate ownership before every launch.
+`CodexThreadSummary` carries start/end/active state, branch and recorded SHA context, user rounds, agent messages, tool calls, maximum cumulative tokens, `metrics_complete`, and `commit_occurrence_count`. `CommitThreadReference` carries only a thread ID. `ThreadMatchKind` and confidence fields are removed.
 
-### Project/profile resolution
+## Full-stream parser and cache
 
-The module loads `sync_config.json` and `machine_projects.json` through `V3Repository`. It requires:
+The rollout parser uses `BufReader::read_until` and never retains the whole session. There is no 256-record, 16 MiB rollout, or 10,000-session stop. It retains only metadata and counters. A malformed or over-1-MiB individual JSONL record is skipped and marks metrics partial; later records are still read.
 
-- an actual registered local project (not a setup draft),
-- an active binding for the local project ID,
-- a bound Codex provider profile,
-- canonical project/profile paths that still match the persisted binding/catalog.
+Timestamp priority is:
 
-The scanner visits only `sessions/` and `archived_sessions/` under that profile and keeps only rollouts whose metadata `cwd` is the canonical project root or a descendant. Before Terminal launch, it repeats this ownership scan and requires an exact owned thread ID.
+1. first and last valid timestamped records in the complete rollout;
+2. session metadata timestamp;
+3. session-index update time only for a partial session;
+4. filesystem modification time.
 
-### Session parsing
+`session_index.jsonl` supplies the preferred title. A malformed non-timestamp record never lets the index replace otherwise valid rollout endpoints. The local cache is `~/.mallard/chat_history_cache.json`; entries include canonical profile/path identity, file size, nanosecond mtime, and parsed metadata/metrics only. It is schema-versioned, size/entry bounded, symlink-safe, atomically replaced with mode `0600`, and stored below a mode-`0700` metadata root. Deleted rollout entries are pruned. Changed files miss the key and are fully reread. The Refresh button sends `force_revalidate=true`, bypasses hits, and rewrites validated entries.
 
-- `session_index.jsonl` supplies the preferred title and update timestamp, supporting known field aliases.
-- Each rollout read is capped by file size, line size, and line count. Malformed/non-UTF-8/oversized content becomes a partial warning rather than aborting all history.
-- Rollout metadata supplies thread ID, cwd, start timestamp, Git branch, and recorded SHA.
-- The first user message supplies a normalized, 180-character fallback summary.
-- Index update time takes precedence for the end time; filesystem mtime is the fallback.
-- A recently updated session can be marked active. End time is never allowed to precede start time.
-- Titles/summaries remain in memory/response only and never enter capture descriptors or bundle manifests.
+## Mapping and 30-day windows
 
-### Git access and pagination
+The scanner first filters sessions by `ended_at` into `[window_start, window_end)`. Git uses enumerated local branches, structured argv, first-parent/date-order logs, and a bounded 10,000-commit correlation rail. Session branch metadata prevents attaching a named session to a different branch.
 
-All Git invocations use `Command` argv, beginning with `git -C <canonical project root>`. No user-provided value is interpolated into a shell command.
+All inclusive overlaps are attached. With none, the chronologically first commit no more than 24 hours after session end is used once. Otherwise the session is uncommitted. Commit references are sorted by session end descending, then start ascending, then thread ID. Unique session and reference counts are separate.
 
-- Repository probe: `rev-parse --is-inside-work-tree`.
-- Local branches: `for-each-ref refs/heads/` plus the symbolic current branch.
-- Commit rail: `log --first-parent --date-order` with SHA, commit timestamp, and subject.
-- The requested branch must be an enumerated local branch or a recorded-but-unavailable historical session branch.
-- A recorded thread branch routes that thread to the matching rail. Missing branch metadata remains eligible for best-effort correlation; a different named branch is excluded rather than shown as an unmapped thread on the wrong branch.
-- Commit cursors must be full 40- or 64-character hexadecimal object IDs and must occur on the selected branch's first-parent rail.
-- Each response returns at most 50 commits. Correlation uses up to the newest 10,000 commits so paging does not reclassify a thread; truncation is returned as a warning.
-- Non-Git directories return `git: null` instead of an error.
+The response normally exposes commits in the requested 30-day window, plus any boundary commit carrying a selected session reference. Frontend page merging unions commit references by SHA/thread ID, recalculates occurrence counts, and prevents cross-window loss.
 
-## DTO contract
+## Lazy details
 
-```text
-ProjectChatHistory
-├── project_id
-├── threads: CodexThreadSummary[]
-├── git?: GitHistoryPage
-│   ├── selected_branch
-│   ├── branches: GitBranchSummary[]
-│   ├── commits: GitCommitSummary[]
-│   │   └── thread_refs: CommitThreadReference[]
-│   ├── next_cursor
-│   ├── unique_thread_count
-│   └── reference_count
-├── unmapped: UnmappedThreadReference[]
-└── warnings: string[]
-```
+Every detail request validates UUID, registered project, active binding, canonical project/profile paths, and rollout ownership. Duplicate IDs consistently select the complete rollout before the latest partial rollout for both summaries and details. The detail parser streams the winner and returns at most 50 genuine user/assistant previews from the cursor. User previews come only from filtered `event_msg.user_message`; agent previews accept visible `event_msg.agent_message` and assistant `response_item.message`, deduplicating paired copies. Injected tags and non-user roles, reasoning, system/developer messages, tool data, and raw payloads are excluded.
 
-`ProjectChatHistory` intentionally does not repeat display name, path, or alias. The page receives the current `LocalProjectSummary` and uses `projectLabel(project)` for presentation.
+The frontend holds message pages once per thread ID and expansion state once per visual occurrence. Thus expanding one occurrence loads shared data without expanding every repeated card. Per-occurrence `aria-controls` IDs and keys use commit SHA plus thread ID.
 
-## Frontend state boundaries
+## Storage timestamps
 
-`ProjectChatHistoryPage` owns branch selection, page accumulation, loading states, partial/action errors, pagination, and a monotonically increasing request ID. Responses from a stale project/branch/refresh request are ignored. `ProjectLinksWorkspace` supplies only the active project/binding, settings callback, and refresh epoch.
+`RecipeBase` adds backward-compatible optional `last_pull_at` and `last_push_at`. Successful Push publish sets `last_push_at`; only an overall successful Pull apply sets `last_pull_at`, preserving the other timestamp. For older data, the latest complete matching materialization `applied_at` is the Pull fallback.
 
-The `ProjectChatHistoryContent` renderer has no Tauri dependency in its execution path, which permits server-rendered integration assertions for Git and non-Git output. Stable SHA/thread IDs are used as React list keys.
+## Project-scoped launch security
 
-## Launch security
+Both actions revalidate ownership immediately before execution and log the exact command first.
 
-### Codex desktop
+- App: `/usr/bin/open -n -a /Applications/ChatGPT.app --env CODEX_HOME=<bound-home> codex://threads/<uuid>` using structured process arguments.
+- Terminal: resolves an absolute Codex CLI, then opens Terminal with a shell-quoted `CODEX_HOME=<bound-home> <codex> resume <uuid> -C <canonical-project-root>` command.
 
-The frontend validates a standard UUID shape and constructs only `codex://threads/<thread-id>`. The Tauri opener capability adds only the `codex://threads/*` scope for this custom scheme. Failure explicitly directs the user to `Open in Terminal`.
+UUIDs are strict, paths come from revalidated bindings, and user branch/cursor values never enter a shell. Missing app/CLI and OS launch failures return specific action errors.
 
-### Terminal
+## Frontend structure
 
-Rust validates registration, binding, canonical roots, UUID shape, and rollout ownership before launch. On macOS, it resolves the Codex CLI through `/bin/zsh -lc 'command -v codex'` so the GUI app sees the user's login-shell Homebrew/npm path, then asks Terminal to run the resolved absolute executable:
+`ProjectChatHistoryPage` owns branch/window loading, stale-request protection, merged pages, launch state, and lazy detail caches. `ProjectChatHistoryContent` is a pure renderer used by integration tests. Git renders Uncommitted Changes then newest-first commits; non-Git renders a flat newest-activity-first Codex thread list. Browser `content-visibility`/intrinsic sizing limits layout and paint work for rows outside the viewport when the rendered history exceeds 100 rows.
 
-```text
-codex resume <quoted-thread-id> -C <quoted-canonical-project-root>
-```
-
-Shell single quotes and AppleScript string characters are escaped by tested helpers. Windows/Linux terminal automation remains unsupported and returns a specific error.
+`list_project_repository_kinds` probes each active canonical binding with structured `git -C … rev-parse --is-inside-work-tree`. `ProjectSyncV3` joins the returned machine-local map into `LocalProjectSummary`, allowing the sidebar to render a static `Git Based`/`Non-Git Based` chip without scanning Codex history or persisting repository type in synchronized configuration. Unbound projects omit the indicator rather than being mislabeled.

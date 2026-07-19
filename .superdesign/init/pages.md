@@ -21,7 +21,7 @@ Entry: `src/components/project-sync/ProjectLinksWorkspace.tsx`
 - `src/App.css`
 - `.superdesign/design-system.md`
 
-Actual render branch: when there is an active completed project and neither dedicated settings page nor setup draft is open, `ProjectLinksWorkspace` renders `ProjectChatHistoryPage`. Project and history-icon selection share the same state handler.
+Actual render branch: when there is an active completed project and neither dedicated settings page nor setup draft is open, `ProjectLinksWorkspace` renders `ProjectChatHistoryPage`. The completed project row is the only history navigation target; its repository-type chip is informational.
 
 ## Project settings
 
