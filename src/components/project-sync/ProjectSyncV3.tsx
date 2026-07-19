@@ -38,7 +38,12 @@ import ProjectSetupWorkspace, { type SetupCompletion } from "./ProjectSetupWorks
 import ProjectSidebar from "./ProjectSidebar";
 import RestorePlanView from "./RestorePlanView";
 import { projectSyncApi } from "./api";
-import { beginPullReview } from "./pullReviewFlow";
+import {
+  applyPullReview,
+  beginPullReview,
+  type PullApplyPhase,
+  type PullReviewSelection,
+} from "./pullReviewFlow";
 import {
   errorMessage,
   inventoryResources,
@@ -169,6 +174,11 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const [historyRefreshEpoch, setHistoryRefreshEpoch] = useState(0);
   const [dependencyResult, setDependencyResult] = useState<DependencyResult | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
+  const [pullApplyPhase, setPullApplyPhase] = useState<PullApplyPhase>("idle");
+  const [reviewSupportLoading, setReviewSupportLoading] = useState(false);
+  const [completedPullActionIds, setCompletedPullActionIds] = useState<Set<string>>(new Set());
+  const [completedPullResourceIds, setCompletedPullResourceIds] = useState<Set<string>>(new Set());
+  const [failedPullResourceIds, setFailedPullResourceIds] = useState<Set<string>>(new Set());
   const restoreRequest = useRef(0);
 
   useEffect(() => {
@@ -302,6 +312,19 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   }), [activeProjectId, bindings, config.links, readiness?.state, registrations, repositoryKinds, resources]);
 
   const activeSummary = projects.find((candidate) => candidate.local_project_id === activeProjectId) ?? null;
+  const activeDraftSummary = setupDraftId
+    ? setupDrafts.find((candidate) => candidate.draft_id === setupDraftId) ?? null
+    : null;
+  const workspaceTitle = restorePlan
+    ? `${restoreProjectName} · Pull review`
+    : activeDraftSummary?.display_name
+      ?? (activeSummary ? projectLabel(activeSummary) : "Projects");
+  const restoreProfileLabel = restoreBinding
+    ? [...new Set(Object.values(restoreBinding.profile_ids)
+      .map((profileId) => profiles.find((profile) => profile.profile_id === profileId)?.display_name)
+      .filter((name): name is string => Boolean(name)))]
+      .join(" + ") || "the assigned provider profile"
+    : "the assigned provider profile";
   const pendingConnectionProject = pendingBundleConnection
     ? registrations.find((candidate) => candidate.local_project_id === pendingBundleConnection.projectId) ?? null
     : null;
@@ -511,6 +534,18 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     }
   };
 
+  const closeWorkspaceSettings = () => {
+    setStorageEditorRequest((current) => ({
+      mode: "close",
+      requestId: (current?.requestId ?? 0) + 1,
+    }));
+    setProjectEditorRequest((current) => ({
+      mode: "close",
+      projectId: "",
+      requestId: (current?.requestId ?? 0) + 1,
+    }));
+  };
+
   const beginAddProject = async () => {
     const picked = await open({ directory: true, multiple: false });
     if (typeof picked !== "string" || !picked) return;
@@ -518,6 +553,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     setError(null);
     try {
       const created = await projectSyncApi.createSetupDraft(picked);
+      closeWorkspaceSettings();
       setSetupDraftId(created.draft.draft_id);
       if (created.resumed) {
         setNotice(`Resumed the saved setup draft for ${created.draft.display_name}.`);
@@ -532,7 +568,8 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
 
   const openSetupDraft = (draftId: string) => {
     setError(null);
-    setSetupDraftId(draftId);
+    closeWorkspaceSettings();
+    setSetupDraftId((current) => current === draftId ? null : draftId);
   };
 
   const closeSetupDraft = async () => {
@@ -810,13 +847,18 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     setRestoreError(null);
     setRestoreResult(null);
     setDependencyResult(null);
+    setPullApplyPhase("idle");
+    setReviewSupportLoading(true);
+    setCompletedPullActionIds(new Set());
+    setCompletedPullResourceIds(new Set());
+    setFailedPullResourceIds(new Set());
     setRestorePlan(null);
     setDependencyPlan(null);
     setReadiness(null);
     setRestoreBinding(targetBinding);
     setRestoreProjectName(displayName);
     try {
-      // The file review is the primary Pull surface. Render it as soon as it
+      // The project-data review is the primary Pull surface. Render it as soon as it
       // is ready; optional dependency/readiness checks must never hide a valid
       // restore plan or its Apply button.
       const request = { storageId, bundleId, binding: targetBinding };
@@ -825,7 +867,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       setRestorePlan(review.restorePlan);
       setNotice(`Pull review ready for ${displayName}. Nothing has been applied yet.`);
 
-      // Supporting context fills in asynchronously after the modal is usable.
+      // Supporting context fills in asynchronously after the workspace is usable.
       // Its lifecycle is request-scoped so closing or replanning cannot apply
       // stale results to another review.
       void review.support
@@ -834,18 +876,22 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
           setDependencyPlan(support.dependencyPlan);
           setReadiness(support.readiness);
           if (support.errors.length > 0) {
-            setRestoreError(`The file actions are ready to apply. ${support.errors.join(" ")}`);
+            setRestoreError(`The project changes are ready to apply. ${support.errors.join(" ")}`);
           }
         })
         .catch((reason) => {
           if (restoreRequest.current === requestId) {
-            setRestoreError(`The file actions are ready to apply. Supporting checks: ${errorMessage(reason)}`);
+            setRestoreError(`The project changes are ready to apply. Supporting checks: ${errorMessage(reason)}`);
           }
+        })
+        .finally(() => {
+          if (restoreRequest.current === requestId) setReviewSupportLoading(false);
         });
       return null;
     } catch (reason) {
       const message = errorMessage(reason);
       if (restoreRequest.current === requestId) {
+        setReviewSupportLoading(false);
         setRestoreError(message);
         setError(message);
       }
@@ -1002,33 +1048,136 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     }
   };
 
-  const applyRestore = async (actionIds: string[]) => {
-    if (!restorePlan || !restoreBinding) return;
-    openActivity();
-    setBusy(true);
+  const closePullReview = () => {
+    restoreRequest.current += 1;
+    setRestorePlan(null);
+    setRestoreBinding(null);
+    setDependencyPlan(null);
+    setRestoreResult(null);
+    setDependencyResult(null);
     setRestoreError(null);
-    try {
-      const result = await projectSyncApi.applyRestore(restorePlan.plan_id, actionIds);
-      setRestoreResult(result);
-      if (result.success) setHistoryRefreshEpoch((epoch) => epoch + 1);
-      setReadiness(await projectSyncApi.getReadiness(restorePlan.bundle_id, restoreBinding));
-      if (activeProjectId) await loadProjectData(activeProjectId, config, activeStorageId);
-    } catch (reason) {
-      setRestoreError(errorMessage(reason));
-    } finally {
-      setBusy(false);
-    }
+    setPullApplyPhase("idle");
+    setReviewSupportLoading(false);
+    setCompletedPullActionIds(new Set());
+    setCompletedPullResourceIds(new Set());
+    setFailedPullResourceIds(new Set());
   };
 
-  const applyDependencies = async (actionIds: string[]) => {
-    if (!dependencyPlan || !restorePlan || !restoreBinding) return;
+  const applyReview = async (selection: PullReviewSelection) => {
+    if (!restorePlan || !restoreBinding) return;
+    const currentRestorePlan = restorePlan;
+    const currentDependencyPlan = dependencyPlan;
+    openActivity();
+    setFailedPullResourceIds((current) => {
+      const next = new Set(current);
+      for (const resourceId of selection.resourceIds) next.delete(resourceId);
+      return next;
+    });
+    if (selection.restoreActionIds.length > 0) setRestoreResult(null);
+    if (selection.dependencyActionIds.length > 0) setDependencyResult(null);
     setBusy(true);
     setRestoreError(null);
     try {
-      setDependencyResult(await projectSyncApi.applyDependencies(dependencyPlan.plan_id, actionIds));
-      setReadiness(await projectSyncApi.getReadiness(restorePlan.bundle_id, restoreBinding));
-      setDependencyPlan(await projectSyncApi.planDependencies(restorePlan.bundle_id, restoreBinding));
+      const result = await applyPullReview(
+        projectSyncApi,
+        currentRestorePlan,
+        currentDependencyPlan,
+        restoreBinding,
+        selection,
+        setPullApplyPhase,
+      );
+      if (result.restoreResult) {
+        setRestoreResult(result.restoreResult);
+        if (result.restoreResult.success) setHistoryRefreshEpoch((epoch) => epoch + 1);
+      }
+      if (result.dependencyResult) setDependencyResult(result.dependencyResult);
+      if (result.readiness) setReadiness(result.readiness);
+      if (result.error) setRestoreError(result.error);
+
+      const resourceByAction = new Map<string, string>();
+      for (const action of currentRestorePlan.actions) {
+        resourceByAction.set(action.action_id, action.resource_id);
+      }
+      for (const action of currentDependencyPlan?.actions ?? []) {
+        resourceByAction.set(action.action_id, action.resource_id);
+      }
+      const appliedActionIds = new Set([
+        ...(result.restoreResult?.applied_action_ids ?? []),
+        ...(result.dependencyResult?.applied_action_ids ?? []),
+      ]);
+      const failedActionIds = new Set([
+        ...(result.restoreResult?.failed_actions ?? []).map((failure) => failure.action_id),
+        ...(result.dependencyResult?.failed_actions ?? []).map((failure) => failure.action_id),
+      ]);
+      const interruptedActionIds = result.failedPhase === "restoring"
+        ? selection.restoreActionIds
+        : result.failedPhase === "installing"
+          ? selection.dependencyActionIds
+          : [];
+      for (const actionId of interruptedActionIds) {
+        if (!appliedActionIds.has(actionId)) failedActionIds.add(actionId);
+      }
+      const failedResources = new Set(
+        [...failedActionIds]
+          .map((actionId) => resourceByAction.get(actionId))
+          .filter((resourceId): resourceId is string => Boolean(resourceId)),
+      );
+      const selectedActions = [...selection.restoreActionIds, ...selection.dependencyActionIds];
+      const successfulResources = new Set(selection.resourceIds.filter((resourceId) => {
+        const actionIds = selectedActions.filter((actionId) => resourceByAction.get(actionId) === resourceId);
+        return actionIds.length > 0 && actionIds.every((actionId) => appliedActionIds.has(actionId));
+      }));
+      setCompletedPullActionIds((current) => new Set([...current, ...appliedActionIds]));
+      setCompletedPullResourceIds((current) => {
+        const next = new Set(current);
+        for (const resourceId of successfulResources) next.add(resourceId);
+        for (const resourceId of failedResources) next.delete(resourceId);
+        return next;
+      });
+      setFailedPullResourceIds((current) => {
+        const next = new Set(current);
+        for (const resourceId of selection.resourceIds) next.delete(resourceId);
+        for (const resourceId of failedResources) next.add(resourceId);
+        return next;
+      });
+
+      // A plan is single-use even when the user skipped or failed an action.
+      // Prepare fresh generation-pinned plans so remaining setup can be
+      // selected or retried without reopening the review.
+      const approvedThisPass = new Set([
+        ...selection.restoreActionIds,
+        ...selection.dependencyActionIds,
+      ]);
+      const deferredRestoreKinds = new Set(["install_plugin", "install_standalone_skill"]);
+      const hasSkippedActions = [
+        ...currentRestorePlan.actions
+          .filter((action) => !deferredRestoreKinds.has(action.kind.kind))
+          .map((action) => action.action_id),
+        ...(currentDependencyPlan?.actions ?? []).map((action) => action.action_id),
+      ].some((actionId) => (
+        !completedPullActionIds.has(actionId) && !approvedThisPass.has(actionId)
+      ));
+      if (!result.success || hasSkippedActions) {
+        const [nextRestore, nextDependencies] = await Promise.allSettled([
+          projectSyncApi.planRestore(
+            currentRestorePlan.storage_id,
+            currentRestorePlan.bundle_id,
+            restoreBinding,
+          ),
+          projectSyncApi.planDependencies(currentRestorePlan.bundle_id, restoreBinding),
+        ]);
+        if (nextRestore.status === "fulfilled") setRestorePlan(nextRestore.value);
+        if (nextDependencies.status === "fulfilled") setDependencyPlan(nextDependencies.value);
+        const replanErrors = [nextRestore, nextDependencies]
+          .filter((entry) => entry.status === "rejected")
+          .map((entry) => errorMessage(entry.reason));
+        if (replanErrors.length > 0) {
+          setRestoreError(`Changes were applied, but remaining setup could not be prepared: ${replanErrors.join(" ")}`);
+        }
+      }
+      if (activeProjectId) await loadProjectData(activeProjectId, config, activeStorageId);
     } catch (reason) {
+      setPullApplyPhase("complete");
       setRestoreError(errorMessage(reason));
     } finally {
       setBusy(false);
@@ -1037,7 +1186,31 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
 
   const refreshRestore = async () => {
     if (!restorePlan || !restoreBinding) return;
-    await planRestore(restorePlan.storage_id, restorePlan.bundle_id, restoreBinding, restoreProjectName);
+    const currentPlan = restorePlan;
+    setBusy(true);
+    setRestoreError(null);
+    try {
+      const [nextRestore, nextDependencies, nextReadiness] = await Promise.all([
+        projectSyncApi.planRestore(currentPlan.storage_id, currentPlan.bundle_id, restoreBinding),
+        projectSyncApi.planDependencies(currentPlan.bundle_id, restoreBinding),
+        projectSyncApi.getReadiness(currentPlan.bundle_id, restoreBinding),
+      ]);
+      if (nextRestore.generation !== currentPlan.generation || nextRestore.manifest_sha256 !== currentPlan.manifest_sha256) {
+        setRestoreResult(null);
+        setDependencyResult(null);
+        setPullApplyPhase("idle");
+        setCompletedPullActionIds(new Set());
+        setCompletedPullResourceIds(new Set());
+        setFailedPullResourceIds(new Set());
+      }
+      setRestorePlan(nextRestore);
+      setDependencyPlan(nextDependencies);
+      setReadiness(nextReadiness);
+    } catch (reason) {
+      setRestoreError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
   };
 
   const saveStorageConfig = async (
@@ -1145,14 +1318,13 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         activityOpen={activityOpen}
         unreadLogs={unreadLogs}
         onSelectProject={(id) => {
-          setProjectEditorRequest((current) => ({
-            mode: "close",
-            projectId: id,
-            requestId: (current?.requestId ?? 0) + 1,
-          }));
+          setSetupDraftId(null);
+          closeWorkspaceSettings();
+          if (restorePlan) closePullReview();
           void selectProject(id);
         }}
         onConfigureProject={(projectId) => {
+          setSetupDraftId(null);
           setProjectEditorRequest((current) => ({
             mode: "toggle",
             projectId,
@@ -1169,6 +1341,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         onAddProject={() => void beginAddProject()}
         onRefresh={() => void refresh()}
         onOpenStorage={(storageId) => {
+          setSetupDraftId(null);
           setStorageEditorRequest((current) => ({
             mode: "toggle",
             storageId,
@@ -1177,6 +1350,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         }}
         onRemoveStorage={(storageId) => void removeStorage(storageId)}
         onAddStorage={() => {
+          setSetupDraftId(null);
           setStorageEditorRequest((current) => ({
             mode: "create",
             storageKind: "local",
@@ -1204,11 +1378,20 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       />
 
       <div className={`v3-workspace${resizingLog ? " resizing-log" : ""}`}>
-        <div className="v3-titlebar" data-tauri-drag-region>
-          <button type="button" className="v3-theme-button" onClick={() => onThemeChange(theme === "dark" ? "light" : "dark")}>
+        <header className="v3-titlebar" data-tauri-drag-region>
+          <div className="v3-titlebar-context" data-tauri-drag-region title={workspaceTitle}>
+            <Icon name="folder" size={16} />
+            <strong>{workspaceTitle}</strong>
+            {activeDraftSummary && <span>Draft setup</span>}
+          </div>
+          <button
+            type="button"
+            className="v3-theme-button"
+            onClick={() => onThemeChange(theme === "dark" ? "light" : "dark")}
+          >
             {theme === "dark" ? "Light" : "Dark"} theme
           </button>
-        </div>
+        </header>
 
         {backendError && (
           <div className="v3-backend-banner">
@@ -1224,7 +1407,29 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
           </button>
         )}
 
-        <ProjectLinksWorkspace
+        {restorePlan && restoreBinding ? (
+          <RestorePlanView
+            projectName={restoreProjectName}
+            profileLabel={restoreProfileLabel}
+            plan={restorePlan}
+            binding={restoreBinding}
+            dependencyPlan={dependencyPlan}
+            readiness={readiness}
+            restoreResult={restoreResult}
+            dependencyResult={dependencyResult}
+            phase={pullApplyPhase}
+            supportLoading={reviewSupportLoading}
+            completedActionIds={completedPullActionIds}
+            completedResourceIds={completedPullResourceIds}
+            failedResourceIds={failedPullResourceIds}
+            busy={busy}
+            error={restoreError}
+            onApply={(selection) => void applyReview(selection)}
+            onRefresh={() => void refreshRestore()}
+            onBack={closePullReview}
+          />
+        ) : (
+          <ProjectLinksWorkspace
             projects={projects}
             bindings={bindings}
             profiles={profiles}
@@ -1259,6 +1464,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
             onRefresh={() => void refresh()}
             onAddProject={() => void beginAddProject()}
             onOpenStorageSettings={() => {
+              setSetupDraftId(null);
               setStorageEditorRequest((current) => ({
                 mode: "create",
                 storageKind: "local",
@@ -1283,7 +1489,8 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
                 onFinalized={(detail, completion) => void completeSetup(detail, completion)}
               />
             ) : null}
-        />
+          />
+        )}
 
         <div
           className={`log-drawer v3-log-drawer${activityOpen ? " open" : ""}`}
@@ -1344,31 +1551,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         />
       )}
 
-      {restorePlan && restoreBinding && (
-        <RestorePlanView
-          projectName={restoreProjectName}
-          plan={restorePlan}
-          binding={restoreBinding}
-          dependencyPlan={dependencyPlan}
-          readiness={readiness}
-          restoreResult={restoreResult}
-          dependencyResult={dependencyResult}
-          busy={busy}
-          error={restoreError}
-          onApplyRestore={(ids) => void applyRestore(ids)}
-          onApplyDependencies={(ids) => void applyDependencies(ids)}
-          onRefresh={() => void refreshRestore()}
-          onClose={() => {
-            restoreRequest.current += 1;
-            setRestorePlan(null);
-            setRestoreBinding(null);
-            setDependencyPlan(null);
-            setRestoreResult(null);
-            setDependencyResult(null);
-            setRestoreError(null);
-          }}
-        />
-      )}
     </div>
   );
 }

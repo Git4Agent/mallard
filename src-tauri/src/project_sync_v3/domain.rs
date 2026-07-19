@@ -293,6 +293,28 @@ fn validate_display_text(label: &str, value: &str, allow_empty: bool) -> Result<
     }
 }
 
+/// Validate either the effective name or install-directory component of a
+/// global custom skill. They are separate values, but both use the providers'
+/// current portable single-component grammar.
+pub fn validate_skill_name(label: &str, value: &str) -> Result<(), String> {
+    let valid_start = value
+        .bytes()
+        .next()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric());
+    if !valid_start
+        || value.len() > 128
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || value == "."
+        || value == ".."
+        || value.ends_with('.')
+    {
+        return Err(format!("invalid {}: '{}'", label, value));
+    }
+    Ok(())
+}
+
 pub fn validate_absolute_clean_path(label: &str, value: &str) -> Result<(), String> {
     if value.is_empty() || value.len() > 4_096 || value.chars().any(char::is_control) {
         return Err(format!("invalid {}", label));
@@ -1452,6 +1474,8 @@ pub enum RestoreActionType {
     MergeFile,
     MaterializeConversation,
     InstallStandaloneSkill,
+    InstallCustomSkill,
+    OverwriteCustomSkill,
     InstallPlugin,
     ReviewHook,
     ReviewMcp,
@@ -1475,6 +1499,21 @@ pub enum RestoreActionKind {
     InstallStandaloneSkill {
         provider: Provider,
         target_relative_path: String,
+    },
+    /// Materialize a complete custom-skill directory into the mapped provider
+    /// home's `skills/<name>`. The whole directory is one unit: staging,
+    /// verification, and rename happen inside a single approved action, never
+    /// as independently selectable file writes.
+    InstallCustomSkill {
+        provider: Provider,
+        skill_name: String,
+    },
+    /// Replace an existing, different custom-skill directory. Approval is
+    /// pinned to the expected target tree digest and a recoverable local
+    /// backup is taken before the swap.
+    OverwriteCustomSkill {
+        provider: Provider,
+        skill_name: String,
     },
     InstallPlugin {
         provider: Provider,
@@ -1502,6 +1541,8 @@ impl RestoreActionKind {
             Self::MergeFile { .. } => RestoreActionType::MergeFile,
             Self::MaterializeConversation { .. } => RestoreActionType::MaterializeConversation,
             Self::InstallStandaloneSkill { .. } => RestoreActionType::InstallStandaloneSkill,
+            Self::InstallCustomSkill { .. } => RestoreActionType::InstallCustomSkill,
+            Self::OverwriteCustomSkill { .. } => RestoreActionType::OverwriteCustomSkill,
             Self::InstallPlugin { .. } => RestoreActionType::InstallPlugin,
             Self::ReviewHook { .. } => RestoreActionType::ReviewHook,
             Self::ReviewMcp { .. } => RestoreActionType::ReviewMcp,
@@ -1531,6 +1572,10 @@ impl RestoreActionKind {
                 } else {
                     Ok(())
                 }
+            }
+            Self::InstallCustomSkill { skill_name, .. }
+            | Self::OverwriteCustomSkill { skill_name, .. } => {
+                validate_skill_name("custom skill name", skill_name)
             }
             Self::InstallPlugin { plugin_id, .. } => {
                 validate_display_text("plugin id", plugin_id, false)
@@ -1574,6 +1619,8 @@ impl RestoreAction {
             self.kind.action_type(),
             RestoreActionType::InstallPlugin
                 | RestoreActionType::InstallStandaloneSkill
+                | RestoreActionType::InstallCustomSkill
+                | RestoreActionType::OverwriteCustomSkill
                 | RestoreActionType::ReviewHook
                 | RestoreActionType::ReviewMcp
                 | RestoreActionType::ApplySetting

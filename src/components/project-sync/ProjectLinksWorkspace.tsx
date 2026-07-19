@@ -475,47 +475,53 @@ export default function ProjectLinksWorkspace({
   }
 
   return (
-    <main className={`v3-main v3-project-links-page${settingsProject ? " v3-project-settings-page" : ""}`}>
-      <section className="profile-links-section" aria-labelledby="project-links-heading">
-        <div className="profile-links-heading">
-          <div className="profile-links-copy">
-            <h1 id="project-links-heading" className="settings-section-title">
-              {settingsProject ? "Project settings" : "Project links"}
-            </h1>
-            <div className="profile-links-subtitle">
-              {settingsProject ? projectLabel(settingsProject) : "Choose where each project repo syncs."}
+    <main className={`v3-main v3-project-links-page${settingsProject ? " v3-project-settings-page" : ""}${newProjectSetup ? " v3-project-setup-page" : ""}`}>
+      <section
+        className="profile-links-section"
+        aria-label={newProjectSetup ? "Project setup" : undefined}
+        aria-labelledby={newProjectSetup ? undefined : "project-links-heading"}
+      >
+        {!newProjectSetup && (
+          <div className="profile-links-heading">
+            <div className="profile-links-copy">
+              <h1 id="project-links-heading" className="settings-section-title">
+                {settingsProject ? "Project settings" : "Project links"}
+              </h1>
+              <div className="profile-links-subtitle">
+                {settingsProject ? projectLabel(settingsProject) : "Choose where each project repo syncs."}
+              </div>
             </div>
+            {settingsProject ? (
+              <button
+                type="button"
+                className="btn btn-ghost v3-project-settings-close"
+                onClick={() => setEditingProjectId(null)}
+                aria-label="Close project settings"
+              >
+                <Icon name="x" size={15} />
+              </button>
+            ) : (
+              <div className="profile-links-heading-actions">
+                <div className="profile-links-counts">
+                  {projects.length} projects <span>·</span> {storages.length} storage <span>·</span> {links.length} links
+                </div>
+                <div className="profile-links-primary-actions">
+                  <button type="button" className="btn profile-refresh-linkage" onClick={onRefresh} disabled={loading || busy}>
+                    <Icon name="refresh" size={16} className={loading ? "icon-spin" : undefined} />
+                    {loading ? "Refreshing…" : "Refresh"}
+                  </button>
+                  <button type="button" className="btn profile-add-profile" onClick={onAddProject} disabled={busy}>
+                    <Icon name="plus" size={16} /> Add project
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
-          {settingsProject ? (
-            <button
-              type="button"
-              className="btn btn-ghost v3-project-settings-close"
-              onClick={() => setEditingProjectId(null)}
-              aria-label="Close project settings"
-            >
-              <Icon name="x" size={15} />
-            </button>
-          ) : (
-            <div className="profile-links-heading-actions">
-              <div className="profile-links-counts">
-                {projects.length} projects <span>·</span> {storages.length} storage <span>·</span> {links.length} links
-              </div>
-              <div className="profile-links-primary-actions">
-                <button type="button" className="btn profile-refresh-linkage" onClick={onRefresh} disabled={loading || busy}>
-                  <Icon name="refresh" size={16} className={loading ? "icon-spin" : undefined} />
-                  {loading ? "Refreshing…" : "Refresh"}
-                </button>
-                <button type="button" className="btn profile-add-profile" onClick={onAddProject} disabled={busy}>
-                  <Icon name="plus" size={16} /> Add project
-                </button>
-              </div>
-            </div>
-          )}
-        </div>
+        )}
 
         {newProjectSetup}
 
-        {projects.length === 0 ? (
+        {!newProjectSetup && (projects.length === 0 ? (
           <div className="profile-links-empty">
             <Icon name="folder" size={24} />
             <span>Add a project to choose which resources and storage belong to it.</span>
@@ -953,7 +959,7 @@ export default function ProjectLinksWorkspace({
               );
             })}
           </div>
-        )}
+        ))}
       </section>
 
     </main>

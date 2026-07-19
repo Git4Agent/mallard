@@ -2,8 +2,10 @@ import type {
   BundleReadiness,
   BundleSnapshotSummary,
   DependencyPlan,
+  DependencyResult,
   ProjectBinding,
   RestorePlan,
+  RestoreResult,
 } from "../../types";
 import { errorMessage } from "./model";
 
@@ -29,6 +31,128 @@ export interface PullReviewSupport {
 export interface StartedPullReview {
   restorePlan: RestorePlan;
   support: Promise<PullReviewSupport>;
+}
+
+export type PullApplyPhase = "idle" | "restoring" | "installing" | "verifying" | "complete";
+
+export interface PullReviewSelection {
+  resourceIds: string[];
+  restoreActionIds: string[];
+  dependencyActionIds: string[];
+}
+
+export interface PullReviewApplyApi {
+  applyRestore: (planId: string, actionIds: string[]) => Promise<RestoreResult>;
+  applyDependencies: (planId: string, actionIds: string[]) => Promise<DependencyResult>;
+  getReadiness: (bundleId: string, binding: ProjectBinding) => Promise<BundleReadiness>;
+}
+
+export interface PullReviewApplyResult {
+  restoreResult: RestoreResult | null;
+  dependencyResult: DependencyResult | null;
+  readiness: BundleReadiness | null;
+  success: boolean;
+  error: string | null;
+  failedPhase: "restoring" | "installing" | "verifying" | null;
+}
+
+/**
+ * The two backend plans are immutable approval surfaces. Refuse to combine
+ * them unless every pin identifies the same remote snapshot and local
+ * binding; otherwise a single Apply click could approve two different states.
+ */
+export function assertPullPlansAligned(
+  restorePlan: RestorePlan,
+  dependencyPlan: DependencyPlan | null,
+  selection: PullReviewSelection,
+): void {
+  const restoreIds = new Set(restorePlan.actions.map((action) => action.action_id));
+  if (selection.restoreActionIds.some((actionId) => !restoreIds.has(actionId))) {
+    throw new Error("The selected restore actions no longer belong to this Pull review.");
+  }
+  if (!dependencyPlan && selection.dependencyActionIds.length > 0) {
+    throw new Error("The selected tools do not have an installation plan yet.");
+  }
+  if (dependencyPlan) {
+    const sameSnapshot =
+      dependencyPlan.storage_id === restorePlan.storage_id &&
+      dependencyPlan.bundle_id === restorePlan.bundle_id &&
+      dependencyPlan.replica_id === restorePlan.replica_id &&
+      dependencyPlan.generation === restorePlan.generation &&
+      dependencyPlan.commit_id === restorePlan.commit_id &&
+      dependencyPlan.manifest_sha256 === restorePlan.manifest_sha256 &&
+      dependencyPlan.binding_revision === restorePlan.binding_revision;
+    if (!sameSnapshot) {
+      throw new Error("The project and tool plans describe different bundle generations. Refresh the Pull review.");
+    }
+    const dependencyIds = new Set(dependencyPlan.actions.map((action) => action.action_id));
+    if (selection.dependencyActionIds.some((actionId) => !dependencyIds.has(actionId))) {
+      throw new Error("The selected tool installations no longer belong to this Pull review.");
+    }
+  }
+}
+
+/** Execute the one-button Pull workflow in the order presented by the UI. */
+export async function applyPullReview(
+  api: PullReviewApplyApi,
+  restorePlan: RestorePlan,
+  dependencyPlan: DependencyPlan | null,
+  binding: ProjectBinding,
+  selection: PullReviewSelection,
+  onPhase: (phase: PullApplyPhase) => void,
+): Promise<PullReviewApplyResult> {
+  assertPullPlansAligned(restorePlan, dependencyPlan, selection);
+  let restoreResult: RestoreResult | null = null;
+  let dependencyResult: DependencyResult | null = null;
+  let readiness: BundleReadiness | null = null;
+  let executionError: string | null = null;
+  let failedPhase: PullReviewApplyResult["failedPhase"] = null;
+
+  onPhase("restoring");
+  if (selection.restoreActionIds.length > 0) {
+    try {
+      restoreResult = await api.applyRestore(restorePlan.plan_id, selection.restoreActionIds);
+    } catch (reason) {
+      executionError = `Restore failed: ${errorMessage(reason)}`;
+      failedPhase = "restoring";
+    }
+  }
+
+  onPhase("installing");
+  if (!executionError && selection.dependencyActionIds.length > 0 && dependencyPlan) {
+    try {
+      dependencyResult = await api.applyDependencies(
+        dependencyPlan.plan_id,
+        selection.dependencyActionIds,
+      );
+    } catch (reason) {
+      executionError = `Tool installation failed: ${errorMessage(reason)}`;
+      failedPhase = "installing";
+    }
+  }
+
+  onPhase("verifying");
+  try {
+    readiness = await api.getReadiness(restorePlan.bundle_id, binding);
+  } catch (reason) {
+    const verificationError = `Readiness verification failed: ${errorMessage(reason)}`;
+    executionError = executionError ? `${executionError} ${verificationError}` : verificationError;
+    if (!failedPhase) failedPhase = "verifying";
+  }
+  const success =
+    executionError === null &&
+    (restoreResult?.success ?? true) &&
+    (dependencyResult?.success ?? true) &&
+    readiness?.state === "ready";
+  onPhase("complete");
+  return {
+    restoreResult,
+    dependencyResult,
+    readiness,
+    success,
+    error: executionError,
+    failedPhase,
+  };
 }
 
 /**

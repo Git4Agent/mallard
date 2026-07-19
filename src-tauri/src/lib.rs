@@ -532,9 +532,11 @@ const DEFAULT_SYNC_DIRS: &[&str] = &[
     // Codex — required for conversation restore
     ".codex/sessions",
     ".codex/archived_sessions",
-    // Codex — behavior and configuration
+    // Codex — behavior and configuration. Global `skills/` is owned by
+    // schema-3 project sync (PLAN_V3_GLOBAL_PLUGINS_AND_SKILLS.md): custom
+    // skills sync as reviewed directory snapshots there, so legacy profile
+    // sync no longer copies them file-by-file.
     ".codex/memories",
-    ".codex/skills",
     ".codex/rules",
     ".codex/prompts",
     ".codex/agents",
@@ -543,10 +545,10 @@ const DEFAULT_SYNC_DIRS: &[&str] = &[
     // Claude — conversation-adjacent
     ".claude/file-history",
     ".claude/todos",
-    // Claude — behavior and configuration
+    // Claude — behavior and configuration. `skills/` is schema-3-owned; see
+    // the Codex note above.
     ".claude/agents",
     ".claude/commands",
-    ".claude/skills",
 ];
 const DEFAULT_SYNC_FILES: &[&str] = &[
     ".codex/session_index.jsonl",
@@ -8081,7 +8083,6 @@ mod tests {
             ".codex/session_index.jsonl",
             ".codex/history.jsonl",
             ".codex/memories/notes.md",
-            ".codex/skills/foo/SKILL.md",
             ".codex/rules/default.rules",
             ".codex/prompts/review.md",
             ".codex/AGENTS.md",
@@ -8098,12 +8099,16 @@ mod tests {
             ".claude/CLAUDE.md",
             ".claude/agents/custom.md",
             ".claude/commands/cmd.md",
-            ".claude/skills/s/SKILL.md",
             ".claude/keybindings.json",
             ".claude/settings.json",
             ".claude/plugins/config.json",
         ] {
             assert!(relative_path_is_included(path, &config), "{}", path);
+        }
+        // Global skills are schema-3-owned custom-skill snapshots now; the
+        // legacy profile allowlist no longer syncs them by default.
+        for path in [".codex/skills/foo/SKILL.md", ".claude/skills/s/SKILL.md"] {
+            assert!(!relative_path_is_included(path, &config), "{}", path);
         }
     }
 

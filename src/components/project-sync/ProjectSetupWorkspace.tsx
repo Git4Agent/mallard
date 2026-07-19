@@ -653,7 +653,7 @@ export default function ProjectSetupWorkspace({
                 {stateBadge(resourcesSection?.state).label}
               </span>
               {!usesExistingRepo && (
-                <button type="button" className="btn" onClick={() => setResourcesOpen((current) => !current)} disabled={resources.length === 0}>
+                <button type="button" className="btn btn-ghost v3-setup-resource-toggle" onClick={() => setResourcesOpen((current) => !current)} disabled={resources.length === 0}>
                   {resourcesOpen ? "Collapse" : "Customize"}
                 </button>
               )}

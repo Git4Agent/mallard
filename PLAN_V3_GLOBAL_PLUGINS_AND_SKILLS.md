@@ -1,8 +1,63 @@
 # Plan: Back up and install global plugins and custom skills
 
-**Status:** proposed  
-**Date:** 2026-07-18  
-**Scope:** schema-3 project sync only; legacy profile sync remains unchanged
+**Status:** implemented (core slices; see Implementation status below)
+**Date:** 2026-07-18 (implemented 2026-07-18)
+**Scope:** schema-3 project sync; legacy profile sync stops syncing global
+`skills/**` (schema-3 is the sole owner of global custom skills)
+
+## Implementation status (2026-07-18)
+
+Landed:
+
+- `project_sync_v3/global_inventory.rs` — ownership-ordered provider-home
+  inventory: plugin inventory (Claude via `codex_plugins::claude_inventory`,
+  Codex via the global `config.toml` plugins/marketplaces tables), plugin
+  install-root ownership index, `skills/*` enumeration and classification
+  (standalone / plugin-provided / blocked), bounded `SKILL.md` name
+  validation. Adapter contract v2 separates the declared runtime-visible
+  effective name from the physical install-directory name; either may differ,
+  while duplicate effective-name claims block selection.
+- Capture: `CaptureResourceKind::StandaloneSkill` maps to
+  `ResourceKind::StandaloneSkill` + provider-state scope +
+  `Provenance::StandaloneSnapshot`; resource identity is provider +
+  effective name (`codex:standalone-skill:<name>`), so edits keep identity
+  and declared-name changes are remove/add. Logical roots preserve the source
+  install directory as `state/<provider>/skills/<install-dir>`.
+  Global plugins become payload-free intent resources that coalesce with
+  project-config observations; `ResourceCandidate.metadata` carries plugin
+  source/version/provided-skills and skill naming evidence into descriptors.
+- Restore: typed `InstallCustomSkill`/`OverwriteCustomSkill` actions (one per
+  skill directory, never per-file writes), digest-pinned to the live target
+  tree at plan time. Apply is transactional under a canonical provider-home
+  lock (flock on `skills/.agent-sync.lock`): same-filesystem staging, full
+  staged-tree verification, journal + recoverable backup in the plan backup
+  area, rename swap with rollback on failure, post-activation verification.
+  Whole-directory replacement removes files deleted by the cloud version.
+- Legacy allowlist: `skills/**` removed from both providers' Optional tier
+  (`lib.rs`, AGENT_SYNC_FILE_SETS.md) so the two engines never co-manage one
+  skill directory.
+- Claude global plugin installs use scope-free argv; project-declared plugins
+  keep `--scope project` (both validated against a closed set).
+
+Deviations / not yet implemented:
+
+- **Install as renamed copy** (§6.4) is not offered; duplicates resolve to
+  Keep (default, unapproved) or Overwrite only.
+- **Version-history selection on pull** (§8.3) is not built; pull installs
+  the head generation. History remains derivable from immutable manifests.
+- The **machine-local plugin requirement graph** (§6.6) and cross-bundle
+  source-conflict blocking are not persisted yet; same-plugin coalescing is
+  per-bundle.
+- **Journal crash-recovery on restart** (§11) is passive: the journal and
+  backup are retained for manual recovery, but no startup scanner replays
+  them.
+- Post-install **plugin re-inventory/verification** (§6.5) still matches the
+  pre-existing dependency runner (exit-status receipts); no dry-run/version
+  pinning.
+- `CapabilityClaim`/overlap preflight exists only as capture-time target
+  collision detection (two snapshots claiming one directory fail the plan);
+  plugin-vs-custom effective-name overlap is surfaced via plugin
+  `provided_skills` metadata, not a blocking claim graph.
 
 ## 1. Outcome
 
@@ -20,7 +75,7 @@ plugin through its provider's native CLI and install a selected custom skill
 into the mapped target provider home.
 
 In this plan, **custom skill** means a global standalone skill under a mapped
-provider home's `skills/<name>` directory that is not proven to be owned by a
+provider home's `skills/<install-dir>` directory that is not proven to be owned by a
 plugin. **Plugin skill** means a skill exported and lifecycle-managed by a
 plugin.
 
@@ -34,7 +89,7 @@ not changed by this work.
    Pull presents the bundle's backed-up plugins and skills unchecked and
    installs only the actions approved for that target machine.
 2. **Global custom skills restore globally.** A selected custom skill is
-   installed under `skills/<name>` in the mapped `CODEX_HOME` or
+   installed under its preserved `skills/<install-dir>` in the mapped `CODEX_HOME` or
    `CLAUDE_CONFIG_DIR`. The UI must disclose that every project sharing that
    provider home can observe the change.
 3. **Plugins remain installer-owned.** Agent Sync stores plugin identity,
@@ -81,7 +136,7 @@ stronger provider adapters that should be reused:
 - native repair with target-profile environment binding.
 
 The existing standalone restore target is project-local, so that part must be
-changed to the mapped provider home's global `skills/<name>` directory and put
+changed to the mapped provider home's global `skills/<install-dir>` directory and put
 behind the provider-home mutation lock. Do not port the legacy whole-profile
 file selection or plugin-cache opt-in. Port only its Tauri-free inventory,
 provenance, planning, and verification logic.
@@ -97,7 +152,8 @@ kind        = standalone_skill
 scope       = provider_state
 provider    = codex | claude
 provenance  = standalone_snapshot(stable_key, source_digest)
-target      = <mapped provider home>/skills/<name>
+target      = <mapped provider home>/skills/<install-dir>
+identity    = (provider, declared effective name)
 ```
 
 Within a project bundle, derive a stable resource ID from provider plus the
@@ -269,13 +325,16 @@ For each standalone skill candidate:
 2. Parse the provider-supported metadata and declared skill name.
 3. Validate the declared name using the adapter for the installed provider
    version.
-4. Verify that the directory name is compatible with the declaration under
-   that provider's rules.
-5. Ask the adapter for the runtime-visible effective name.
+4. Preserve the independently validated directory basename as the physical
+   install-directory name.
+5. Ask the adapter for the runtime-visible effective name. Adapter v2 uses a
+   valid declared name and falls back to the directory basename only for a
+   legacy skill without a declaration.
 
-A missing, invalid, or contradictory declaration blocks automatic
-classification. Do not silently fall back to the directory basename unless the
-tested provider contract explicitly defines the basename as authoritative.
+An invalid declaration blocks automatic classification. A declared name may
+legitimately differ from the install directory. Two directories claiming the
+same canonical effective name are both blocked until the local ambiguity is
+resolved.
 
 For example, a validated standalone skill declared as `security-review` could
 produce:
@@ -393,7 +452,7 @@ of the currently active custom skill.
 
 ### 6.4 Duplicate custom skill and overwrite policy
 
-Pull scans the exact target `skills/<name>` with no-follow metadata and computes
+Pull scans the exact target `skills/<install-dir>` with no-follow metadata and computes
 its canonical tree digest before offering an action. Classify it as one of:
 
 | Target state | Pull action |
@@ -782,7 +841,7 @@ install one plugin must not erase successfully restored conversations or skills.
 - Reuse hardened native plugin planning/apply/verification.
 - Persist shared-provider plugin requirement claims.
 - Change standalone targets from project-local directories to the mapped global
-  provider home's `skills/<name>` directory.
+  provider home's preserved `skills/<install-dir>` directory.
 - Implement provider-home operation locking, complete-directory staging,
   local backup/journal, atomic replacement where the platform supports it, and
   rollback on Agent Sync-managed overwrite failure.

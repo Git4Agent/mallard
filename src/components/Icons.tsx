@@ -5,6 +5,7 @@ type IconName =
   | "alert-triangle"
   | "ban"
   | "chevron-down"
+  | "chevron-left"
   | "chevron-right"
   | "cloud"
   | "computer"
@@ -87,6 +88,7 @@ export default function Icon({ name, size = 14, ...props }: IconProps) {
         </>
       )}
       {name === "chevron-down" && <path d="m6 9 6 6 6-6" />}
+      {name === "chevron-left" && <path d="m15 18-6-6 6-6" />}
       {name === "chevron-right" && <path d="m9 6 6 6-6 6" />}
       {name === "link" && (
         <>

@@ -5,11 +5,18 @@ import type {
   BundleReadiness,
   BundleSnapshotSummary,
   DependencyPlan,
+  DependencyResult,
   ProjectBinding,
   RestorePlan,
+  RestoreResult,
 } from "../../src/types";
 import RestorePlanView from "../../src/components/project-sync/RestorePlanView";
 import {
+  buildPullReviewItems,
+  buildPullReviewSelection,
+} from "../../src/components/project-sync/pullReviewModel";
+import {
+  applyPullReview,
   beginPullReview,
   type PullReviewApi,
 } from "../../src/components/project-sync/pullReviewFlow";
@@ -70,7 +77,7 @@ const snapshot: BundleSnapshotSummary = {
   fetched_at: 1,
 };
 
-test("a valid Pull plan renders an enabled Apply button while supporting checks fail", async () => {
+test("a valid Pull plan renders an enabled non-modal Apply workspace while supporting checks fail", async () => {
   const dependencies = deferred<DependencyPlan>();
   const readiness = deferred<BundleReadiness>();
   const calls: string[] = [];
@@ -110,23 +117,31 @@ test("a valid Pull plan renders an enabled Apply button while supporting checks 
   const html = renderToStaticMarkup(
     <RestorePlanView
       projectName="gam2"
+      profileLabel="myconf2"
       plan={review.restorePlan}
       binding={binding}
       dependencyPlan={null}
       readiness={null}
       restoreResult={null}
       dependencyResult={null}
+      phase="idle"
+      supportLoading={false}
+      completedActionIds={new Set()}
+      completedResourceIds={new Set()}
+      failedResourceIds={new Set()}
       busy={false}
       error={null}
-      onApplyRestore={() => undefined}
-      onApplyDependencies={() => undefined}
+      onApply={() => undefined}
       onRefresh={() => undefined}
-      onClose={() => undefined}
+      onBack={() => undefined}
     />,
   );
-  assert.match(html, /Review only — no project files have changed/);
-  assert.match(html, /v3-restore-apply-footer/);
-  const applyText = html.lastIndexOf("Apply approved changes");
+  assert.match(html, /v3-pull-review-workspace/);
+  assert.match(html, /Global tools/);
+  assert.match(html, /installs into myconf2/);
+  assert.doesNotMatch(html, /aria-modal/);
+  assert.doesNotMatch(html, /v3-modal-backdrop/);
+  const applyText = html.lastIndexOf("Apply 1 selected change");
   assert.notEqual(applyText, -1);
   const applyTagStart = html.lastIndexOf("<button", applyText);
   const applyTagEnd = html.indexOf(">", applyTagStart);
@@ -145,6 +160,268 @@ test("a valid Pull plan renders an enabled Apply button while supporting checks 
     "Dependency checks: invalid generated id prefix",
     "Readiness checks: readiness unavailable",
   ]);
+});
+
+function dependencyPlan(actions: DependencyPlan["actions"]): DependencyPlan {
+  return {
+    schema_version: 1,
+    plan_id: "plan-dependencies",
+    storage_id: restorePlan.storage_id,
+    bundle_id: restorePlan.bundle_id,
+    replica_id: restorePlan.replica_id,
+    generation: restorePlan.generation,
+    commit_id: restorePlan.commit_id,
+    manifest_sha256: restorePlan.manifest_sha256,
+    binding_revision: restorePlan.binding_revision,
+    created_at: restorePlan.created_at,
+    expires_at: restorePlan.expires_at,
+    actions,
+    blockers: [],
+    warnings: [],
+  };
+}
+
+test("restore and native dependency actions merge into one global-tool row per resource", () => {
+  const mergedRestore: RestorePlan = {
+    ...restorePlan,
+    actions: [
+      {
+        action_id: "restore-custom-skill",
+        resource_id: "codex:standalone-skill:frontend-skill",
+        kind: { kind: "install_custom_skill", provider: "codex", skill_name: "frontend-skill" },
+        target_path: "/Users/test/.codex/skills/frontend-skill",
+        requires_explicit_approval: true,
+      },
+      {
+        action_id: "dependency:codex:plugin:computer-use",
+        resource_id: "codex:plugin:computer-use",
+        kind: { kind: "install_plugin", provider: "codex", plugin_id: "computer-use@openai-bundled" },
+        requires_explicit_approval: true,
+      },
+    ],
+  };
+  const dependencies = dependencyPlan([{
+    action_id: "dependency:codex:plugin:computer-use",
+    resource_id: "codex:plugin:computer-use",
+    kind: "install_codex_plugin",
+    display_name: "computer-use@openai-bundled",
+    provider: "codex",
+    argv: ["plugin", "add", "computer-use@openai-bundled"],
+    requires_explicit_approval: true,
+  }]);
+
+  const items = buildPullReviewItems(mergedRestore, dependencies);
+  assert.equal(items.length, 2);
+  assert.equal(items.filter((item) => item.resourceId === "codex:plugin:computer-use").length, 1);
+  assert.ok(items.every((item) => item.category === "global_tool"));
+  const plugin = items.find((item) => item.resourceId === "codex:plugin:computer-use");
+  assert.equal(plugin?.restoreActions.length, 1);
+  assert.equal(plugin?.dependencyActions.length, 1);
+  const selection = buildPullReviewSelection(
+    items,
+    new Set(items.map((item) => item.resourceId)),
+    new Set(),
+    new Set(),
+  );
+  assert.deepEqual(selection.restoreActionIds, ["restore-custom-skill"]);
+  assert.deepEqual(selection.dependencyActionIds, ["dependency:codex:plugin:computer-use"]);
+
+  const html = renderToStaticMarkup(
+    <RestorePlanView
+      projectName="gam2"
+      profileLabel="myconf2"
+      plan={mergedRestore}
+      binding={binding}
+      dependencyPlan={dependencies}
+      readiness={null}
+      restoreResult={null}
+      dependencyResult={null}
+      phase="idle"
+      supportLoading={false}
+      completedActionIds={new Set()}
+      completedResourceIds={new Set()}
+      failedResourceIds={new Set()}
+      busy={false}
+      error={null}
+      onApply={() => undefined}
+      onRefresh={() => undefined}
+      onBack={() => undefined}
+    />,
+  );
+  assert.doesNotMatch(html, /Plugins &amp; standalone skills/);
+  assert.doesNotMatch(html, /Install selected/);
+  assert.doesNotMatch(html, /deferred to the native dependency runner/);
+  assert.doesNotMatch(html, /Ready to restore|Preparing installer/);
+  assert.equal((html.match(/class="v3-pull-item(?: |")/g) ?? []).length, 2);
+});
+
+test("skipping a required global tool cannot produce a ready Pull outcome", () => {
+  const dependencies = dependencyPlan([{
+    action_id: "install-plugin",
+    resource_id: "codex:plugin:computer-use",
+    kind: "install_codex_plugin",
+    display_name: "computer-use@openai-bundled",
+    provider: "codex",
+    argv: ["plugin", "add", "computer-use@openai-bundled"],
+    requires_explicit_approval: true,
+  }]);
+  const applied: RestoreResult = {
+    success: true,
+    message: "Applied 1 restore action",
+    applied_action_ids: ["action-session"],
+    failed_actions: [],
+  };
+  const html = renderToStaticMarkup(
+    <RestorePlanView
+      projectName="gam2"
+      profileLabel="myconf2"
+      plan={restorePlan}
+      binding={binding}
+      dependencyPlan={dependencies}
+      readiness={{ bundle_id: binding.bundle_id, state: "ready", issues: [] }}
+      restoreResult={applied}
+      dependencyResult={null}
+      phase="complete"
+      supportLoading={false}
+      completedActionIds={new Set(["action-session"])}
+      completedResourceIds={new Set(["codex:session:thread-a"])}
+      failedResourceIds={new Set()}
+      busy={false}
+      error={null}
+      onApply={() => undefined}
+      onRefresh={() => undefined}
+      onBack={() => undefined}
+    />,
+  );
+  assert.match(html, /Project restored; 1 setup item skipped/);
+  assert.doesNotMatch(html, />Pull complete</);
+  assert.match(html, /Needs approval/);
+  assert.match(html, /Readiness is not confirmed/);
+});
+
+test("the composite Apply coordinator restores, installs, then verifies one aligned generation", async () => {
+  const dependencies = dependencyPlan([{
+    action_id: "install-plugin",
+    resource_id: "codex:plugin:computer-use",
+    kind: "install_codex_plugin",
+    display_name: "computer-use@openai-bundled",
+    provider: "codex",
+    argv: ["plugin", "add", "computer-use@openai-bundled"],
+    requires_explicit_approval: true,
+  }]);
+  const restoreResult: RestoreResult = {
+    success: true,
+    message: "Applied 1 restore action",
+    applied_action_ids: ["action-session"],
+    failed_actions: [],
+  };
+  const dependencyResult: DependencyResult = {
+    success: true,
+    message: "Applied 1 dependency action",
+    applied_action_ids: ["install-plugin"],
+    failed_actions: [],
+  };
+  const ready: BundleReadiness = { bundle_id: binding.bundle_id, state: "ready", issues: [] };
+  const calls: string[] = [];
+  const phases: string[] = [];
+  const result = await applyPullReview(
+    {
+      applyRestore: async () => {
+        calls.push("restore");
+        return restoreResult;
+      },
+      applyDependencies: async () => {
+        calls.push("install");
+        return dependencyResult;
+      },
+      getReadiness: async () => {
+        calls.push("verify");
+        return ready;
+      },
+    },
+    restorePlan,
+    dependencies,
+    binding,
+    {
+      resourceIds: ["codex:session:thread-a", "codex:plugin:computer-use"],
+      restoreActionIds: ["action-session"],
+      dependencyActionIds: ["install-plugin"],
+    },
+    (phase) => phases.push(phase),
+  );
+  assert.deepEqual(calls, ["restore", "install", "verify"]);
+  assert.deepEqual(phases, ["restoring", "installing", "verifying", "complete"]);
+  assert.equal(result.success, true);
+
+  const partialPhases: string[] = [];
+  const partial = await applyPullReview(
+    {
+      applyRestore: async () => restoreResult,
+      applyDependencies: async () => {
+        throw new Error("native runner unavailable");
+      },
+      getReadiness: async () => ({ ...ready, state: "needs_setup" }),
+    },
+    restorePlan,
+    dependencies,
+    binding,
+    {
+      resourceIds: ["codex:session:thread-a", "codex:plugin:computer-use"],
+      restoreActionIds: ["action-session"],
+      dependencyActionIds: ["install-plugin"],
+    },
+    (phase) => partialPhases.push(phase),
+  );
+  assert.equal(partial.restoreResult, restoreResult, "an applied restore is retained when native installation throws");
+  assert.match(partial.error ?? "", /native runner unavailable/);
+  assert.equal(partial.failedPhase, "installing");
+  assert.equal(partial.success, false);
+  assert.deepEqual(partialPhases, ["restoring", "installing", "verifying", "complete"]);
+
+  await assert.rejects(
+    applyPullReview(
+      {
+        applyRestore: async () => {
+          calls.push("unexpected-restore");
+          return restoreResult;
+        },
+        applyDependencies: async () => dependencyResult,
+        getReadiness: async () => ready,
+      },
+      restorePlan,
+      { ...dependencies, generation: dependencies.generation + 1 },
+      binding,
+      {
+        resourceIds: ["codex:plugin:computer-use"],
+        restoreActionIds: [],
+        dependencyActionIds: ["install-plugin"],
+      },
+      () => undefined,
+    ),
+    /different bundle generations/,
+  );
+  assert.doesNotMatch(calls.join(","), /unexpected-restore/);
+
+  await assert.rejects(
+    applyPullReview(
+      {
+        applyRestore: async () => restoreResult,
+        applyDependencies: async () => dependencyResult,
+        getReadiness: async () => ready,
+      },
+      restorePlan,
+      { ...dependencies, generation: dependencies.generation + 1 },
+      binding,
+      {
+        resourceIds: ["codex:session:thread-a"],
+        restoreActionIds: ["action-session"],
+        dependencyActionIds: [],
+      },
+      () => undefined,
+    ),
+    /different bundle generations/,
+    "a visible stale tool plan invalidates the whole composite review even when no tool is checked",
+  );
 });
 
 test("a primary restore-plan failure still rejects the Pull review", async () => {

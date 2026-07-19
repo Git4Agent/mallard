@@ -705,6 +705,8 @@ export type RestoreActionKind =
   | { kind: "merge_file"; logical_path: string }
   | { kind: "materialize_conversation"; provider: ProjectProvider; logical_path: string }
   | { kind: "install_standalone_skill"; provider: ProjectProvider; target_relative_path: string }
+  | { kind: "install_custom_skill"; provider: ProjectProvider; skill_name: string }
+  | { kind: "overwrite_custom_skill"; provider: ProjectProvider; skill_name: string }
   | { kind: "install_plugin"; provider: ProjectProvider; plugin_id: string }
   | { kind: "review_hook"; definition_sha256: string }
   | { kind: "review_mcp"; definition_sha256: string }
@@ -745,8 +747,17 @@ export interface RestoreResult {
 }
 
 export interface DependencyPlan {
+  schema_version: 1;
   plan_id: string;
+  storage_id: string;
   bundle_id: string;
+  replica_id: string;
+  generation: number;
+  commit_id: string;
+  manifest_sha256: string;
+  binding_revision: number;
+  created_at: number;
+  expires_at: number;
   actions: DependencyAction[];
   blockers?: string[];
   warnings?: string[];

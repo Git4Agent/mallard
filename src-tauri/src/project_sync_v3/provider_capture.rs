@@ -15,6 +15,7 @@ use std::time::UNIX_EPOCH;
 use walkdir::{DirEntry, WalkDir};
 
 use super::domain;
+use super::global_inventory;
 
 const MAX_DISCOVERED_FILES: usize = 20_000;
 const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
@@ -41,6 +42,7 @@ pub enum CaptureResourceKind {
     Command,
     Rule,
     Skill,
+    StandaloneSkill,
     Plugin,
     Hook,
     McpServer,
@@ -106,6 +108,10 @@ pub struct ResourceCandidate {
     pub logical_paths: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependency: Option<DependencyAction>,
+    /// Kind-specific descriptor facts (provenance, naming evidence, plugin
+    /// source data). Copied verbatim into the bundle descriptor metadata.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub metadata: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq, Eq)]
@@ -144,7 +150,14 @@ pub struct CapturedResources {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StandaloneSkillSource {
     pub provider: Provider,
-    pub name: String,
+    /// Runtime-visible capability name declared by the provider-supported
+    /// `SKILL.md` metadata. This is the portable identity and may differ from
+    /// the directory used to install the skill.
+    pub effective_name: String,
+    /// Physical directory name below the provider home's `skills/` root.
+    /// Preserve it on restore because skill content may refer to its own
+    /// installed path.
+    pub install_dir_name: String,
     /// Stable provenance identifier (for example a sanitized Git URL plus
     /// subdirectory). It must not include a content digest.
     pub stable_key: String,
@@ -160,6 +173,12 @@ pub struct CaptureRequest {
     /// cwd falls below one is excluded from this project's inventory.
     pub excluded_project_roots: Vec<PathBuf>,
     pub standalone_skills: Vec<StandaloneSkillSource>,
+    /// Inventoried global plugins from the mapped provider homes. Observations
+    /// of a plugin also declared in project config coalesce into one resource.
+    pub global_plugins: Vec<global_inventory::GlobalPluginSource>,
+    /// Skill candidates the ownership classifier refused; surfaced as blocked
+    /// resources so the UI can show the evidence, never captured.
+    pub blocked_global_skills: Vec<global_inventory::BlockedSkillCandidate>,
 }
 
 impl CaptureRequest {
@@ -171,6 +190,8 @@ impl CaptureRequest {
             claude_home: None,
             excluded_project_roots: Vec::new(),
             standalone_skills: Vec::new(),
+            global_plugins: Vec::new(),
+            blocked_global_skills: Vec::new(),
         }
     }
 }
@@ -367,9 +388,9 @@ pub fn domain_resources(
         let provider = candidate.provider.map(domain_provider);
         let kind = domain_kind(&candidate.kind, candidate.provider);
         let scope = match candidate.kind {
-            CaptureResourceKind::Conversation | CaptureResourceKind::Memory => {
-                domain::ResourceScope::ProviderState
-            }
+            CaptureResourceKind::Conversation
+            | CaptureResourceKind::Memory
+            | CaptureResourceKind::StandaloneSkill => domain::ResourceScope::ProviderState,
             CaptureResourceKind::Plugin => domain::ResourceScope::Dependency,
             _ => domain::ResourceScope::Project,
         };
@@ -377,6 +398,14 @@ pub fn domain_resources(
             CaptureResourceKind::Plugin => domain::Provenance::Plugin {
                 provider: provider.ok_or_else(|| "plugin lacks provider".to_string())?,
                 plugin_id: candidate.display_name.clone(),
+            },
+            CaptureResourceKind::StandaloneSkill => domain::Provenance::StandaloneSnapshot {
+                stable_key: candidate
+                    .metadata
+                    .get("stable_key")
+                    .cloned()
+                    .unwrap_or_else(|| candidate.display_name.clone()),
+                source_digest: resource.content_sha256.clone(),
             },
             CaptureResourceKind::ProjectFile
             | CaptureResourceKind::ProjectSettings
@@ -395,7 +424,7 @@ pub fn domain_resources(
             }
             _ => domain::Provenance::Unknown,
         };
-        let mut metadata = BTreeMap::new();
+        let mut metadata = candidate.metadata.clone();
         metadata.insert(
             "content_sha256".to_string(),
             resource.content_sha256.clone(),
@@ -483,6 +512,7 @@ fn domain_kind(kind: &CaptureResourceKind, provider: Option<Provider>) -> domain
         CaptureResourceKind::Command => domain::ResourceKind::Command,
         CaptureResourceKind::Rule => domain::ResourceKind::Rule,
         CaptureResourceKind::Skill => domain::ResourceKind::ProjectSkill,
+        CaptureResourceKind::StandaloneSkill => domain::ResourceKind::StandaloneSkill,
         CaptureResourceKind::Plugin => domain::ResourceKind::Plugin,
         CaptureResourceKind::Hook => domain::ResourceKind::Hook,
         CaptureResourceKind::McpServer => domain::ResourceKind::McpServer,
@@ -543,6 +573,12 @@ fn discover(request: &CaptureRequest) -> Result<Discovery, String> {
     }
     for skill in &request.standalone_skills {
         discover_standalone_skill(skill, &canonical_project, &mut discovery)?;
+    }
+    for plugin in &request.global_plugins {
+        discover_global_plugin(plugin, &mut discovery)?;
+    }
+    for blocked in &request.blocked_global_skills {
+        discover_blocked_global_skill(blocked, &mut discovery)?;
     }
     if discovery.resources.len() > MAX_DISCOVERED_FILES {
         return Err(format!(
@@ -684,6 +720,7 @@ fn add_single_project_file(
         discovery,
         DiscoveredResource {
             descriptor: ResourceCandidate {
+                metadata: BTreeMap::new(),
                 resource_id,
                 kind,
                 provider,
@@ -1126,6 +1163,7 @@ fn discover_grouped_directory(
             discovery,
             DiscoveredResource {
                 descriptor: ResourceCandidate {
+                    metadata: BTreeMap::new(),
                     resource_id,
                     kind: kind.clone(),
                     provider: Some(provider),
@@ -1248,6 +1286,7 @@ fn dependency_resource(
 ) -> DiscoveredResource {
     DiscoveredResource {
         descriptor: ResourceCandidate {
+            metadata: BTreeMap::new(),
             resource_id,
             kind,
             provider: Some(provider),
@@ -1312,6 +1351,7 @@ fn discover_codex(
                 discovery,
                 DiscoveredResource {
                     descriptor: ResourceCandidate {
+                        metadata: BTreeMap::new(),
                         resource_id: resource_id.clone(),
                         kind: CaptureResourceKind::Conversation,
                         provider: Some(Provider::Codex),
@@ -1349,6 +1389,7 @@ fn discover_codex(
                 discovery,
                 DiscoveredResource {
                     descriptor: ResourceCandidate {
+                        metadata: BTreeMap::new(),
                         resource_id: resource_id.clone(),
                         kind: CaptureResourceKind::Conversation,
                         provider: Some(Provider::Codex),
@@ -1426,6 +1467,7 @@ fn discover_claude(
             discovery,
             DiscoveredResource {
                 descriptor: ResourceCandidate {
+                    metadata: BTreeMap::new(),
                     resource_id: resource_id.clone(),
                     kind: CaptureResourceKind::Conversation,
                     provider: Some(Provider::Claude),
@@ -1488,6 +1530,7 @@ fn discover_claude(
                 discovery,
                 DiscoveredResource {
                     descriptor: ResourceCandidate {
+                        metadata: BTreeMap::new(),
                         resource_id: resource_id.clone(),
                         kind: kind.clone(),
                         provider: Some(Provider::Claude),
@@ -1555,6 +1598,7 @@ fn discover_claude(
             discovery,
             DiscoveredResource {
                 descriptor: ResourceCandidate {
+                    metadata: BTreeMap::new(),
                     resource_id: resource_id.clone(),
                     kind: CaptureResourceKind::Memory,
                     provider: Some(Provider::Claude),
@@ -1587,19 +1631,15 @@ fn discover_standalone_skill(
     project_root: &Path,
     discovery: &mut Discovery,
 ) -> Result<(), String> {
-    if skill.name.is_empty()
-        || skill.name.len() > 128
-        || skill.name == "."
-        || skill.name == ".."
-        || skill.name.contains(['/', '\\'])
-        || skill.name.chars().any(char::is_control)
-    {
-        return Err(format!("invalid standalone skill name '{}'", skill.name));
-    }
+    domain::validate_skill_name("standalone skill effective name", &skill.effective_name)?;
+    domain::validate_skill_name(
+        "standalone skill install directory",
+        &skill.install_dir_name,
+    )?;
     if skill.stable_key.is_empty() || skill.stable_key.len() > 1024 {
         return Err(format!(
             "invalid stable provenance for skill '{}'",
-            skill.name
+            skill.effective_name
         ));
     }
     let canonical_source = canonical_existing_dir(&skill.source_dir, "standalone skill")?;
@@ -1610,10 +1650,14 @@ fn discover_standalone_skill(
         ));
     }
     let files = collect_regular_tree_files(&canonical_source, canonical_source.clone())?;
-    let target_root = match skill.provider {
-        Provider::Codex => format!("project/.agents/skills/{}", skill.name),
-        Provider::Claude => format!("project/.claude/skills/{}", skill.name),
-    };
+    // Global custom skills restore into their original physical directory
+    // below the mapped provider home's `skills/` root. Runtime identity is
+    // independent and comes from `effective_name`.
+    let target_root = format!(
+        "state/{}/skills/{}",
+        provider_name(skill.provider),
+        skill.install_dir_name
+    );
     let logical_paths = files
         .iter()
         .map(|path| {
@@ -1621,10 +1665,13 @@ fn discover_standalone_skill(
                 .map(|rel| format!("{}/{}", target_root, rel))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    // Identity is provider + effective skill name: editing content preserves
+    // it, renaming the skill is an explicit remove/add. The stable key stays
+    // provenance metadata only.
     let resource_id = format!(
         "{}:standalone-skill:{}",
         provider_name(skill.provider),
-        resource_id_component(&skill.stable_key)
+        resource_id_component(&skill.effective_name)
     );
     let executable = files.iter().any(|path| is_executable_path(path));
     let dependency = executable.then(|| DependencyAction {
@@ -1632,21 +1679,37 @@ fn discover_standalone_skill(
         resource_id: resource_id.clone(),
         provider: skill.provider,
         kind: DependencyKind::StandaloneSkill,
-        scope: DependencyScope::Project,
-        display_name: skill.name.clone(),
+        scope: DependencyScope::ProviderHome,
+        display_name: skill.effective_name.clone(),
         program: None,
         argv: Vec::new(),
         requires_review: true,
         payload_logical_prefix: Some(target_root.clone()),
     });
+    let mut metadata = BTreeMap::new();
+    metadata.insert("stable_key".to_string(), skill.stable_key.clone());
+    metadata.insert("effective_name".to_string(), skill.effective_name.clone());
+    metadata.insert(
+        "install_dir_name".to_string(),
+        skill.install_dir_name.clone(),
+    );
+    metadata.insert(
+        "provider_adapter_version".to_string(),
+        global_inventory::PROVIDER_ADAPTER_VERSION.to_string(),
+    );
+    metadata.insert(
+        "ownership_evidence".to_string(),
+        "no plugin claim; regular global skills directory".to_string(),
+    );
     insert_resource(
         discovery,
         DiscoveredResource {
             descriptor: ResourceCandidate {
+                metadata,
                 resource_id,
-                kind: CaptureResourceKind::Skill,
+                kind: CaptureResourceKind::StandaloneSkill,
                 provider: Some(skill.provider),
-                display_name: skill.name.clone(),
+                display_name: skill.effective_name.clone(),
                 relative_cwd: None,
                 apply_policy: if executable {
                     CaptureApplyPolicy::Dependency
@@ -1668,6 +1731,132 @@ fn discover_standalone_skill(
                     derived_bytes: None,
                 })
                 .collect(),
+        },
+    )
+}
+
+/// Register one inventoried global plugin as portable install intent. If the
+/// project configuration already declared the same plugin, the two
+/// observations coalesce into the existing resource instead of creating a
+/// second install action.
+fn discover_global_plugin(
+    plugin: &global_inventory::GlobalPluginSource,
+    discovery: &mut Discovery,
+) -> Result<(), String> {
+    let resource_id = format!(
+        "{}:plugin:{}",
+        provider_name(plugin.provider),
+        resource_id_component(&plugin.plugin_id)
+    );
+    let mut metadata = BTreeMap::new();
+    metadata.insert("plugin_origin".to_string(), "global".to_string());
+    if let Some(marketplace) = &plugin.marketplace {
+        metadata.insert("plugin_marketplace".to_string(), marketplace.clone());
+    }
+    if let Some(source_type) = &plugin.source_type {
+        metadata.insert("plugin_source_type".to_string(), source_type.clone());
+    }
+    if let Some(source) = &plugin.source {
+        metadata.insert("plugin_source".to_string(), source.clone());
+    }
+    if let Some(version) = &plugin.observed_version {
+        // Observational only: install may resolve a different marketplace
+        // version unless the native CLI can pin exactly.
+        metadata.insert("plugin_observed_version".to_string(), version.clone());
+    }
+    metadata.insert("plugin_enabled".to_string(), plugin.enabled.to_string());
+    if !plugin.provided_skills.is_empty() {
+        metadata.insert(
+            "plugin_provided_skills_json".to_string(),
+            serde_json::to_string(&plugin.provided_skills).map_err(|e| e.to_string())?,
+        );
+    }
+    if let Some(existing) = discovery.resources.get_mut(&resource_id) {
+        // One plugin with two discovery origins, not two install actions.
+        existing
+            .descriptor
+            .metadata
+            .insert("plugin_origin".to_string(), "project+global".to_string());
+        for (key, value) in metadata {
+            existing.descriptor.metadata.entry(key).or_insert(value);
+        }
+        return Ok(());
+    }
+    let (kind, program, argv) = match plugin.provider {
+        Provider::Codex => (
+            DependencyKind::CodexPlugin,
+            "codex",
+            vec![
+                "plugin".to_string(),
+                "add".to_string(),
+                plugin.plugin_id.clone(),
+            ],
+        ),
+        Provider::Claude => (
+            DependencyKind::ClaudePlugin,
+            "claude",
+            vec![
+                "plugin".to_string(),
+                "install".to_string(),
+                plugin.plugin_id.clone(),
+            ],
+        ),
+    };
+    let action = DependencyAction {
+        action_id: format!("dependency:{}", resource_id),
+        resource_id: resource_id.clone(),
+        provider: plugin.provider,
+        kind,
+        scope: DependencyScope::ProviderHome,
+        display_name: plugin.plugin_id.clone(),
+        program: Some(program.to_string()),
+        argv,
+        requires_review: true,
+        payload_logical_prefix: None,
+    };
+    let mut resource = dependency_resource(
+        resource_id,
+        plugin.plugin_id.clone(),
+        plugin.provider,
+        CaptureResourceKind::Plugin,
+        action,
+    );
+    resource.descriptor.metadata = metadata;
+    insert_resource(discovery, resource)
+}
+
+/// Surface an unclassifiable global skill candidate as a blocked resource so
+/// review can show the ownership evidence. It carries no files and can never
+/// be captured.
+fn discover_blocked_global_skill(
+    blocked: &global_inventory::BlockedSkillCandidate,
+    discovery: &mut Discovery,
+) -> Result<(), String> {
+    let resource_id = format!(
+        "{}:standalone-skill:{}",
+        provider_name(blocked.provider),
+        resource_id_component(&blocked.name)
+    );
+    if discovery.resources.contains_key(&resource_id) {
+        return Ok(());
+    }
+    insert_resource(
+        discovery,
+        DiscoveredResource {
+            descriptor: ResourceCandidate {
+                metadata: BTreeMap::new(),
+                resource_id,
+                kind: CaptureResourceKind::StandaloneSkill,
+                provider: Some(blocked.provider),
+                display_name: blocked.name.clone(),
+                relative_cwd: None,
+                apply_policy: CaptureApplyPolicy::Review,
+                selected_by_default: false,
+                blocked_reason: Some(blocked.reason.clone()),
+                logical_paths: Vec::new(),
+                dependency: None,
+            },
+            files: Vec::new(),
         },
     )
 }
@@ -2433,6 +2622,7 @@ fn resource_kind_name(kind: &CaptureResourceKind) -> &'static str {
         CaptureResourceKind::Command => "command",
         CaptureResourceKind::Rule => "rule",
         CaptureResourceKind::Skill => "skill",
+        CaptureResourceKind::StandaloneSkill => "custom-skill",
         CaptureResourceKind::Plugin => "plugin",
         CaptureResourceKind::Hook => "hook",
         CaptureResourceKind::McpServer => "mcp",
@@ -2607,6 +2797,8 @@ mod tests {
             claude_home: Some(claude),
             excluded_project_roots: Vec::new(),
             standalone_skills: Vec::new(),
+            global_plugins: Vec::new(),
+            blocked_global_skills: Vec::new(),
         };
         let inventory = discover_project(&request).unwrap();
         let codex = inventory
@@ -2657,6 +2849,8 @@ mod tests {
             claude_home: None,
             excluded_project_roots: Vec::new(),
             standalone_skills: Vec::new(),
+            global_plugins: Vec::new(),
+            blocked_global_skills: Vec::new(),
         };
         let inventory = discover_project(&request).unwrap();
         let conversation_ids = inventory

@@ -10,6 +10,7 @@ const outputDirectory = await mkdtemp(join(tmpdir(), "agent-sync-frontend-tests-
 const entries = [
   "tests/frontend/pull-review.integration.test.tsx",
   "tests/frontend/project-chat-history.integration.test.tsx",
+  "tests/frontend/resource-inventory.integration.test.tsx",
 ];
 
 try {

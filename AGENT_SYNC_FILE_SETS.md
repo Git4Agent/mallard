@@ -100,8 +100,12 @@ schema-2 engine remains reference code only.
    is partially captured; Codex still relies mainly on config rather than the
    authoritative `codex plugin list --json`. Marketplace source/ref provenance
    and post-install provider verification are incomplete.
-3. Expose selectable global standalone skills. Capture types support them, but
-   command capture requests currently pass an empty `standalone_skills` list.
+3. ~~Expose selectable global standalone skills.~~ Done: schema-3 project sync
+   inventories global `skills/<name>` directories and installed plugins from
+   the mapped provider homes (`project_sync_v3/global_inventory.rs`,
+   PLAN_V3_GLOBAL_PLUGINS_AND_SKILLS.md). Global `skills/**` also moved out of
+   the legacy profile allowlist: custom skills sync as reviewed schema-3
+   directory snapshots, never as legacy file-by-file union merges.
 4. Finish reconciliation and restore safety: per-replica baselines, resource
    three-way rebase/CAS retry, class-specific conflict/quarantine/tombstone
    behavior, shared-provider contribution ownership/locking, and continuation
@@ -170,7 +174,7 @@ app-generated sidebar lock instead.
 |---|---|---|
 | **Required** — conversations | `sessions/**`, `archived_sessions/**`, `session_index.jsonl`, `history.jsonl` | `projects/**` |
 | **Optional** — conversation-adjacent | — | `history.jsonl`, `file-history/**`, `todos/**` |
-| **Optional** — behavior/config | `memories/**`, `skills/**`, `rules/**`, `prompts/**`, `agents/**`, `AGENTS.md`, `hooks.json`, `config.toml`, `agent-sync/codex-plugins.lock.json`, `agent-sync/codex-sidebar.lock.json` | `CLAUDE.md`, `agents/**`, `commands/**`, `skills/**`, `keybindings.json`, `settings.json`, `plugins/config.json`, `agent-sync/claude-plugins.lock.json` |
+| **Optional** — behavior/config | `memories/**`, `rules/**`, `prompts/**`, `agents/**`, `AGENTS.md`, `hooks.json`, `config.toml`, `agent-sync/codex-plugins.lock.json`, `agent-sync/codex-sidebar.lock.json` | `CLAUDE.md`, `agents/**`, `commands/**`, `keybindings.json`, `settings.json`, `plugins/config.json`, `agent-sync/claude-plugins.lock.json` |
 | **Never** | `auth.json*`, `installation_id`, `.codex-global-state.json*`, `.tmp/**`, `plugins/cache/**` | `.credentials.json`, `settings.local.json`, `sessions/**`, `plugins/repos/**`, `plugins/marketplaces/**` |
 
 Merge policy in one line: almost everything converges by file-set union;
@@ -208,7 +212,8 @@ disaster-recovery path only — it is NOT the portable restore path
 
 ```text
 ~/.codex/memories/**              # see memory caveat below
-~/.codex/skills/**
+                                  # (skills/** is schema-3-owned; see
+                                  # PLAN_V3_GLOBAL_PLUGINS_AND_SKILLS.md)
 ~/.codex/rules/**
 ~/.codex/prompts/**               # custom prompts, if present
 ~/.codex/agents/**                # personal custom-agent TOMLs (name,
@@ -310,7 +315,8 @@ Three things to know:
 ~/.claude/CLAUDE.md               # user-level instructions
 ~/.claude/agents/**               # custom subagents
 ~/.claude/commands/**             # slash commands
-~/.claude/skills/**
+                                  # (skills/** is schema-3-owned; see
+                                  # PLAN_V3_GLOBAL_PLUGINS_AND_SKILLS.md)
 ~/.claude/keybindings.json
 ~/.claude/settings.json           # review/redact; env, apiKeyHelper, hooks, paths
 ~/.claude/plugins/config.json     # plugin install state; see below
@@ -483,7 +489,7 @@ can resurrect files the local machine just cleaned, which then show as
 local retention window, and offer retention-age deletions for bulk
 confirmation.
 
-**Behavior directories.** New files under `skills/**`, `rules/**`,
+**Behavior directories.** New files under `rules/**`,
 `prompts/**`, `agents/**`, and `commands/**` (either tree) also union: a
 skill added on one machine and a command added on another merge cleanly. But
 the same relative path modified differently on both sides is a real conflict

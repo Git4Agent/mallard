@@ -2364,7 +2364,8 @@ async fn run_fresh_mount_pull_edit_push(root: &'static str, seeds: &[(&str, &str
     // edits hide from the stat fast path) and add a new one.
     let (edited_rel, _) = seeds[0];
     b.seed(edited_rel, "edited to a different length\n");
-    let added_rel = format!("{}/skills/added/SKILL.md", root);
+    // `agents/` is an allowlisted behavior directory for both providers.
+    let added_rel = format!("{}/agents/added.md", root);
     b.seed(&added_rel, "new\n");
 
     b.push(&cloud, &[root]).await.expect("B push");
@@ -2397,7 +2398,7 @@ async fn fresh_mount_pull_edit_push_keeps_full_profile_codex() {
             (".codex/sessions/2026/07/05/rollout-a.jsonl", "{}\n"),
             (".codex/history.jsonl", "{\"ts\":1}\n"),
             (".codex/config.toml", "model = \"gpt\"\n"),
-            (".codex/skills/foo/SKILL.md", "skill\n"),
+            (".codex/prompts/review.md", "prompt\n"),
             (
                 ".codex/agent-sync/codex-plugins.lock.json",
                 "{\"schema\":1,\"marketplaces\":[{\"name\":\"team-tools\",\"repository\":\"owner/repo\"}],\"plugins\":[{\"id\":\"a@team-tools\"}],\"manual\":[]}",
@@ -2869,7 +2870,7 @@ async fn codex_project_path_mapping_flow_local() {
 async fn manifest_driven_push_never_reads_a_symlinked_local_tree() {
     use std::os::unix::fs::symlink;
 
-    const REL: &str = ".codex/skills/team/private.md";
+    const REL: &str = ".codex/rules/team/private.md";
     let _env = harness::lock_env().await;
     let cloud = TestCloud::start_local().await;
     let a = Machine::new("symlinkManifestA");
@@ -2878,11 +2879,11 @@ async fn manifest_driven_push_never_reads_a_symlinked_local_tree() {
 
     let b = Machine::new("symlinkManifestB");
     b.pull(&cloud).await.expect("establish B baseline");
-    std::fs::remove_dir_all(b.path(".codex/skills")).unwrap();
+    std::fs::remove_dir_all(b.path(".codex/rules")).unwrap();
     let outside = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(outside.path().join("team")).unwrap();
     std::fs::write(outside.path().join("team/private.md"), b"outside secret\n").unwrap();
-    symlink(outside.path(), b.path(".codex/skills")).unwrap();
+    symlink(outside.path(), b.path(".codex/rules")).unwrap();
 
     let published_sha = cloud.manifest_file_sha(".codex", REL).unwrap();
     let error = b

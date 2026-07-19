@@ -130,6 +130,15 @@ export default function ProjectSidebar({
               <div className="sidebar-profile-actions">
                 <button
                   type="button"
+                  onClick={() => onSelectDraft(draft.draft_id)}
+                  disabled={busy}
+                  title={`Continue setup for ${draft.display_name}`}
+                  aria-label={`Continue setup for ${draft.display_name}`}
+                >
+                  <Icon name="settings" size={13} />
+                </button>
+                <button
+                  type="button"
                   className="sidebar-profile-remove"
                   onClick={() => onDiscardDraft(draft.draft_id)}
                   disabled={busy}
@@ -154,7 +163,7 @@ export default function ProjectSidebar({
             return (
               <div
                 key={project.local_project_id}
-                className={`sidebar-profile-item${activeProjectId === project.local_project_id ? " active" : ""}${profileRequired ? " needs-profile" : ""}`}
+                className={`sidebar-profile-item${!activeDraftId && activeProjectId === project.local_project_id ? " active" : ""}${profileRequired ? " needs-profile" : ""}`}
               >
                 <button
                   type="button"

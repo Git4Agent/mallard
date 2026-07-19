@@ -8,6 +8,7 @@ pub mod bundle_engine;
 pub mod chat_history;
 pub mod commands;
 pub mod domain;
+pub mod global_inventory;
 pub mod persistence;
 pub mod provider_capture;
 pub mod s3_store;

@@ -23,6 +23,7 @@ use super::domain::{
     StorageKind, SyncConfigV3, DEPENDENCY_PLAN_SCHEMA_V1, SETUP_DRAFT_SCHEMA_V1,
     SETUP_TRANSACTION_SCHEMA_V1,
 };
+use super::global_inventory;
 use super::persistence::V3Repository;
 use super::provider_capture::{
     self, CaptureApplyPolicy, CaptureRequest, CaptureResourceKind, Provider as CaptureProvider,
@@ -1495,13 +1496,12 @@ fn discover_project_at(
             ));
         }
     }
-    let request = CaptureRequest {
-        project_root: project_root.clone(),
-        codex_home: profile_paths.get(&Provider::Codex).map(PathBuf::from),
-        claude_home: profile_paths.get(&Provider::Claude).map(PathBuf::from),
-        excluded_project_roots: Vec::new(),
-        standalone_skills: Vec::new(),
-    };
+    let request = capture_request_with_global_inventory(
+        project_root.clone(),
+        profile_paths.get(&Provider::Codex).map(PathBuf::from),
+        profile_paths.get(&Provider::Claude).map(PathBuf::from),
+        Vec::new(),
+    );
     let discovered = provider_capture::discover_project(&request)?;
     let recipe = default_recipe(&discovered.resources)?;
     let inventory = inventory_from_candidates(
@@ -1611,9 +1611,9 @@ fn inventory_from_candidates(
         let provider = candidate.provider.map(capture_provider);
         let kind = capture_resource_kind(&candidate.kind, candidate.provider);
         let scope = match candidate.kind {
-            CaptureResourceKind::Conversation | CaptureResourceKind::Memory => {
-                ResourceScope::ProviderState
-            }
+            CaptureResourceKind::Conversation
+            | CaptureResourceKind::Memory
+            | CaptureResourceKind::StandaloneSkill => ResourceScope::ProviderState,
             CaptureResourceKind::Plugin => ResourceScope::Dependency,
             _ => ResourceScope::Project,
         };
@@ -1632,6 +1632,21 @@ fn inventory_from_candidates(
                 })
                 .unwrap_or(Provenance::Unknown),
         };
+        let description = match candidate.kind {
+            CaptureResourceKind::StandaloneSkill => Some(
+                "Global custom skill from the mapped provider home. Restoring installs it \
+                 for every project sharing that provider profile."
+                    .to_string(),
+            ),
+            CaptureResourceKind::Plugin if candidate.metadata.contains_key("plugin_origin") => {
+                Some(
+                    "Installed global plugin. Only portable install intent syncs; pull \
+                     reinstalls through the provider's own CLI."
+                        .to_string(),
+                )
+            }
+            _ => None,
+        };
         let apply_policy = recipe
             .entries
             .get(&resource_id)
@@ -1647,12 +1662,12 @@ fn inventory_from_candidates(
             apply_policy,
             relative_cwd: candidate.relative_cwd.clone(),
             codec_version: 1,
-            metadata: BTreeMap::new(),
+            metadata: candidate.metadata.clone(),
         };
         descriptor.validate()?;
         resources.push(InventoryResource {
             category: resource_category(kind).to_string(),
-            description: None,
+            description,
             logical_paths: candidate.logical_paths.clone(),
             default_selected: candidate.selected_by_default,
             blocked_reason: candidate.blocked_reason.clone(),
@@ -1782,6 +1797,7 @@ fn capture_resource_kind(
         CaptureResourceKind::Command => ResourceKind::Command,
         CaptureResourceKind::Rule => ResourceKind::Rule,
         CaptureResourceKind::Skill => ResourceKind::ProjectSkill,
+        CaptureResourceKind::StandaloneSkill => ResourceKind::StandaloneSkill,
         CaptureResourceKind::Plugin => ResourceKind::Plugin,
         CaptureResourceKind::Hook => ResourceKind::Hook,
         CaptureResourceKind::McpServer => ResourceKind::McpServer,
@@ -2295,6 +2311,11 @@ fn apply_bundle_restore_with_repository(
             RestoreActionType::WriteFile
                 | RestoreActionType::MergeFile
                 | RestoreActionType::MaterializeConversation
+                | RestoreActionType::InstallCustomSkill
+                | RestoreActionType::OverwriteCustomSkill
+                | RestoreActionType::ReviewHook
+                | RestoreActionType::ReviewMcp
+                | RestoreActionType::ApplySetting
         ) || receipt.status == ActionStatus::Applied
     });
     let status = if files_complete {
@@ -2878,27 +2899,37 @@ async fn run_plugin_install(
     if !portable_plugin_id(&action.display_name) {
         return Err("plugin identifier is not safe for native installation".to_string());
     }
-    let expected_arguments = match action.kind {
-        DependencyActionKind::InstallCodexPlugin => vec![
+    // Global plugins install without a scope flag; project-declared Claude
+    // plugins keep their project scope. Anything else is rejected before a
+    // process is launched.
+    let supported_argument_sets: Vec<Vec<String>> = match action.kind {
+        DependencyActionKind::InstallCodexPlugin => vec![vec![
             "plugin".to_string(),
             "add".to_string(),
             action.display_name.clone(),
-        ],
+        ]],
         DependencyActionKind::InstallClaudePlugin => vec![
-            "plugin".to_string(),
-            "install".to_string(),
-            action.display_name.clone(),
-            "--scope".to_string(),
-            "project".to_string(),
+            vec![
+                "plugin".to_string(),
+                "install".to_string(),
+                action.display_name.clone(),
+                "--scope".to_string(),
+                "project".to_string(),
+            ],
+            vec![
+                "plugin".to_string(),
+                "install".to_string(),
+                action.display_name.clone(),
+            ],
         ],
         _ => return Err("dependency is not a plugin installation".to_string()),
     };
-    if action.argv != expected_arguments {
+    if !supported_argument_sets.contains(&action.argv) {
         return Err("plugin install arguments differ from the supported intent".to_string());
     }
     let mut command = Command::new(program);
     command
-        .args(&expected_arguments)
+        .args(&action.argv)
         .current_dir(&binding.project_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -2992,13 +3023,46 @@ fn capture_request_for_binding(
         .map(|other| PathBuf::from(other.canonical_project_root))
         .filter(|root| root.starts_with(&resolved_project) && root != &resolved_project)
         .collect();
-    Ok(CaptureRequest {
-        project_root: resolved_project,
-        codex_home: binding.codex_home.as_ref().map(PathBuf::from),
-        claude_home: binding.claude_home.as_ref().map(PathBuf::from),
+    Ok(capture_request_with_global_inventory(
+        resolved_project,
+        binding.codex_home.as_ref().map(PathBuf::from),
+        binding.claude_home.as_ref().map(PathBuf::from),
         excluded_project_roots,
-        standalone_skills: Vec::new(),
-    })
+    ))
+}
+
+/// Build a capture request whose global plugin and custom-skill candidates
+/// come from an ownership-ordered inventory of the mapped provider homes.
+/// Discovery keeps every global resource unselected by default; the recipe
+/// remains the only selection authority.
+fn capture_request_with_global_inventory(
+    project_root: PathBuf,
+    codex_home: Option<PathBuf>,
+    claude_home: Option<PathBuf>,
+    excluded_project_roots: Vec<PathBuf>,
+) -> CaptureRequest {
+    let mut standalone_skills = Vec::new();
+    let mut global_plugins = Vec::new();
+    let mut blocked_global_skills = Vec::new();
+    for (provider, home) in [
+        (CaptureProvider::Codex, codex_home.as_deref()),
+        (CaptureProvider::Claude, claude_home.as_deref()),
+    ] {
+        let Some(home) = home else { continue };
+        let inventory = global_inventory::inventory_provider_home(provider, home);
+        standalone_skills.extend(inventory.standalone_skills);
+        global_plugins.extend(inventory.plugins);
+        blocked_global_skills.extend(inventory.blocked_skills);
+    }
+    CaptureRequest {
+        project_root,
+        codex_home,
+        claude_home,
+        excluded_project_roots,
+        standalone_skills,
+        global_plugins,
+        blocked_global_skills,
+    }
 }
 
 fn repository_fingerprint(project_root: &Path) -> Option<String> {
@@ -3093,9 +3157,7 @@ fn engine_for_storage_config(storage: &StorageConfigV3) -> Result<StorageEngine,
         StorageKind::Local => {
             ConfiguredStore::Local(LocalBundleObjectStore::open(&storage.local_dir)?)
         }
-        StorageKind::S3 => {
-            ConfiguredStore::S3(S3BundleObjectStore::from_current_runtime(storage)?)
-        }
+        StorageKind::S3 => ConfiguredStore::S3(S3BundleObjectStore::from_current_runtime(storage)?),
     };
     Ok(BundleEngine::new(store, storage.id.clone()))
 }
@@ -3260,12 +3322,45 @@ fn get_project_with_repository(
     }))
 }
 
+/// Machine-local default nickname for a new project: repo name + hostname,
+/// counter-suffixed until it matches no existing project's visible label, so
+/// two checkouts of the same repo stay distinguishable out of the box.
+fn default_local_alias(
+    display_name: &str,
+    existing: &[LocalProjectRegistration],
+) -> Option<String> {
+    let base = format!(
+        "{} ({})",
+        display_name.trim(),
+        crate::default_machine_name()
+    );
+    let taken: BTreeSet<&str> = existing
+        .iter()
+        .map(|project| {
+            project
+                .local_alias
+                .as_deref()
+                .unwrap_or(&project.display_name)
+                .trim()
+        })
+        .collect();
+    let mut candidate = base.clone();
+    let mut counter = 2u64;
+    while taken.contains(candidate.as_str()) {
+        candidate = format!("{} {}", base, counter);
+        counter += 1;
+    }
+    // Fall back to the bare display name rather than letting a pathological
+    // hostname fail display-text validation and block registration.
+    Some(candidate).filter(|value| value.len() <= 1_024 && !value.chars().any(char::is_control))
+}
+
 fn register_local_project_with_repository(
     repository: &V3Repository,
     request: RegisterLocalProjectRequest,
 ) -> Result<LocalProjectRegistration, String> {
     let now = now_secs();
-    let project = LocalProjectRegistration {
+    let mut project = LocalProjectRegistration {
         local_project_id: LocalProjectId::parse(generated_named_id("project")?)?,
         bundle_id: match request.bundle_id {
             Some(bundle_id) => bundle_id,
@@ -3280,7 +3375,6 @@ fn register_local_project_with_repository(
         created_at: now,
         updated_at: now,
     };
-    project.validate()?;
     repository.mutate_config(|config| {
         if config
             .projects
@@ -3289,6 +3383,8 @@ fn register_local_project_with_repository(
         {
             return Err("generated local project id collision; try again".to_string());
         }
+        project.local_alias = default_local_alias(&project.display_name, &config.projects);
+        project.validate()?;
         config.projects.push(project.clone());
         Ok(project)
     })
@@ -3980,9 +4076,10 @@ fn draft_references_are_present(
         DraftProfileSelection::Pending { .. } => true,
     });
     let storage_present = match &draft.storage {
-        Some(DraftStorageSelection::Existing { storage_id }) => {
-            config.storages.iter().any(|storage| &storage.id == storage_id)
-        }
+        Some(DraftStorageSelection::Existing { storage_id }) => config
+            .storages
+            .iter()
+            .any(|storage| &storage.id == storage_id),
         _ => true,
     };
     profiles_present && storage_present
@@ -3995,7 +4092,10 @@ fn create_setup_draft_with_repository(
     validate_absolute_clean_path("project root", project_root)?;
     let canonical = fs_canonicalize(Path::new(project_root))?;
     if !canonical.is_dir() {
-        return Err(format!("project root '{}' is not a directory", project_root));
+        return Err(format!(
+            "project root '{}' is not a directory",
+            project_root
+        ));
     }
     let repository_root = prospective_canonical(repository.root())?;
     if paths_overlap(&canonical, &repository_root) {
@@ -4270,9 +4370,7 @@ fn resolve_draft_storage(
                     pending: false,
                 }));
             }
-            if storage.kind == StorageKind::Local
-                && !Path::new(&storage.local_dir).is_dir()
-            {
+            if storage.kind == StorageKind::Local && !Path::new(&storage.local_dir).is_dir() {
                 return Err(format!(
                     "local storage folder '{}' does not exist",
                     storage.local_dir
@@ -4331,7 +4429,9 @@ fn inspect_setup_draft_with_repository(
         Ok(_) => SetupSectionStatus {
             section: "project".to_string(),
             state: "blocked".to_string(),
-            message: Some("The folder now resolves to a different location; choose it again.".to_string()),
+            message: Some(
+                "The folder now resolves to a different location; choose it again.".to_string(),
+            ),
         },
         Err(error) => SetupSectionStatus {
             section: "project".to_string(),
@@ -4363,7 +4463,11 @@ fn inspect_setup_draft_with_repository(
                     let signature = discovery_signature(&discovery.inventory);
                     selection_stale = !draft.discovery_signature.is_empty()
                         && draft.discovery_signature != signature;
-                    let state = if selection_stale { "attention" } else { "ready" };
+                    let state = if selection_stale {
+                        "attention"
+                    } else {
+                        "ready"
+                    };
                     sections.push(SetupSectionStatus {
                         section: "resources".to_string(),
                         state: state.to_string(),
@@ -4396,7 +4500,9 @@ fn inspect_setup_draft_with_repository(
             sections.push(SetupSectionStatus {
                 section: "resources".to_string(),
                 state: "blocked".to_string(),
-                message: Some("Resources are discovered once agent profiles are chosen.".to_string()),
+                message: Some(
+                    "Resources are discovered once agent profiles are chosen.".to_string(),
+                ),
             });
         }
     }
@@ -4496,7 +4602,9 @@ fn build_setup_transaction(
     let mut warnings = Vec::new();
     let canonical = fs_canonicalize(Path::new(&draft.project_root))?;
     if canonical.to_string_lossy() != draft.canonical_project_root {
-        return Err("the project folder moved since this draft was saved; choose it again".to_string());
+        return Err(
+            "the project folder moved since this draft was saved; choose it again".to_string(),
+        );
     }
     let resolved_profiles = resolve_draft_profiles(repository, draft)?;
     let resolved_storage = resolve_draft_storage(repository, draft)?;
@@ -4698,12 +4806,23 @@ fn apply_setup_transaction(
     // 2. Storage, project, and links (one atomic config mutation).
     repository.mutate_config(|config| {
         if let Some(storage) = &transaction.storage {
-            if !config.storages.iter().any(|existing| existing.id == storage.id) {
+            if !config
+                .storages
+                .iter()
+                .any(|existing| existing.id == storage.id)
+            {
                 config.storages.push(storage.clone());
             }
         }
-        if config.project(&transaction.project.local_project_id).is_none() {
-            config.projects.push(transaction.project.clone());
+        if config
+            .project(&transaction.project.local_project_id)
+            .is_none()
+        {
+            let mut project = transaction.project.clone();
+            if project.local_alias.is_none() {
+                project.local_alias = default_local_alias(&project.display_name, &config.projects);
+            }
+            config.projects.push(project);
         }
         for link in &transaction.links {
             if !config.links.iter().any(|existing| {
@@ -4738,7 +4857,10 @@ fn apply_setup_transaction(
     // Confirm both documents contain the expected records before the caller
     // removes the transaction.
     let config = repository.load_config()?;
-    if config.project(&transaction.project.local_project_id).is_none() {
+    if config
+        .project(&transaction.project.local_project_id)
+        .is_none()
+    {
         return Err("project registration did not persist".to_string());
     }
     if repository
@@ -4757,11 +4879,18 @@ fn setup_transaction_partially_applied(
     transaction: &SetupTransaction,
 ) -> Result<bool, String> {
     let config = repository.load_config()?;
-    if config.project(&transaction.project.local_project_id).is_some() {
+    if config
+        .project(&transaction.project.local_project_id)
+        .is_some()
+    {
         return Ok(true);
     }
     if let Some(storage) = &transaction.storage {
-        if config.storages.iter().any(|existing| existing.id == storage.id) {
+        if config
+            .storages
+            .iter()
+            .any(|existing| existing.id == storage.id)
+        {
             return Ok(true);
         }
     }
@@ -4925,6 +5054,7 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project_sync_v3::domain::{RestoreActionKind, StorageConfigV3, StorageKind};
 
     #[test]
     fn failed_pull_preserves_the_previous_success_timestamp() {
@@ -4932,7 +5062,6 @@ mod tests {
         assert_eq!(successful_pull_timestamp(None, 200, false), None);
         assert_eq!(successful_pull_timestamp(Some(100), 200, true), Some(200));
     }
-    use crate::project_sync_v3::domain::{StorageConfigV3, StorageKind};
 
     fn repository(temp: &tempfile::TempDir) -> V3Repository {
         V3Repository::from_home_dir(temp.path()).unwrap()
@@ -5192,6 +5321,30 @@ mod tests {
     }
 
     #[test]
+    fn default_alias_combines_repo_name_and_hostname_and_deduplicates() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp);
+        let first = register(&repo);
+        let base = first
+            .local_alias
+            .clone()
+            .expect("new project gets a default alias");
+        assert!(base.starts_with("Project A ("), "unexpected alias '{base}'");
+        assert!(base.ends_with(')'));
+        // A second checkout of the same repo on this machine gets a counter.
+        let second = register(&repo);
+        assert_eq!(
+            second.local_alias.as_deref(),
+            Some(format!("{base} 2").as_str())
+        );
+        let third = register(&repo);
+        assert_eq!(
+            third.local_alias.as_deref(),
+            Some(format!("{base} 3").as_str())
+        );
+    }
+
+    #[test]
     fn local_alias_renames_stay_off_the_shared_display_name() {
         let temp = tempfile::tempdir().unwrap();
         let repo = repository(&temp);
@@ -5226,10 +5379,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cleared.local_alias, None);
-        assert_eq!(
-            repo.load_config().unwrap().projects[0].local_alias,
-            None
-        );
+        assert_eq!(repo.load_config().unwrap().projects[0].local_alias, None);
     }
 
     #[test]
@@ -5750,6 +5900,199 @@ mod tests {
     }
 
     #[test]
+    fn global_skill_with_distinct_declared_name_round_trips_across_push_and_pull() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp);
+        let storage_id = StorageId::parse("skill-roundtrip-store").unwrap();
+        let bundle_id = BundleId::parse("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").unwrap();
+        let mut config = repo.load_config().unwrap();
+        config.storages.push(StorageConfigV3 {
+            id: storage_id.clone(),
+            name: "Skill round-trip store".to_string(),
+            kind: StorageKind::Local,
+            bucket: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            account_id: String::new(),
+            s3_endpoint: String::new(),
+            region: String::new(),
+            local_dir: temp.path().join("store").to_string_lossy().into_owned(),
+            included_default_exclusions: Vec::new(),
+            supports_conditional_writes: None,
+        });
+        repo.save_config(config).unwrap();
+
+        // Machine A: the runtime-visible name deliberately differs from its
+        // physical directory, and the payload refers to that physical path.
+        let source = register_local_project_with_repository(
+            &repo,
+            RegisterLocalProjectRequest {
+                display_name: "Source project".to_string(),
+                repository_fingerprint: Some("e".repeat(64)),
+                bundle_id: Some(bundle_id.clone()),
+            },
+        )
+        .unwrap();
+        let source_root = temp.path().join("source-project");
+        let source_codex = temp.path().join("source-codex");
+        let source_skill = source_codex.join("skills/capture-lsservice-detail/SKILL.md");
+        std::fs::create_dir_all(&source_root).unwrap();
+        std::fs::create_dir_all(source_skill.parent().unwrap()).unwrap();
+        let skill_contents = b"---\nname: get-real-hardware-rh-service\n---\nRun ~/.codex/skills/capture-lsservice-detail/scripts/run.py\n";
+        std::fs::write(&source_skill, skill_contents).unwrap();
+        let source_profile = add_profile(&repo, Provider::Codex, &source_codex);
+        save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: source.local_project_id.clone(),
+                project_root: source_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, source_profile)]),
+                expected_revision: None,
+            },
+        )
+        .unwrap();
+        save_project_link_with_repository(
+            &repo,
+            SaveProjectLinkRequest {
+                local_project_id: source.local_project_id.clone(),
+                storage_id: storage_id.clone(),
+                pinned: true,
+            },
+        )
+        .unwrap();
+
+        // Discovery must expose a selectable effective identity while
+        // retaining the physical directory in portable metadata and paths.
+        let inventory =
+            get_bundle_inventory_with_repository(&repo, &source.local_project_id).unwrap();
+        let resource_id =
+            ResourceId::parse("codex:standalone-skill:get-real-hardware-rh-service").unwrap();
+        let skill = inventory
+            .resources
+            .iter()
+            .find(|resource| resource.descriptor.resource_id == resource_id)
+            .expect("declared-name skill should be discoverable");
+        assert!(skill.blocked_reason.is_none());
+        assert_eq!(
+            skill.descriptor.display_name,
+            "get-real-hardware-rh-service"
+        );
+        assert_eq!(
+            skill
+                .descriptor
+                .metadata
+                .get("install_dir_name")
+                .map(String::as_str),
+            Some("capture-lsservice-detail")
+        );
+        assert!(skill
+            .logical_paths
+            .iter()
+            .all(|path| path.starts_with("state/codex/skills/capture-lsservice-detail/")));
+        assert!(!inventory.recipe.entries.contains_key(&resource_id));
+
+        let mut recipe = inventory.recipe;
+        recipe.entries.insert(
+            resource_id.clone(),
+            RecipeEntry {
+                resource_id: resource_id.clone(),
+                apply_policy: ApplyPolicy::SafeFile,
+                required: false,
+            },
+        );
+        save_bundle_recipe_with_repository(&repo, &source.local_project_id, recipe).unwrap();
+        let pushed =
+            push_bundle_with_repository(&repo, &source.local_project_id, &storage_id).unwrap();
+        assert!(pushed.success, "{}", pushed.message);
+        assert!(pushed
+            .results
+            .iter()
+            .any(|result| result.resource_id == resource_id));
+
+        // Machine B: Pull plans by effective identity but pins the original
+        // physical directory as the mutation target.
+        let target = register_local_project_with_repository(
+            &repo,
+            RegisterLocalProjectRequest {
+                display_name: "Target project".to_string(),
+                repository_fingerprint: Some("e".repeat(64)),
+                bundle_id: Some(bundle_id.clone()),
+            },
+        )
+        .unwrap();
+        let target_root = temp.path().join("target-project");
+        let target_codex = temp.path().join("target-codex");
+        std::fs::create_dir_all(&target_root).unwrap();
+        let target_profile = add_profile(&repo, Provider::Codex, &target_codex);
+        save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: target.local_project_id.clone(),
+                project_root: target_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, target_profile)]),
+                expected_revision: None,
+            },
+        )
+        .unwrap();
+        save_project_link_with_repository(
+            &repo,
+            SaveProjectLinkRequest {
+                local_project_id: target.local_project_id.clone(),
+                storage_id: storage_id.clone(),
+                pinned: true,
+            },
+        )
+        .unwrap();
+        let target_binding = repo
+            .load_bindings()
+            .unwrap()
+            .active_for(&target.local_project_id)
+            .cloned()
+            .unwrap();
+        let restore =
+            plan_bundle_restore_with_repository(&repo, &storage_id, &bundle_id, &target_binding)
+                .unwrap();
+        let install = restore
+            .actions
+            .iter()
+            .find(|action| action.resource_id == resource_id)
+            .expect("pull should contain the custom-skill action");
+        match &install.kind {
+            RestoreActionKind::InstallCustomSkill { skill_name, .. } => {
+                assert_eq!(skill_name, "get-real-hardware-rh-service")
+            }
+            other => panic!("expected custom-skill install, got {other:?}"),
+        }
+        assert!(install.requires_explicit_approval);
+        assert!(install
+            .target_path
+            .as_deref()
+            .unwrap()
+            .ends_with("skills/capture-lsservice-detail"));
+        let dependencies =
+            plan_dependencies_with_repository(&repo, &bundle_id, &target_binding).unwrap();
+        assert!(dependencies.actions.is_empty());
+
+        let applied = apply_bundle_restore_with_repository(
+            &repo,
+            &restore.plan_id,
+            vec![install.action_id.clone()],
+        )
+        .unwrap();
+        assert!(applied.success, "{}", applied.message);
+        assert_eq!(
+            std::fs::read(target_codex.join("skills/capture-lsservice-detail/SKILL.md")).unwrap(),
+            skill_contents
+        );
+        assert!(!target_codex
+            .join("skills/get-real-hardware-rh-service")
+            .exists());
+        let readiness =
+            get_bundle_readiness_with_repository(&repo, &bundle_id, &target_binding).unwrap();
+        assert_eq!(readiness.state, "ready");
+    }
+
+    #[test]
     fn profile_probe_resolves_a_provider_child_and_deduplicates_it() {
         let temp = tempfile::tempdir().unwrap();
         let repo = repository(&temp);
@@ -6139,7 +6482,10 @@ mod tests {
 
         let config = fixture.repo.load_config().unwrap();
         assert_eq!(config.projects.len(), 1);
-        assert!(config.storages.iter().any(|s| s.id.as_str() == "storage-setup-test"));
+        assert!(config
+            .storages
+            .iter()
+            .any(|s| s.id.as_str() == "storage-setup-test"));
         let machine = fixture.repo.load_bindings().unwrap();
         assert!(machine.active_for(&expected_project_id).is_some());
         assert!(machine.profiles.iter().any(|profile| {
@@ -6149,7 +6495,11 @@ mod tests {
         }));
 
         // The draft and its transaction are consumed by success.
-        assert!(fixture.repo.load_setup_draft(&draft.draft_id).unwrap().is_none());
+        assert!(fixture
+            .repo
+            .load_setup_draft(&draft.draft_id)
+            .unwrap()
+            .is_none());
         assert!(fixture
             .repo
             .load_setup_transaction(&draft.draft_id)
@@ -6160,7 +6510,10 @@ mod tests {
         let error =
             finalize_project_setup_with_repository(&fixture.repo, &draft.draft_id, draft.revision)
                 .unwrap_err();
-        assert!(error.contains("does not exist"), "unexpected error: {error}");
+        assert!(
+            error.contains("does not exist"),
+            "unexpected error: {error}"
+        );
         assert_eq!(fixture.repo.load_config().unwrap().projects.len(), 1);
     }
 
@@ -6168,8 +6521,7 @@ mod tests {
     fn interrupted_finalize_recovers_on_next_project_listing() {
         let fixture = setup_fixture();
         let draft = draft_ready_to_finalize(&fixture);
-        let (transaction, warnings) =
-            build_setup_transaction(&fixture.repo, &draft).unwrap();
+        let (transaction, warnings) = build_setup_transaction(&fixture.repo, &draft).unwrap();
         assert!(warnings.is_empty());
         fixture.repo.save_setup_transaction(&transaction).unwrap();
 
@@ -6178,7 +6530,9 @@ mod tests {
         fixture
             .repo
             .mutate_bindings(|_, machine| {
-                machine.profiles.extend(transaction.profiles.iter().cloned());
+                machine
+                    .profiles
+                    .extend(transaction.profiles.iter().cloned());
                 Ok(())
             })
             .unwrap();
@@ -6204,7 +6558,11 @@ mod tests {
         let machine = fixture.repo.load_bindings().unwrap();
         assert!(machine.active_for(&draft.local_project_id).is_some());
         assert_eq!(fixture.repo.load_config().unwrap().projects.len(), 1);
-        assert!(fixture.repo.load_setup_draft(&draft.draft_id).unwrap().is_none());
+        assert!(fixture
+            .repo
+            .load_setup_draft(&draft.draft_id)
+            .unwrap()
+            .is_none());
         assert!(fixture
             .repo
             .load_setup_transaction(&draft.draft_id)
@@ -6219,7 +6577,11 @@ mod tests {
 
         // A profile record nested under an existing profile fails machine
         // validation in the first apply step, before anything persists.
-        let existing = add_profile(&fixture.repo, Provider::Claude, &fixture._temp.path().join("claude-profile/.claude"));
+        let existing = add_profile(
+            &fixture.repo,
+            Provider::Claude,
+            &fixture._temp.path().join("claude-profile/.claude"),
+        );
         let nested = fixture._temp.path().join("claude-profile/.claude/nested");
         std::fs::create_dir_all(&nested).unwrap();
         let _ = existing;
@@ -6229,7 +6591,10 @@ mod tests {
             provider: Provider::Claude,
             display_name: "Nested".to_string(),
             path: nested.to_string_lossy().into_owned(),
-            canonical_path: fs_canonicalize(&nested).unwrap().to_string_lossy().into_owned(),
+            canonical_path: fs_canonicalize(&nested)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
             revision: 0,
             created_at: now,
             updated_at: now,
@@ -6262,7 +6627,11 @@ mod tests {
         let fixture = setup_fixture();
         let draft = draft_ready_to_finalize(&fixture);
         assert!(discard_setup_draft_with_repository(&fixture.repo, &draft.draft_id).unwrap());
-        assert!(fixture.repo.load_setup_draft(&draft.draft_id).unwrap().is_none());
+        assert!(fixture
+            .repo
+            .load_setup_draft(&draft.draft_id)
+            .unwrap()
+            .is_none());
         assert!(fixture.project_dir.is_dir());
         assert!(fixture.codex_home.is_dir());
         // Discarding again reports that nothing was there.
