@@ -610,6 +610,10 @@ pub struct RecipeBase {
     /// experimental bases deserialize as `None` and cannot authorize Push.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binding_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_pull_at: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_push_at: Option<u64>,
 }
 
 impl RecipeBase {
@@ -1999,6 +2003,16 @@ impl Materializations {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_recipe_base_defaults_sync_activity_timestamps() {
+        let base: RecipeBase = serde_json::from_str(
+            r#"{"generation":1,"manifest_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","recipe_revision":2}"#,
+        )
+        .unwrap();
+        assert_eq!(base.last_pull_at, None);
+        assert_eq!(base.last_push_at, None);
+    }
 
     fn bundle_id() -> BundleId {
         BundleId::parse("0123456789abcdef0123456789abcdef").unwrap()

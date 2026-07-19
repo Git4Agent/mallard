@@ -13,6 +13,8 @@ type IconName =
   | "drive"
   | "file"
   | "folder"
+  | "external-link"
+  | "git-branch"
   | "link"
   | "more"
   | "pause"
@@ -21,6 +23,7 @@ type IconName =
   | "refresh"
   | "settings"
   | "trash"
+  | "terminal"
   | "upload"
   | "x";
 
@@ -118,6 +121,22 @@ export default function Icon({ name, size = 14, ...props }: IconProps) {
           <path d="M3 10h18" />
         </>
       )}
+      {name === "external-link" && (
+        <>
+          <path d="M15 4h5v5" />
+          <path d="m10 14 10-10" />
+          <path d="M20 13v5a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h5" />
+        </>
+      )}
+      {name === "git-branch" && (
+        <>
+          <circle cx="6" cy="5" r="2" />
+          <circle cx="18" cy="6" r="2" />
+          <circle cx="6" cy="19" r="2" />
+          <path d="M6 7v10" />
+          <path d="M8 13h4a6 6 0 0 0 6-5" />
+        </>
+      )}
       {name === "more" && (
         <>
           <path d="M12 12h.01" />
@@ -159,6 +178,13 @@ export default function Icon({ name, size = 14, ...props }: IconProps) {
           <path d="m6 7 1 14h10l1-14" />
           <path d="M10 11v6" />
           <path d="M14 11v6" />
+        </>
+      )}
+      {name === "terminal" && (
+        <>
+          <rect x="3" y="4" width="18" height="16" rx="2" />
+          <path d="m7 9 3 3-3 3" />
+          <path d="M13 15h4" />
         </>
       )}
       {name === "upload" && (

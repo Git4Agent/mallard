@@ -1,0 +1,2473 @@
+//! Local-only Git-to-Codex history discovery for a registered project.
+//!
+//! This module deliberately does not participate in bundle capture. Titles,
+//! first-message summaries, and inferred Git relationships stay on this
+//! machine and are recomputed from the active project binding on demand.
+
+use super::domain::{BindingState, LocalProjectId, MaterializationStatus, Provider};
+use super::persistence::{read_json_bounded, write_json_atomic, V3Repository};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File};
+use std::io::{self, BufRead, BufReader};
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Output};
+use std::time::{SystemTime, UNIX_EPOCH};
+use walkdir::WalkDir;
+
+const DEFAULT_COMMIT_LIMIT: usize = 50;
+const MAX_COMMIT_LIMIT: usize = 50;
+const MAX_GIT_COMMITS: usize = 10_000;
+const MAX_INDEX_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SUMMARY_CHARS: usize = 180;
+const ACTIVE_WINDOW_SECS: u64 = 5 * 60;
+const AFTER_SESSION_WINDOW_SECS: u64 = 24 * 60 * 60;
+const MAX_LINE_BYTES: usize = 1024 * 1024;
+const DEFAULT_HISTORY_WINDOW_DAYS: u64 = 30;
+const DAY_SECS: u64 = 24 * 60 * 60;
+const CHAT_CACHE_SCHEMA: u32 = 1;
+const MAX_CHAT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_CHAT_CACHE_ENTRIES: usize = 50_000;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CodexThreadSummary {
+    pub thread_id: String,
+    pub title: String,
+    pub summary: String,
+    pub started_at: u64,
+    pub ended_at: u64,
+    pub branch: Option<String>,
+    pub recorded_sha: Option<String>,
+    pub is_active: bool,
+    #[serde(default)]
+    pub user_round_count: usize,
+    #[serde(default)]
+    pub agent_message_count: usize,
+    #[serde(default)]
+    pub tool_call_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(default)]
+    pub metrics_complete: bool,
+    #[serde(default)]
+    pub commit_occurrence_count: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatTurnRole {
+    User,
+    Assistant,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ChatTurnPreview {
+    pub ordinal: usize,
+    pub role: ChatTurnRole,
+    pub timestamp: Option<u64>,
+    pub preview: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CodexThreadDetailsPage {
+    pub thread_id: String,
+    pub turns: Vec<ChatTurnPreview>,
+    pub next_cursor: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct CommitThreadReference {
+    pub thread_id: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct GitCommitSummary {
+    pub sha: String,
+    pub short_sha: String,
+    pub committed_at: u64,
+    pub subject: String,
+    pub thread_refs: Vec<CommitThreadReference>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct GitBranchSummary {
+    pub name: String,
+    pub is_current: bool,
+    pub available: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct GitHistoryPage {
+    pub selected_branch: String,
+    pub branches: Vec<GitBranchSummary>,
+    pub commits: Vec<GitCommitSummary>,
+    pub next_cursor: Option<String>,
+    pub unique_thread_count: usize,
+    pub reference_count: usize,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct UnmappedThreadReference {
+    pub thread_id: String,
+    pub reason: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ProjectChatHistory {
+    pub project_id: String,
+    pub codex_home: String,
+    pub threads: Vec<CodexThreadSummary>,
+    pub git: Option<GitHistoryPage>,
+    pub unmapped: Vec<UnmappedThreadReference>,
+    pub warnings: Vec<String>,
+    pub window_start: u64,
+    pub window_end: u64,
+    pub next_before: Option<u64>,
+    pub storage_sync: Vec<StorageSyncSummary>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct StorageSyncSummary {
+    pub storage_id: String,
+    pub storage_name: String,
+    pub last_pull_at: Option<u64>,
+    pub last_push_at: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+struct SessionIndexEntry {
+    title: Option<String>,
+    updated_at: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ParsedRollout {
+    thread: CodexThreadSummary,
+    cwd: PathBuf,
+    #[serde(default)]
+    has_record_endpoints: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct RolloutCacheEntry {
+    size: u64,
+    modified_nanos: u64,
+    parsed: ParsedRollout,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct ChatHistoryCache {
+    schema: u32,
+    #[serde(default)]
+    entries: BTreeMap<String, RolloutCacheEntry>,
+}
+
+impl Default for ChatHistoryCache {
+    fn default() -> Self {
+        Self {
+            schema: CHAT_CACHE_SCHEMA,
+            entries: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MappingResult {
+    unmapped: Vec<UnmappedThreadReference>,
+    unique_thread_count: usize,
+    reference_count: usize,
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(test), allow(dead_code))]
+struct GitDiscovery {
+    selected_branch: String,
+    selected_available: bool,
+    branches: Vec<GitBranchSummary>,
+    commits: Vec<GitCommitSummary>,
+    next_cursor: Option<String>,
+}
+
+struct ResolvedProject {
+    project_id: LocalProjectId,
+    project_root: PathBuf,
+    codex_home: PathBuf,
+}
+
+pub fn list_project_repository_kinds(
+    repository: &V3Repository,
+) -> Result<BTreeMap<String, bool>, String> {
+    let config = repository.load_config()?;
+    let bindings = repository.load_bindings()?;
+    Ok(config
+        .projects
+        .iter()
+        .filter_map(|project| {
+            let root = bindings
+                .bindings
+                .iter()
+                .find(|binding| {
+                    binding.local_project_id == project.local_project_id
+                        && binding.state == BindingState::Active
+                })
+                .and_then(|binding| fs::canonicalize(&binding.project_root).ok())?;
+            let is_git =
+                git_output(&root, &["rev-parse", "--is-inside-work-tree"]).is_ok_and(|output| {
+                    output.status.success()
+                        && String::from_utf8_lossy(&output.stdout).trim() == "true"
+                });
+            Some((project.local_project_id.to_string(), is_git))
+        })
+        .collect())
+}
+
+/// Recompute a project's local Codex history and its best-effort relationship
+/// to the selected Git branch. The result contains no synced metadata.
+pub fn get_project_chat_history(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    branch: Option<&str>,
+    before_time: Option<u64>,
+    window_days: Option<u64>,
+    force_revalidate: bool,
+) -> Result<ProjectChatHistory, String> {
+    let resolved = resolve_project(repository, local_project_id)?;
+    let mut warnings = Vec::new();
+    let mut all_threads = scan_codex_threads(
+        repository,
+        &resolved.codex_home,
+        &resolved.project_root,
+        force_revalidate,
+        &mut warnings,
+    )?;
+    all_threads.sort_by(|left, right| {
+        right
+            .ended_at
+            .cmp(&left.ended_at)
+            .then_with(|| left.thread_id.cmp(&right.thread_id))
+    });
+    let window_end = before_time.unwrap_or_else(|| now_secs().saturating_add(1));
+    let window_days = window_days
+        .unwrap_or(DEFAULT_HISTORY_WINDOW_DAYS)
+        .clamp(1, 90);
+    let window_start = window_end.saturating_sub(window_days.saturating_mul(DAY_SECS));
+    let mut threads = all_threads
+        .iter()
+        .filter(|thread| thread_in_window(thread, window_start, window_end))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let recorded_branches = all_threads
+        .iter()
+        .filter_map(|thread| thread.branch.as_ref())
+        .filter(|branch| !branch.trim().is_empty())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut git = discover_git_history_with_recorded_branches(
+        &resolved.project_root,
+        branch,
+        None,
+        DEFAULT_COMMIT_LIMIT,
+        &recorded_branches,
+    )?;
+    let mut unmapped = Vec::new();
+
+    let git_page = if let Some(discovery) = git.as_mut() {
+        // Mapping must use the complete bounded first-parent rail, rather than
+        // just the visible page, so pagination does not change classification.
+        let all_commits = if discovery.selected_available {
+            load_first_parent_commits(
+                &resolved.project_root,
+                &discovery.selected_branch,
+                MAX_GIT_COMMITS + 1,
+            )?
+        } else {
+            Vec::new()
+        };
+        let was_truncated = all_commits.len() > MAX_GIT_COMMITS;
+        let mut all_commits = all_commits
+            .into_iter()
+            .take(MAX_GIT_COMMITS)
+            .collect::<Vec<_>>();
+        if was_truncated {
+            warnings.push(format!(
+                "Git history was limited to the newest {MAX_GIT_COMMITS} first-parent commits"
+            ));
+        }
+        let selected_branch = discovery.selected_branch.clone();
+        let mapping = map_threads_to_commits(&threads, &mut all_commits, &selected_branch);
+        unmapped = mapping.unmapped;
+
+        let occurrences = all_commits
+            .iter()
+            .flat_map(|commit| commit.thread_refs.iter())
+            .fold(BTreeMap::<String, usize>::new(), |mut counts, reference| {
+                *counts.entry(reference.thread_id.clone()).or_default() += 1;
+                counts
+            });
+        for thread in &mut threads {
+            thread.commit_occurrence_count =
+                occurrences.get(&thread.thread_id).copied().unwrap_or(0);
+        }
+
+        let visible_commits = all_commits
+            .iter()
+            .filter(|commit| {
+                (commit.committed_at >= window_start && commit.committed_at < window_end)
+                    || !commit.thread_refs.is_empty()
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        Some(GitHistoryPage {
+            selected_branch: discovery.selected_branch.clone(),
+            branches: discovery.branches.clone(),
+            commits: visible_commits,
+            next_cursor: None,
+            unique_thread_count: mapping.unique_thread_count,
+            reference_count: mapping.reference_count,
+        })
+    } else {
+        None
+    };
+
+    let has_older_threads = all_threads
+        .iter()
+        .any(|thread| thread.ended_at < window_start);
+    let has_older_commits = git_page.as_ref().is_some_and(|_| {
+        git.as_ref()
+            .is_some_and(|discovery| discovery.selected_available)
+            && load_first_parent_commits(
+                &resolved.project_root,
+                git.as_ref()
+                    .map(|item| item.selected_branch.as_str())
+                    .unwrap_or("HEAD"),
+                MAX_GIT_COMMITS + 1,
+            )
+            .is_ok_and(|commits| {
+                commits
+                    .iter()
+                    .any(|commit| commit.committed_at < window_start)
+            })
+    });
+
+    Ok(ProjectChatHistory {
+        project_id: resolved.project_id.to_string(),
+        codex_home: resolved.codex_home.to_string_lossy().to_string(),
+        threads,
+        git: git_page,
+        unmapped,
+        warnings,
+        window_start,
+        window_end,
+        next_before: (has_older_threads || has_older_commits).then_some(window_start),
+        storage_sync: project_storage_sync(repository, local_project_id)?,
+    })
+}
+
+fn thread_in_window(thread: &CodexThreadSummary, window_start: u64, window_end: u64) -> bool {
+    thread.ended_at >= window_start && thread.ended_at < window_end
+}
+
+fn project_storage_sync(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+) -> Result<Vec<StorageSyncSummary>, String> {
+    let config = repository.load_config()?;
+    let project = config
+        .project(local_project_id)
+        .ok_or_else(|| "project is not registered".to_string())?;
+    let materializations = repository.load_materializations()?;
+    let mut result = Vec::new();
+    for link in config
+        .links
+        .iter()
+        .filter(|link| &link.local_project_id == local_project_id)
+    {
+        let storage_name = config
+            .storages
+            .iter()
+            .find(|storage| storage.id == link.storage_id)
+            .map(|storage| storage.name.clone())
+            .unwrap_or_else(|| link.storage_id.to_string());
+        let base = project.recipe_bases.get(&link.storage_id);
+        let historical_pull = materializations
+            .records
+            .iter()
+            .filter(|record| {
+                &record.local_project_id == local_project_id
+                    && record.storage_id == link.storage_id
+                    && record.status == MaterializationStatus::Complete
+            })
+            .map(|record| record.applied_at)
+            .max();
+        result.push(StorageSyncSummary {
+            storage_id: link.storage_id.to_string(),
+            storage_name,
+            last_pull_at: base.and_then(|base| base.last_pull_at).or(historical_pull),
+            last_push_at: base.and_then(|base| base.last_push_at),
+        });
+    }
+    result.sort_by(|left, right| left.storage_name.cmp(&right.storage_name));
+    Ok(result)
+}
+
+pub fn get_project_chat_thread_details(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    thread_id: &str,
+    cursor: Option<usize>,
+    limit: Option<usize>,
+) -> Result<CodexThreadDetailsPage, String> {
+    let (_, rollout_path) = resolve_owned_rollout(repository, local_project_id, thread_id)?;
+    let mut page = parse_thread_detail_file(&rollout_path, cursor, limit.unwrap_or(50))?;
+    page.thread_id = thread_id.to_string();
+    Ok(page)
+}
+
+/// Revalidates both project registration and rollout ownership before opening
+/// an argument-safe Codex resume command in macOS Terminal.
+pub fn open_codex_thread_in_terminal(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    thread_id: &str,
+    before_launch: impl FnOnce(&str),
+) -> Result<(), String> {
+    let resolved = resolve_owned_thread(repository, local_project_id, thread_id)?;
+    launch_terminal_resume(
+        thread_id,
+        &resolved.project_root,
+        &resolved.codex_home,
+        before_launch,
+    )
+}
+
+pub fn open_codex_thread_in_app(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    thread_id: &str,
+    before_launch: impl FnOnce(&str),
+) -> Result<(), String> {
+    let resolved = resolve_owned_thread(repository, local_project_id, thread_id)?;
+    launch_codex_app(thread_id, &resolved.codex_home, before_launch)
+}
+
+/// Fast launch guard used by the desktop deep-link action. It deliberately
+/// skips Git discovery/mapping while enforcing the same registration,
+/// binding, profile, UUID, and rollout-ownership checks as Terminal launch.
+pub fn validate_codex_thread_ownership(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    thread_id: &str,
+) -> Result<(), String> {
+    resolve_owned_thread(repository, local_project_id, thread_id).map(|_| ())
+}
+
+fn resolve_owned_thread(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    thread_id: &str,
+) -> Result<ResolvedProject, String> {
+    validate_thread_uuid(thread_id)?;
+    let resolved = resolve_project(repository, local_project_id)?;
+    let mut warnings = Vec::new();
+    let owned = scan_codex_threads(
+        repository,
+        &resolved.codex_home,
+        &resolved.project_root,
+        false,
+        &mut warnings,
+    )?
+    .into_iter()
+    .any(|thread| thread.thread_id == thread_id);
+    if !owned {
+        return Err("Codex thread does not belong to the selected project".to_string());
+    }
+    Ok(resolved)
+}
+
+fn resolve_owned_rollout(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    thread_id: &str,
+) -> Result<(ResolvedProject, PathBuf), String> {
+    validate_thread_uuid(thread_id)?;
+    let resolved = resolve_project(repository, local_project_id)?;
+    let mut best: Option<(ParsedRollout, PathBuf)> = None;
+    for directory_name in ["sessions", "archived_sessions"] {
+        let directory = resolved.codex_home.join(directory_name);
+        if !directory.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(&directory)
+            .follow_links(false)
+            .max_depth(8)
+            .into_iter()
+            .filter_map(Result::ok)
+        {
+            if !entry.file_type().is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            let metadata = entry
+                .metadata()
+                .map_err(|error| format!("read '{}': {error}", entry.path().display()))?;
+            let mut warnings = Vec::new();
+            let Ok(parsed) = parse_rollout_file(
+                entry.path(),
+                modified_secs(&metadata).unwrap_or(0),
+                &mut warnings,
+            ) else {
+                continue;
+            };
+            if parsed.thread.thread_id == thread_id
+                && cwd_belongs_to_project(&parsed.cwd, &resolved.project_root)
+            {
+                let replace = best
+                    .as_ref()
+                    .is_none_or(|(current, _)| rollout_is_preferred(&parsed, current));
+                if replace {
+                    best = Some((parsed, entry.path().to_path_buf()));
+                }
+            }
+        }
+    }
+    best.map(|(_, path)| (resolved, path))
+        .ok_or_else(|| "Codex thread does not belong to the selected project".to_string())
+}
+
+fn rollout_is_preferred(candidate: &ParsedRollout, current: &ParsedRollout) -> bool {
+    candidate
+        .thread
+        .metrics_complete
+        .cmp(&current.thread.metrics_complete)
+        .then_with(|| candidate.thread.ended_at.cmp(&current.thread.ended_at))
+        .then_with(|| {
+            candidate
+                .has_record_endpoints
+                .cmp(&current.has_record_endpoints)
+        })
+        .is_gt()
+}
+
+fn resolve_project(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+) -> Result<ResolvedProject, String> {
+    let config = repository.load_config()?;
+    if config.project(local_project_id).is_none() {
+        return Err(
+            "project is not registered; unfinished setup drafts have no history".to_string(),
+        );
+    }
+    let state = repository.load_bindings()?;
+    let binding = state
+        .bindings
+        .iter()
+        .find(|binding| {
+            &binding.local_project_id == local_project_id && binding.state == BindingState::Active
+        })
+        .ok_or_else(|| "project has no active binding on this machine".to_string())?;
+
+    let project_root = fs::canonicalize(&binding.project_root)
+        .map_err(|error| format!("resolve project root '{}': {error}", binding.project_root))?;
+    if project_root != PathBuf::from(&binding.canonical_project_root) {
+        return Err(
+            "project root changed since the binding was saved; open Project Settings".to_string(),
+        );
+    }
+    let profile_id = binding
+        .profile_ids
+        .get(&Provider::Codex)
+        .ok_or_else(|| "project has no Codex profile; open Project Settings".to_string())?;
+    let profile = state
+        .profiles
+        .iter()
+        .find(|profile| &profile.profile_id == profile_id && profile.provider == Provider::Codex)
+        .ok_or_else(|| "project's Codex profile is missing; open Project Settings".to_string())?;
+    let codex_home = fs::canonicalize(&profile.path)
+        .map_err(|error| format!("resolve Codex profile '{}': {error}", profile.path))?;
+    if codex_home != PathBuf::from(&profile.canonical_path) {
+        return Err("Codex profile path changed; open Project Settings".to_string());
+    }
+
+    Ok(ResolvedProject {
+        project_id: local_project_id.clone(),
+        project_root,
+        codex_home,
+    })
+}
+
+fn scan_codex_threads(
+    repository: &V3Repository,
+    codex_home: &Path,
+    project_root: &Path,
+    force_revalidate: bool,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<CodexThreadSummary>, String> {
+    let index_path = codex_home.join("session_index.jsonl");
+    let index = read_session_index(&index_path, warnings)?;
+    let now = now_secs();
+    let mut by_id = BTreeMap::<String, (CodexThreadSummary, bool)>::new();
+    let cache_path = repository.root().join("chat_history_cache.json");
+    let mut cache = load_chat_history_cache(repository.root(), &cache_path, warnings);
+    let profile_cache_prefix = format!("{}\u{0}", codex_home.display());
+    let mut seen_cache_keys = BTreeSet::new();
+
+    for directory_name in ["sessions", "archived_sessions"] {
+        let directory = codex_home.join(directory_name);
+        if !directory.exists() {
+            continue;
+        }
+        for entry in WalkDir::new(&directory)
+            .follow_links(false)
+            .max_depth(8)
+            .into_iter()
+        {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    warnings.push(format!("Cannot inspect a Codex session path: {error}"));
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    warnings.push(format!("Cannot read '{}': {error}", entry.path().display()));
+                    continue;
+                }
+            };
+            let fallback_time = modified_secs(&metadata).unwrap_or(0);
+            let cache_key = format!("{}\u{0}{}", codex_home.display(), entry.path().display());
+            seen_cache_keys.insert(cache_key.clone());
+            let modified_nanos = modified_nanos(&metadata).unwrap_or(0);
+            let parsed = if !force_revalidate {
+                cache.entries.get(&cache_key).and_then(|cached| {
+                    cached_rollout(
+                        cached,
+                        metadata.len(),
+                        modified_nanos,
+                        index
+                            .get(&cached.parsed.thread.thread_id)
+                            .and_then(|item| item.title.as_ref())
+                            .is_some(),
+                    )
+                })
+            } else {
+                None
+            };
+            let parsed = match parsed {
+                Some(parsed) => parsed,
+                None => match parse_rollout_file(entry.path(), fallback_time, warnings) {
+                    Ok(parsed) => {
+                        cache.entries.insert(
+                            cache_key,
+                            RolloutCacheEntry {
+                                size: metadata.len(),
+                                modified_nanos,
+                                parsed: cache_safe_rollout(parsed.clone()),
+                            },
+                        );
+                        parsed
+                    }
+                    Err(error) => {
+                        warnings.push(format!("Skipped '{}': {error}", entry.path().display()));
+                        continue;
+                    }
+                },
+            };
+            if !cwd_belongs_to_project(&parsed.cwd, project_root) {
+                continue;
+            }
+            let has_record_endpoints = parsed.has_record_endpoints;
+            let mut thread = parsed.thread;
+            if let Some(index_entry) = index.get(&thread.thread_id) {
+                apply_index_metadata(&mut thread, has_record_endpoints, index_entry);
+            }
+            if thread.title.is_empty() {
+                thread.title = if thread.summary.is_empty() {
+                    format!("Codex thread {}", short_id(&thread.thread_id))
+                } else {
+                    thread.summary.clone()
+                };
+            }
+            thread.is_active = session_mtime_is_active(now, fallback_time);
+            if fallback_time > now.saturating_add(ACTIVE_WINDOW_SECS) {
+                warnings.push(format!(
+                    "Codex rollout '{}' has a modified time in the future",
+                    entry.path().display()
+                ));
+            }
+            let replace =
+                by_id
+                    .get(&thread.thread_id)
+                    .is_none_or(|(previous, previous_endpoints)| {
+                        thread
+                            .metrics_complete
+                            .cmp(&previous.metrics_complete)
+                            .then_with(|| thread.ended_at.cmp(&previous.ended_at))
+                            .then_with(|| has_record_endpoints.cmp(previous_endpoints))
+                            .is_gt()
+                    });
+            if replace {
+                by_id.insert(thread.thread_id.clone(), (thread, has_record_endpoints));
+            }
+        }
+    }
+    cache
+        .entries
+        .retain(|key, _| !key.starts_with(&profile_cache_prefix) || seen_cache_keys.contains(key));
+    if cache.entries.len() > MAX_CHAT_CACHE_ENTRIES {
+        warnings.push(format!(
+            "Local chat history cache exceeded {MAX_CHAT_CACHE_ENTRIES} entries and was reset"
+        ));
+        cache = ChatHistoryCache::default();
+    }
+    save_chat_history_cache(repository.root(), &cache_path, &cache, warnings);
+    Ok(by_id.into_values().map(|(thread, _)| thread).collect())
+}
+
+fn apply_index_metadata(
+    thread: &mut CodexThreadSummary,
+    has_record_endpoints: bool,
+    index_entry: &SessionIndexEntry,
+) {
+    if let Some(title) = &index_entry.title {
+        thread.title = title.clone();
+    }
+    if !has_record_endpoints {
+        if let Some(updated) = index_entry.updated_at {
+            thread.ended_at = updated.max(thread.started_at);
+        }
+    }
+}
+
+fn load_chat_history_cache(
+    root: &Path,
+    path: &Path,
+    warnings: &mut Vec<String>,
+) -> ChatHistoryCache {
+    match read_json_bounded::<ChatHistoryCache>(root, path, MAX_CHAT_CACHE_BYTES) {
+        Ok(Some(cache))
+            if cache.schema == CHAT_CACHE_SCHEMA
+                && cache.entries.len() <= MAX_CHAT_CACHE_ENTRIES =>
+        {
+            cache
+        }
+        Ok(Some(_)) => {
+            warnings.push(format!(
+                "Ignored incompatible or oversized local chat history cache '{}'",
+                path.display()
+            ));
+            ChatHistoryCache::default()
+        }
+        Ok(None) => ChatHistoryCache::default(),
+        Err(error) => {
+            warnings.push(format!(
+                "Ignored unreadable local chat history cache '{}': {error}",
+                path.display()
+            ));
+            ChatHistoryCache::default()
+        }
+    }
+}
+
+fn cached_rollout(
+    entry: &RolloutCacheEntry,
+    size: u64,
+    modified_nanos: u64,
+    has_indexed_title: bool,
+) -> Option<ParsedRollout> {
+    (entry.size == size && entry.modified_nanos == modified_nanos && has_indexed_title)
+        .then(|| entry.parsed.clone())
+}
+
+fn cache_safe_rollout(mut parsed: ParsedRollout) -> ParsedRollout {
+    parsed.thread.title.clear();
+    parsed.thread.summary.clear();
+    parsed
+}
+
+fn save_chat_history_cache(
+    root: &Path,
+    path: &Path,
+    cache: &ChatHistoryCache,
+    warnings: &mut Vec<String>,
+) {
+    if let Err(error) = write_json_atomic(root, path, cache, MAX_CHAT_CACHE_BYTES) {
+        warnings.push(format!(
+            "Could not update local chat history cache '{}': {error}",
+            path.display()
+        ));
+    }
+}
+
+fn read_session_index(
+    path: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<BTreeMap<String, SessionIndexEntry>, String> {
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let metadata = fs::metadata(path)
+        .map_err(|error| format!("read Codex session index '{}': {error}", path.display()))?;
+    if metadata.len() > MAX_INDEX_BYTES {
+        warnings.push(format!(
+            "Codex session index exceeded {} MiB and was ignored",
+            MAX_INDEX_BYTES / (1024 * 1024)
+        ));
+        return Ok(BTreeMap::new());
+    }
+    let lines = read_bounded_lines(path, usize::MAX, warnings)?;
+    Ok(parse_session_index_lines(lines.iter().map(String::as_str)))
+}
+
+fn parse_session_index_lines<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+) -> BTreeMap<String, SessionIndexEntry> {
+    let mut result = BTreeMap::<String, SessionIndexEntry>::new();
+    for line in lines {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some(id) = string_alias(&value, &["id", "thread_id", "session_id"]) else {
+            continue;
+        };
+        let entry = result.entry(id.to_string()).or_insert(SessionIndexEntry {
+            title: None,
+            updated_at: None,
+        });
+        if let Some(title) = string_alias(&value, &["thread_name", "title", "name"])
+            .map(normalize_summary)
+            .map(|title| truncate_chars(&title, MAX_SUMMARY_CHARS))
+            .filter(|title| !title.is_empty())
+        {
+            entry.title = Some(title);
+        }
+        if let Some(updated) = value_alias(&value, &["updated_at", "updatedAt", "last_updated_at"])
+            .and_then(parse_timestamp_value)
+        {
+            entry.updated_at = Some(updated);
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+fn parse_rollout_lines<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    fallback_time: u64,
+) -> Result<ParsedRollout, String> {
+    let mut parser = RolloutParser::new(fallback_time);
+    for line in lines {
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) => parser.consume(&value),
+            Err(_) => parser.metrics_complete = false,
+        }
+    }
+    parser.finish()
+}
+
+fn parse_rollout_file(
+    path: &Path,
+    fallback_time: u64,
+    warnings: &mut Vec<String>,
+) -> Result<ParsedRollout, String> {
+    let file = File::open(path).map_err(|error| format!("open '{}': {error}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut parser = RolloutParser::new(fallback_time);
+    let mut bytes = Vec::new();
+    loop {
+        match read_bounded_line(&mut reader, &mut bytes, MAX_LINE_BYTES)
+            .map_err(|error| format!("read '{}': {error}", path.display()))?
+        {
+            BoundedLine::Eof => break,
+            BoundedLine::Oversized => {
+                parser.metrics_complete = false;
+                warnings.push(format!(
+                    "Ignored oversized JSONL line in '{}'",
+                    path.display()
+                ));
+                continue;
+            }
+            BoundedLine::Line => {}
+        }
+        if bytes.is_empty() {
+            continue;
+        }
+        match serde_json::from_slice::<Value>(&bytes) {
+            Ok(value) => parser.consume(&value),
+            Err(error) => {
+                parser.metrics_complete = false;
+                warnings.push(format!(
+                    "Ignored malformed JSONL record in '{}': {error}",
+                    path.display()
+                ));
+            }
+        }
+    }
+    parser.finish()
+}
+
+struct RolloutParser {
+    fallback_time: u64,
+    thread_id: Option<String>,
+    cwd: Option<PathBuf>,
+    first_timestamp: Option<u64>,
+    last_timestamp: Option<u64>,
+    metadata_timestamp: Option<u64>,
+    branch: Option<String>,
+    recorded_sha: Option<String>,
+    summary: Option<String>,
+    fallback_summary: Option<String>,
+    user_round_count: usize,
+    agent_message_count: usize,
+    tool_call_count: usize,
+    total_tokens: Option<u64>,
+    metrics_complete: bool,
+}
+
+impl RolloutParser {
+    fn new(fallback_time: u64) -> Self {
+        Self {
+            fallback_time,
+            thread_id: None,
+            cwd: None,
+            first_timestamp: None,
+            last_timestamp: None,
+            metadata_timestamp: None,
+            branch: None,
+            recorded_sha: None,
+            summary: None,
+            fallback_summary: None,
+            user_round_count: 0,
+            agent_message_count: 0,
+            tool_call_count: 0,
+            total_tokens: None,
+            metrics_complete: true,
+        }
+    }
+
+    fn consume(&mut self, value: &Value) {
+        let payload = value.get("payload").unwrap_or(value);
+        let event_type = value
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let payload_type = payload
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if let Some(timestamp) = value_alias(value, &["timestamp", "created_at", "updated_at"])
+            .or_else(|| value_alias(payload, &["timestamp", "created_at", "updated_at"]))
+            .and_then(parse_timestamp_value)
+        {
+            self.first_timestamp.get_or_insert(timestamp);
+            self.last_timestamp = Some(timestamp);
+        }
+        if event_type == "session_meta" || payload_type == "session_meta" {
+            if self.thread_id.is_none() {
+                self.thread_id = string_alias(payload, &["id", "thread_id", "session_id"])
+                    .map(ToOwned::to_owned);
+            }
+            if self.cwd.is_none() {
+                self.cwd = string_alias(payload, &["cwd", "working_directory", "project_path"])
+                    .map(PathBuf::from);
+            }
+            if self.metadata_timestamp.is_none() {
+                self.metadata_timestamp =
+                    value_alias(value, &["timestamp", "created_at", "started_at"])
+                        .or_else(|| {
+                            value_alias(payload, &["timestamp", "created_at", "started_at"])
+                        })
+                        .and_then(parse_timestamp_value);
+            }
+            let git = payload.get("git").unwrap_or(payload);
+            if self.branch.is_none() {
+                self.branch = string_alias(git, &["branch", "git_branch"])
+                    .or_else(|| string_alias(payload, &["git_branch", "branch"]))
+                    .map(ToOwned::to_owned);
+            }
+            if self.recorded_sha.is_none() {
+                self.recorded_sha =
+                    string_alias(git, &["commit_hash", "commit", "sha", "git_commit"])
+                        .or_else(|| string_alias(payload, &["git_commit", "commit_hash"]))
+                        .map(ToOwned::to_owned);
+            }
+        }
+        if payload_type == "user_message" {
+            if let Some(text) = genuine_user_event(payload) {
+                self.user_round_count = self.user_round_count.saturating_add(1);
+                if self.summary.is_none() {
+                    self.summary = Some(truncate_chars(&text, MAX_SUMMARY_CHARS));
+                }
+            }
+        } else if payload_type == "agent_message" {
+            self.agent_message_count = self.agent_message_count.saturating_add(1);
+        }
+        if matches!(payload_type, "function_call" | "custom_tool_call") {
+            self.tool_call_count = self.tool_call_count.saturating_add(1);
+        }
+        if payload_type == "token_count" {
+            if let Some(total) = payload
+                .get("info")
+                .and_then(|info| info.get("total_token_usage"))
+                .and_then(|usage| usage.get("total_tokens"))
+                .and_then(Value::as_u64)
+            {
+                self.total_tokens = Some(self.total_tokens.unwrap_or(0).max(total));
+            }
+        }
+        if self.fallback_summary.is_none() {
+            self.fallback_summary = extract_user_message(value)
+                .map(|text| truncate_chars(&normalize_summary(&text), MAX_SUMMARY_CHARS))
+                .filter(|text| is_meaningful_user_text(text));
+        }
+    }
+
+    fn finish(self) -> Result<ParsedRollout, String> {
+        let thread_id = self
+            .thread_id
+            .ok_or_else(|| "rollout has no session id metadata".to_string())?;
+        let cwd = self
+            .cwd
+            .ok_or_else(|| "rollout has no cwd metadata".to_string())?;
+        let summary = self.summary.or(self.fallback_summary).unwrap_or_default();
+        let started_at = self
+            .first_timestamp
+            .or(self.metadata_timestamp)
+            .unwrap_or(self.fallback_time);
+        let ended_at = self
+            .last_timestamp
+            .unwrap_or(self.fallback_time)
+            .max(started_at);
+        Ok(ParsedRollout {
+            thread: CodexThreadSummary {
+                thread_id,
+                title: summary.clone(),
+                summary,
+                started_at,
+                ended_at,
+                branch: self.branch,
+                recorded_sha: self.recorded_sha,
+                is_active: false,
+                user_round_count: self.user_round_count,
+                agent_message_count: self.agent_message_count,
+                tool_call_count: self.tool_call_count,
+                total_tokens: self.total_tokens,
+                metrics_complete: self.metrics_complete
+                    && self.first_timestamp.is_some()
+                    && self.last_timestamp.is_some(),
+                commit_occurrence_count: 0,
+            },
+            cwd,
+            has_record_endpoints: self.first_timestamp.is_some() && self.last_timestamp.is_some(),
+        })
+    }
+}
+
+fn event_message_text(payload: &Value) -> Option<String> {
+    payload
+        .get("message")
+        .and_then(extract_text)
+        .or_else(|| payload.get("text").and_then(extract_text))
+}
+
+fn genuine_user_event(payload: &Value) -> Option<String> {
+    (payload.get("type").and_then(Value::as_str) == Some("user_message"))
+        .then(|| event_message_text(payload))
+        .flatten()
+        .map(|text| normalize_summary(&text))
+        .filter(|text| is_meaningful_user_text(text))
+}
+
+fn visible_chat_message(value: &Value) -> Option<(ChatTurnRole, String, Option<u64>)> {
+    let payload = value.get("payload").unwrap_or(value);
+    let payload_type = payload.get("type").and_then(Value::as_str);
+    let (role, text) = match payload_type {
+        Some("user_message") => (ChatTurnRole::User, genuine_user_event(payload)?),
+        Some("agent_message") => (
+            ChatTurnRole::Assistant,
+            event_message_text(payload).map(|text| normalize_summary(&text))?,
+        ),
+        Some("message") if payload.get("role").and_then(Value::as_str) == Some("assistant") => (
+            ChatTurnRole::Assistant,
+            payload
+                .get("content")
+                .and_then(extract_text)
+                .map(|text| normalize_summary(&text))?,
+        ),
+        _ => return None,
+    };
+    if text.is_empty() {
+        return None;
+    }
+    let timestamp = value_alias(value, &["timestamp"])
+        .or_else(|| value_alias(payload, &["timestamp"]))
+        .and_then(parse_timestamp_value);
+    Some((role, truncate_chars(&text, 240), timestamp))
+}
+
+fn is_meaningful_user_text(value: &str) -> bool {
+    let trimmed = value.trim_start();
+    !trimmed.is_empty()
+        && ![
+            "<recommended_plugins>",
+            "<skill>",
+            "<environment_context>",
+            "<permissions instructions>",
+            "<app-context>",
+        ]
+        .iter()
+        .any(|prefix| trimmed.starts_with(prefix))
+}
+
+#[cfg(test)]
+fn parse_thread_detail_lines<'a>(
+    lines: impl IntoIterator<Item = &'a str>,
+    cursor: Option<usize>,
+    limit: usize,
+) -> CodexThreadDetailsPage {
+    let start = cursor.unwrap_or(0);
+    let limit = limit.clamp(1, 50);
+    let mut visible = Vec::new();
+    let mut previous: Option<(ChatTurnRole, String, Option<u64>)> = None;
+    for line in lines {
+        let Ok(value) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let Some((role, preview, timestamp)) = visible_chat_message(&value) else {
+            continue;
+        };
+        if previous.as_ref() == Some(&(role, preview.clone(), timestamp)) {
+            continue;
+        }
+        previous = Some((role, preview.clone(), timestamp));
+        let ordinal = visible.len();
+        visible.push(ChatTurnPreview {
+            ordinal,
+            role,
+            timestamp,
+            preview,
+        });
+    }
+    let turns = visible
+        .iter()
+        .skip(start)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_cursor = (start + turns.len() < visible.len()).then_some(start + turns.len());
+    CodexThreadDetailsPage {
+        thread_id: String::new(),
+        turns,
+        next_cursor,
+    }
+}
+
+fn parse_thread_detail_file(
+    path: &Path,
+    cursor: Option<usize>,
+    limit: usize,
+) -> Result<CodexThreadDetailsPage, String> {
+    let file = File::open(path).map_err(|error| format!("open '{}': {error}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let start = cursor.unwrap_or(0);
+    let limit = limit.clamp(1, 50);
+    let mut ordinal = 0usize;
+    let mut turns = Vec::new();
+    let mut bytes = Vec::new();
+    let mut has_more = false;
+    let mut previous: Option<(ChatTurnRole, String, Option<u64>)> = None;
+    loop {
+        match read_bounded_line(&mut reader, &mut bytes, MAX_LINE_BYTES)
+            .map_err(|error| format!("read '{}': {error}", path.display()))?
+        {
+            BoundedLine::Eof => break,
+            BoundedLine::Oversized => continue,
+            BoundedLine::Line => {}
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some((role, preview, timestamp)) = visible_chat_message(&value) else {
+            continue;
+        };
+        if previous.as_ref() == Some(&(role, preview.clone(), timestamp)) {
+            continue;
+        }
+        previous = Some((role, preview.clone(), timestamp));
+        if ordinal >= start {
+            if turns.len() == limit {
+                has_more = true;
+                break;
+            }
+            turns.push(ChatTurnPreview {
+                ordinal,
+                role,
+                timestamp,
+                preview,
+            });
+        }
+        ordinal = ordinal.saturating_add(1);
+    }
+    Ok(CodexThreadDetailsPage {
+        thread_id: String::new(),
+        next_cursor: has_more.then_some(start + turns.len()),
+        turns,
+    })
+}
+
+fn extract_user_message(value: &Value) -> Option<String> {
+    let payload = value.get("payload").unwrap_or(value);
+    if payload.get("role").and_then(Value::as_str) != Some("user") {
+        return None;
+    }
+    if let Some(text) = payload.get("text").and_then(Value::as_str) {
+        return Some(text.to_string());
+    }
+    if let Some(content) = payload.get("content") {
+        return extract_text(content);
+    }
+    payload.get("message").and_then(extract_text)
+}
+
+fn extract_text(value: &Value) -> Option<String> {
+    match value {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(items) => {
+            let parts = items.iter().filter_map(extract_text).collect::<Vec<_>>();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        Value::Object(object) => object
+            .get("text")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned)
+            .or_else(|| object.get("content").and_then(extract_text)),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BoundedLine {
+    Eof,
+    Line,
+    Oversized,
+}
+
+fn read_bounded_line<R: BufRead>(
+    reader: &mut R,
+    output: &mut Vec<u8>,
+    max_bytes: usize,
+) -> io::Result<BoundedLine> {
+    output.clear();
+    let mut oversized = false;
+    loop {
+        let available = reader.fill_buf()?;
+        if available.is_empty() {
+            if output.is_empty() && !oversized {
+                return Ok(BoundedLine::Eof);
+            }
+            break;
+        }
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let content_len = newline.unwrap_or(available.len());
+        if !oversized {
+            if output.len().saturating_add(content_len) > max_bytes {
+                oversized = true;
+                output.clear();
+            } else {
+                output.extend_from_slice(&available[..content_len]);
+            }
+        }
+        let consumed = content_len + usize::from(newline.is_some());
+        reader.consume(consumed);
+        if newline.is_some() {
+            break;
+        }
+    }
+    if oversized {
+        return Ok(BoundedLine::Oversized);
+    }
+    if output.last() == Some(&b'\r') {
+        output.pop();
+    }
+    Ok(BoundedLine::Line)
+}
+
+fn read_bounded_lines(
+    path: &Path,
+    max_lines: usize,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<String>, String> {
+    let file = File::open(path).map_err(|error| format!("open '{}': {error}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut lines = Vec::new();
+    let mut bytes = Vec::new();
+    let mut processed = 0usize;
+    while processed < max_lines {
+        let state = read_bounded_line(&mut reader, &mut bytes, MAX_LINE_BYTES)
+            .map_err(|error| format!("read '{}': {error}", path.display()))?;
+        if state == BoundedLine::Eof {
+            break;
+        }
+        processed += 1;
+        if state == BoundedLine::Oversized {
+            warnings.push(format!(
+                "Ignored oversized JSONL line in '{}'",
+                path.display()
+            ));
+            continue;
+        }
+        if bytes.is_empty() {
+            continue;
+        }
+        match String::from_utf8(bytes.clone()) {
+            Ok(line) if serde_json::from_str::<Value>(&line).is_ok() => lines.push(line),
+            Ok(_) => warnings.push(format!(
+                "Ignored malformed JSONL line in '{}'",
+                path.display()
+            )),
+            Err(_) => warnings.push(format!(
+                "Ignored non-UTF-8 JSONL line in '{}'",
+                path.display()
+            )),
+        }
+    }
+    let has_more = reader.fill_buf().is_ok_and(|buffer| !buffer.is_empty());
+    if max_lines != usize::MAX && processed == max_lines && has_more {
+        warnings.push(format!(
+            "Stopped reading '{}' after {max_lines} JSONL lines",
+            path.display()
+        ));
+    }
+    Ok(lines)
+}
+
+#[cfg(test)]
+fn discover_git_history(
+    project_root: &Path,
+    requested_branch: Option<&str>,
+    before_commit: Option<&str>,
+    limit: usize,
+) -> Result<Option<GitDiscovery>, String> {
+    discover_git_history_with_recorded_branches(
+        project_root,
+        requested_branch,
+        before_commit,
+        limit,
+        &BTreeSet::new(),
+    )
+}
+
+fn discover_git_history_with_recorded_branches(
+    project_root: &Path,
+    requested_branch: Option<&str>,
+    before_commit: Option<&str>,
+    limit: usize,
+    recorded_branches: &BTreeSet<String>,
+) -> Result<Option<GitDiscovery>, String> {
+    let probe = git_output(project_root, &["rev-parse", "--is-inside-work-tree"])?;
+    if !probe.status.success() || String::from_utf8_lossy(&probe.stdout).trim() != "true" {
+        return Ok(None);
+    }
+    let current = git_output(
+        project_root,
+        &["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .ok()
+    .filter(|output| output.status.success())
+    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+    .filter(|value| !value.is_empty());
+    let output = git_output(
+        project_root,
+        &["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+    )?;
+    if !output.status.success() {
+        return Err(git_error("list branches", &output));
+    }
+    let available_names = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect::<BTreeSet<_>>();
+    let mut names = available_names.clone();
+    if let Some(current) = &current {
+        names.insert(current.clone());
+    }
+    names.extend(recorded_branches.iter().cloned());
+    let selected = if let Some(requested) = requested_branch {
+        if !names.contains(requested) {
+            return Err(
+                "branch is not one of the repository's enumerated local branches".to_string(),
+            );
+        }
+        requested.to_string()
+    } else if let Some(current) = &current {
+        current.clone()
+    } else {
+        names
+            .iter()
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "HEAD".to_string())
+    };
+    let branches = names
+        .into_iter()
+        .map(|name| GitBranchSummary {
+            is_current: current.as_deref() == Some(name.as_str()),
+            available: available_names.contains(&name) || current.as_deref() == Some(name.as_str()),
+            name,
+        })
+        .collect::<Vec<_>>();
+
+    let selected_available = branches
+        .iter()
+        .find(|branch| branch.name == selected)
+        .is_some_and(|branch| branch.available);
+    let all = if selected_available {
+        load_first_parent_commits(project_root, &selected, MAX_GIT_COMMITS + 1)?
+    } else {
+        Vec::new()
+    };
+    let start = if let Some(cursor) = before_commit {
+        validate_sha(cursor)?;
+        all.iter()
+            .position(|commit| commit.sha.eq_ignore_ascii_case(cursor))
+            .map(|position| position + 1)
+            .ok_or_else(|| {
+                "commit cursor is not on the selected branch's first-parent history".to_string()
+            })?
+    } else {
+        0
+    };
+    let limit = limit.clamp(1, MAX_COMMIT_LIMIT);
+    let commits = all
+        .iter()
+        .skip(start)
+        .take(limit)
+        .cloned()
+        .collect::<Vec<_>>();
+    let next_cursor = if start + commits.len() < all.len() {
+        commits.last().map(|commit| commit.sha.clone())
+    } else {
+        None
+    };
+    Ok(Some(GitDiscovery {
+        selected_branch: selected,
+        selected_available,
+        branches,
+        commits,
+        next_cursor,
+    }))
+}
+
+fn load_first_parent_commits(
+    project_root: &Path,
+    branch: &str,
+    limit: usize,
+) -> Result<Vec<GitCommitSummary>, String> {
+    let count = limit.min(MAX_GIT_COMMITS + 1).to_string();
+    let branch_ref = if branch == "HEAD" {
+        "HEAD".to_string()
+    } else {
+        format!("refs/heads/{branch}")
+    };
+    let output = git_output(
+        project_root,
+        &[
+            "log",
+            "--first-parent",
+            "--date-order",
+            "--format=%H%x1f%ct%x1f%s",
+            "-n",
+            &count,
+            &branch_ref,
+            "--",
+        ],
+    )?;
+    if !output.status.success() {
+        return Err(git_error("read first-parent history", &output));
+    }
+    let mut commits = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut fields = line.splitn(3, '\u{1f}');
+        let Some(sha) = fields.next() else { continue };
+        let Some(time) = fields.next().and_then(|value| value.parse::<u64>().ok()) else {
+            continue;
+        };
+        let subject = fields.next().unwrap_or_default().to_string();
+        if validate_sha(sha).is_err() {
+            continue;
+        }
+        commits.push(GitCommitSummary {
+            sha: sha.to_ascii_lowercase(),
+            short_sha: sha.chars().take(12).collect(),
+            committed_at: time,
+            subject,
+            thread_refs: Vec::new(),
+        });
+    }
+    Ok(commits)
+}
+
+fn map_threads_to_commits(
+    threads: &[CodexThreadSummary],
+    commits: &mut [GitCommitSummary],
+    selected_branch: &str,
+) -> MappingResult {
+    let mut mapped_threads = BTreeSet::new();
+    let mut unmapped = Vec::new();
+    for thread in threads {
+        // A recorded branch is authoritative routing metadata. Rollouts that
+        // predate branch capture stay eligible as a best-effort fallback,
+        // but a thread from another named branch must never appear on this
+        // branch's commit rail.
+        if thread
+            .branch
+            .as_deref()
+            .is_some_and(|branch| branch != selected_branch)
+        {
+            continue;
+        }
+        let mut matched = Vec::new();
+        for (index, commit) in commits.iter().enumerate() {
+            if commit.committed_at >= thread.started_at && commit.committed_at <= thread.ended_at {
+                matched.push(index);
+            }
+        }
+        if matched.is_empty() {
+            if let Some((index, _)) = commits
+                .iter()
+                .enumerate()
+                .filter(|(_, commit)| {
+                    commit.committed_at > thread.ended_at
+                        && commit.committed_at.saturating_sub(thread.ended_at)
+                            <= AFTER_SESSION_WINDOW_SECS
+                })
+                .min_by_key(|(_, commit)| commit.committed_at)
+            {
+                matched.push(index);
+            }
+        }
+        if matched.is_empty() {
+            let reason = if commits.is_empty() {
+                "The selected branch has no available first-parent commits"
+            } else {
+                "No commit fell within the session window or its 24-hour follow-up"
+            };
+            unmapped.push(UnmappedThreadReference {
+                thread_id: thread.thread_id.clone(),
+                reason: reason.to_string(),
+            });
+            continue;
+        }
+        mapped_threads.insert(thread.thread_id.clone());
+        for index in matched {
+            commits[index].thread_refs.push(CommitThreadReference {
+                thread_id: thread.thread_id.clone(),
+            });
+        }
+    }
+    let thread_order = threads
+        .iter()
+        .map(|thread| (thread.thread_id.as_str(), thread))
+        .collect::<BTreeMap<_, _>>();
+    for commit in commits.iter_mut() {
+        commit.thread_refs.sort_by(|left, right| {
+            match (
+                thread_order.get(left.thread_id.as_str()),
+                thread_order.get(right.thread_id.as_str()),
+            ) {
+                (Some(left_thread), Some(right_thread)) => right_thread
+                    .ended_at
+                    .cmp(&left_thread.ended_at)
+                    .then_with(|| left_thread.started_at.cmp(&right_thread.started_at))
+                    .then_with(|| left.thread_id.cmp(&right.thread_id)),
+                _ => left.thread_id.cmp(&right.thread_id),
+            }
+        });
+    }
+    let reference_count = commits.iter().map(|commit| commit.thread_refs.len()).sum();
+    MappingResult {
+        unmapped,
+        unique_thread_count: mapped_threads.len(),
+        reference_count,
+    }
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Result<Output, String> {
+    Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .map_err(|error| format!("run Git for '{}': {error}", root.display()))
+}
+
+fn git_error(action: &str, output: &Output) -> String {
+    let detail = String::from_utf8_lossy(&output.stderr);
+    format!("Git could not {action}: {}", detail.trim())
+}
+
+fn launch_terminal_resume(
+    thread_id: &str,
+    project_root: &Path,
+    codex_home: &Path,
+    before_launch: impl FnOnce(&str),
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let codex_cli = resolve_codex_cli()?;
+        let shell = terminal_resume_command(&codex_cli, thread_id, project_root, codex_home)?;
+        before_launch(&shell);
+        let script = format!(
+            "tell application \"Terminal\" to do script \"{}\"",
+            apple_script_string(&shell)
+        );
+        let output = Command::new("/usr/bin/osascript")
+            .args([
+                "-e",
+                &script,
+                "-e",
+                "tell application \"Terminal\" to activate",
+            ])
+            .output()
+            .map_err(|error| format!("open Terminal: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Terminal could not resume the Codex thread: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (thread_id, project_root, codex_home, before_launch);
+        Err("Open in Terminal is currently supported only on macOS".to_string())
+    }
+}
+
+fn launch_codex_app(
+    thread_id: &str,
+    codex_home: &Path,
+    before_launch: impl FnOnce(&str),
+) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let command = codex_app_command(thread_id, codex_home)?;
+        before_launch(&command);
+        let environment = format!("CODEX_HOME={}", codex_home.to_string_lossy());
+        let uri = format!("codex://threads/{thread_id}");
+        let output = Command::new("/usr/bin/open")
+            .args([
+                "-n",
+                "-a",
+                "/Applications/ChatGPT.app",
+                "--env",
+                &environment,
+                &uri,
+            ])
+            .output()
+            .map_err(|error| format!("open the Codex desktop app: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "Codex desktop app could not open the thread: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (thread_id, codex_home, before_launch);
+        Err("Open in Codex is currently supported only on macOS".to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn resolve_codex_cli() -> Result<PathBuf, String> {
+    // GUI applications inherit launchd's sparse PATH. A login shell sees the
+    // same Homebrew/npm/user configuration as the Terminal window we open.
+    let output = Command::new("/bin/zsh")
+        .args(["-lc", "command -v codex"])
+        .output()
+        .map_err(|error| format!("check for Codex CLI in the login shell: {error}"))?;
+    if !output.status.success() {
+        return Err(
+            "Codex CLI is unavailable in the login shell; install it or use Open in Codex"
+                .to_string(),
+        );
+    }
+    let value = String::from_utf8_lossy(&output.stdout);
+    let path = PathBuf::from(value.lines().next().unwrap_or_default().trim());
+    if !path.is_absolute() {
+        return Err("Codex CLI did not resolve to an absolute executable path".to_string());
+    }
+    let resolved = fs::canonicalize(&path)
+        .map_err(|error| format!("resolve Codex CLI '{}': {error}", path.display()))?;
+    if !resolved.is_file() {
+        return Err(format!(
+            "Codex CLI '{}' is not an executable file",
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+fn terminal_resume_command(
+    codex_cli: &Path,
+    thread_id: &str,
+    project_root: &Path,
+    codex_home: &Path,
+) -> Result<String, String> {
+    validate_thread_uuid(thread_id)?;
+    if !codex_cli.is_absolute() || !project_root.is_absolute() || !codex_home.is_absolute() {
+        return Err("Codex CLI, project root, and Codex home must be absolute".to_string());
+    }
+    Ok(format!(
+        "CODEX_HOME={} {} resume {} -C {}",
+        shell_quote(&codex_home.to_string_lossy()),
+        shell_quote(&codex_cli.to_string_lossy()),
+        shell_quote(thread_id),
+        shell_quote(&project_root.to_string_lossy())
+    ))
+}
+
+fn codex_app_command(thread_id: &str, codex_home: &Path) -> Result<String, String> {
+    validate_thread_uuid(thread_id)?;
+    if !codex_home.is_absolute() {
+        return Err("Codex home must be absolute".to_string());
+    }
+    Ok(format!(
+        "'/usr/bin/open' -n -a '/Applications/ChatGPT.app' --env {} {}",
+        shell_quote(&format!("CODEX_HOME={}", codex_home.to_string_lossy())),
+        shell_quote(&format!("codex://threads/{thread_id}"))
+    ))
+}
+
+fn validate_thread_uuid(value: &str) -> Result<(), String> {
+    let bytes = value.as_bytes();
+    let valid = bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => *byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        });
+    valid
+        .then_some(())
+        .ok_or_else(|| "Codex thread id must be a UUID".to_string())
+}
+
+fn validate_sha(value: &str) -> Result<(), String> {
+    ((value.len() == 40 || value.len() == 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then_some(())
+        .ok_or_else(|| "commit cursor must be a full hexadecimal Git object id".to_string())
+}
+
+fn cwd_belongs_to_project(cwd: &Path, project_root: &Path) -> bool {
+    if !cwd.is_absolute()
+        || cwd
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return false;
+    }
+    let resolved = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    resolved == project_root || resolved.starts_with(project_root)
+}
+
+fn value_alias<'a>(value: &'a Value, names: &[&str]) -> Option<&'a Value> {
+    names.iter().find_map(|name| value.get(*name))
+}
+
+fn string_alias<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
+    value_alias(value, names).and_then(Value::as_str)
+}
+
+fn parse_timestamp_value(value: &Value) -> Option<u64> {
+    if let Some(number) = value.as_u64() {
+        return Some(if number > 10_000_000_000 {
+            number / 1000
+        } else {
+            number
+        });
+    }
+    if let Some(number) = value.as_i64() {
+        return (number >= 0).then_some(number as u64).map(|value| {
+            if value > 10_000_000_000 {
+                value / 1000
+            } else {
+                value
+            }
+        });
+    }
+    value.as_str().and_then(parse_rfc3339)
+}
+
+fn parse_rfc3339(value: &str) -> Option<u64> {
+    let (date, rest) = value.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse::<i64>().ok()?;
+    let month = date_parts.next()?.parse::<u32>().ok()?;
+    let day = date_parts.next()?.parse::<u32>().ok()?;
+    let zone_index = rest
+        .char_indices()
+        .skip(1)
+        .find(|(_, character)| matches!(character, 'Z' | '+' | '-'))
+        .map(|(index, _)| index)?;
+    let (clock, zone) = rest.split_at(zone_index);
+    let mut clock_parts = clock.split(':');
+    let hour = clock_parts.next()?.parse::<u32>().ok()?;
+    let minute = clock_parts.next()?.parse::<u32>().ok()?;
+    let second = clock_parts.next()?.split('.').next()?.parse::<u32>().ok()?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 60
+    {
+        return None;
+    }
+    let offset = if zone == "Z" {
+        0i64
+    } else {
+        let sign = if zone.starts_with('+') {
+            1
+        } else if zone.starts_with('-') {
+            -1
+        } else {
+            return None;
+        };
+        let mut parts = zone[1..].split(':');
+        let hours = parts.next()?.parse::<i64>().ok()?;
+        let minutes = parts.next()?.parse::<i64>().ok()?;
+        if hours > 23 || minutes > 59 {
+            return None;
+        }
+        sign * (hours * 3600 + minutes * 60)
+    };
+    let days = days_from_civil(year, month, day);
+    let seconds = days
+        .checked_mul(86_400)?
+        .checked_add(i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second))?
+        .checked_sub(offset)?;
+    (seconds >= 0).then_some(seconds as u64)
+}
+
+// Howard Hinnant's proleptic Gregorian conversion, offset to Unix epoch.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let adjusted_year = year - i64::from(month <= 2);
+    let era = if adjusted_year >= 0 {
+        adjusted_year
+    } else {
+        adjusted_year - 399
+    } / 400;
+    let year_of_era = adjusted_year - era * 400;
+    let month_prime = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn normalize_summary(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn truncate_chars(value: &str, limit: usize) -> String {
+    if value.chars().count() <= limit {
+        return value.to_string();
+    }
+    let mut result = value
+        .chars()
+        .take(limit.saturating_sub(1))
+        .collect::<String>();
+    result.push('…');
+    result
+}
+
+fn short_id(value: &str) -> &str {
+    value.get(..8).unwrap_or(value)
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(target_os = "macos")]
+fn apple_script_string(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn modified_secs(metadata: &fs::Metadata) -> Option<u64> {
+    metadata
+        .modified()
+        .ok()?
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_secs())
+}
+
+fn modified_nanos(metadata: &fs::Metadata) -> Option<u64> {
+    let duration = metadata.modified().ok()?.duration_since(UNIX_EPOCH).ok()?;
+    u64::try_from(duration.as_nanos()).ok()
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+fn session_mtime_is_active(now: u64, modified: u64) -> bool {
+    modified <= now.saturating_add(ACTIVE_WINDOW_SECS)
+        && now.saturating_sub(modified) <= ACTIVE_WINDOW_SECS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use std::fs;
+    use std::io::{BufWriter, Write};
+    use std::path::Path;
+    use std::process::Command;
+
+    fn commit(sha: &str, time: u64) -> GitCommitSummary {
+        GitCommitSummary {
+            sha: sha.repeat(40 / sha.len()),
+            short_sha: sha.repeat(12 / sha.len()),
+            committed_at: time,
+            subject: format!("commit {time}"),
+            thread_refs: Vec::new(),
+        }
+    }
+
+    fn thread(id: &str, start: u64, end: u64) -> CodexThreadSummary {
+        CodexThreadSummary {
+            thread_id: id.to_string(),
+            title: id.to_string(),
+            summary: String::new(),
+            started_at: start,
+            ended_at: end,
+            branch: Some("main".to_string()),
+            recorded_sha: None,
+            is_active: false,
+            user_round_count: 0,
+            agent_message_count: 0,
+            tool_call_count: 0,
+            total_tokens: None,
+            metrics_complete: true,
+            commit_occurrence_count: 0,
+        }
+    }
+
+    #[test]
+    fn mapping_attaches_all_inclusive_commits_and_counts_unique_threads() {
+        let mut commits = vec![commit("a", 100), commit("b", 150), commit("c", 200)];
+        let threads = vec![thread("one", 100, 200), thread("two", 150, 150)];
+        let result = map_threads_to_commits(&threads, &mut commits, "main");
+
+        assert_eq!(result.unmapped, Vec::<UnmappedThreadReference>::new());
+        assert_eq!(result.unique_thread_count, 2);
+        assert_eq!(result.reference_count, 4);
+        assert_eq!(commits[1].thread_refs.len(), 2);
+    }
+
+    #[test]
+    fn mapping_uses_first_subsequent_commit_only_within_24_hours() {
+        let mut commits = vec![commit("a", 86_500), commit("b", 86_501)];
+        let near = thread("near", 1, 100);
+        let far = thread("far", 0, 99);
+        let result = map_threads_to_commits(&[near, far], &mut commits, "main");
+
+        assert_eq!(commits[0].thread_refs.len(), 1);
+        assert_eq!(commits[0].thread_refs[0].thread_id, "near");
+        assert_eq!(result.unmapped[0].thread_id, "far");
+    }
+
+    #[test]
+    fn mapping_does_not_use_recorded_sha_as_an_attachment_rule() {
+        let mut base = thread("recorded", 1, 2);
+        base.recorded_sha = Some("a".repeat(40));
+        base.branch = Some("main".to_string());
+        let mut commits = vec![commit("a", 200_000)];
+        let result = map_threads_to_commits(&[base], &mut commits, "main");
+
+        assert_eq!(result.unmapped.len(), 1);
+        assert!(commits[0].thread_refs.is_empty());
+    }
+
+    #[test]
+    fn mapping_never_attaches_a_named_thread_to_another_branch() {
+        let mut other = thread("feature-thread", 1, 300);
+        other.branch = Some("feature/a".to_string());
+        let mut unknown = thread("legacy-thread", 1, 300);
+        unknown.branch = None;
+        let mut commits = vec![commit("a", 200)];
+
+        let result = map_threads_to_commits(&[other, unknown], &mut commits, "main");
+
+        assert_eq!(commits[0].thread_refs.len(), 1);
+        assert_eq!(commits[0].thread_refs[0].thread_id, "legacy-thread");
+        assert_eq!(result.unique_thread_count, 1);
+        assert!(result.unmapped.is_empty());
+    }
+
+    #[test]
+    fn rollout_parsing_accepts_metadata_aliases_and_first_user_message() {
+        let lines = vec![
+            json!({"timestamp":"2026-07-18T16:20:00Z","type":"session_meta","payload":{"id":"019f742a-a206-7932-876c-9db8d8ce575a","cwd":"/tmp/project","git":{"branch":"feature/x","commit_hash":"abc"}}}).to_string(),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"  Build   the history page please  "}]}}).to_string(),
+        ];
+        let parsed = parse_rollout_lines(lines.iter().map(String::as_str), 123).unwrap();
+
+        assert_eq!(
+            parsed.thread.thread_id,
+            "019f742a-a206-7932-876c-9db8d8ce575a"
+        );
+        assert_eq!(parsed.cwd, Path::new("/tmp/project"));
+        assert_eq!(parsed.thread.branch.as_deref(), Some("feature/x"));
+        assert_eq!(parsed.thread.recorded_sha.as_deref(), Some("abc"));
+        assert_eq!(parsed.thread.summary, "Build the history page please");
+        assert_eq!(parsed.thread.started_at, 1_784_391_600);
+    }
+
+    #[test]
+    fn rollout_stream_reads_past_256_records_and_uses_first_and_last_timestamps() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollout.jsonl");
+        let mut body = String::new();
+        body.push_str(&format!(
+            "{}\n",
+            json!({"timestamp":"2026-07-18T16:20:00Z","type":"session_meta","payload":{"id":"019f742a-a206-7932-876c-9db8d8ce575a","cwd":"/tmp/project","git":{"branch":"main"}}})
+        ));
+        body.push_str(&format!(
+            "{}\n",
+            json!({"timestamp":"2026-07-18T16:21:00Z","type":"event_msg","payload":{"type":"user_message","message":"Real user request"}})
+        ));
+        for index in 0..300 {
+            body.push_str(&format!(
+                "{}\n",
+                json!({"timestamp":1_784_391_700u64 + index,"type":"event_msg","payload":{"type":"agent_reasoning","text":"internal"}})
+            ));
+        }
+        body.push_str(&format!(
+            "{}\n",
+            json!({"timestamp":"2026-07-18T17:20:00Z","type":"event_msg","payload":{"type":"agent_message","message":"Visible response","phase":"final"}})
+        ));
+        fs::write(&path, body).unwrap();
+
+        let mut warnings = Vec::new();
+        let parsed = parse_rollout_file(&path, 123, &mut warnings).unwrap();
+
+        assert_eq!(parsed.thread.started_at, 1_784_391_600);
+        assert_eq!(parsed.thread.ended_at, 1_784_395_200);
+        assert_eq!(parsed.thread.summary, "Real user request");
+        assert_eq!(parsed.thread.user_round_count, 1);
+        assert_eq!(parsed.thread.agent_message_count, 1);
+        assert!(parsed.thread.metrics_complete);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn rollout_larger_than_16_mib_is_fully_streamed() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("large-rollout.jsonl");
+        let mut writer = BufWriter::new(File::create(&path).unwrap());
+        writeln!(writer, "{}", json!({"timestamp":100,"type":"session_meta","payload":{"id":"019f742a-a206-7932-876c-9db8d8ce575a","cwd":"/tmp/project"}})).unwrap();
+        let padding = "x".repeat(900);
+        for timestamp in 101..19_000 {
+            writeln!(writer, "{}", json!({"timestamp":timestamp,"type":"event_msg","payload":{"type":"agent_reasoning","text":padding}})).unwrap();
+        }
+        writeln!(writer, "{}", json!({"timestamp":20_000,"type":"event_msg","payload":{"type":"agent_message","message":"visible final response"}})).unwrap();
+        writer.flush().unwrap();
+        assert!(fs::metadata(&path).unwrap().len() > 16 * 1024 * 1024);
+
+        let mut warnings = Vec::new();
+        let parsed = parse_rollout_file(&path, 1, &mut warnings).unwrap();
+        assert_eq!(parsed.thread.started_at, 100);
+        assert_eq!(parsed.thread.ended_at, 20_000);
+        assert_eq!(parsed.thread.agent_message_count, 1);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn session_windows_are_start_inclusive_and_end_exclusive() {
+        assert!(thread_in_window(&thread("start", 1, 100), 100, 200));
+        assert!(thread_in_window(&thread("inside", 1, 199), 100, 200));
+        assert!(!thread_in_window(&thread("end", 1, 200), 100, 200));
+        assert!(!thread_in_window(&thread("older", 1, 99), 100, 200));
+    }
+
+    #[test]
+    fn metadata_cache_excludes_chat_text_and_invalidates_changed_files() {
+        let parsed = parse_rollout_lines(
+            [
+                r#"{"timestamp":100,"type":"session_meta","payload":{"id":"019f742a-a206-7932-876c-9db8d8ce575a","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":101,"type":"event_msg","payload":{"type":"user_message","message":"private prompt text"}}"#,
+            ],
+            99,
+        )
+        .unwrap();
+        let cached = RolloutCacheEntry {
+            size: 200,
+            modified_nanos: 300,
+            parsed: cache_safe_rollout(parsed),
+        };
+
+        assert!(cached.parsed.thread.title.is_empty());
+        assert!(cached.parsed.thread.summary.is_empty());
+        assert!(cached_rollout(&cached, 200, 300, true).is_some());
+        assert!(cached_rollout(&cached, 201, 300, true).is_none());
+        assert!(cached_rollout(&cached, 200, 301, true).is_none());
+        assert!(cached_rollout(&cached, 200, 300, false).is_none());
+    }
+
+    #[test]
+    fn metadata_cache_uses_private_bounded_atomic_persistence() {
+        let temp = tempfile::tempdir().unwrap();
+        let repository = V3Repository::from_home_dir(temp.path().join("home")).unwrap();
+        let path = repository.root().join("chat_history_cache.json");
+        let mut warnings = Vec::new();
+        save_chat_history_cache(
+            repository.root(),
+            &path,
+            &ChatHistoryCache::default(),
+            &mut warnings,
+        );
+        assert!(warnings.is_empty());
+        assert_eq!(
+            load_chat_history_cache(repository.root(), &path, &mut warnings).schema,
+            CHAT_CACHE_SCHEMA
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+            assert_eq!(
+                fs::metadata(repository.root())
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_rollouts_prefer_complete_then_latest_metadata_and_details() {
+        let complete = parse_rollout_lines(
+            [
+                r#"{"timestamp":100,"type":"session_meta","payload":{"id":"019f742a-a206-7932-876c-9db8d8ce575a","cwd":"/tmp/project"}}"#,
+                r#"{"timestamp":200,"type":"event_msg","payload":{"type":"agent_message","message":"complete"}}"#,
+            ],
+            1,
+        )
+        .unwrap();
+        let partial = parse_rollout_lines(
+            [
+                r#"{"timestamp":100,"type":"session_meta","payload":{"id":"019f742a-a206-7932-876c-9db8d8ce575a","cwd":"/tmp/project"}}"#,
+                "malformed",
+                r#"{"timestamp":300,"type":"event_msg","payload":{"type":"agent_message","message":"newer but partial"}}"#,
+            ],
+            1,
+        )
+        .unwrap();
+        assert!(rollout_is_preferred(&complete, &partial));
+        assert!(!rollout_is_preferred(&partial, &complete));
+    }
+
+    #[test]
+    fn rollout_metrics_ignore_injected_user_roles_and_use_reported_token_maximum() {
+        let lines = vec![
+            json!({"timestamp":100,"type":"session_meta","payload":{"id":"019f742a-a206-7932-876c-9db8d8ce575a","cwd":"/tmp/project"}}).to_string(),
+            json!({"timestamp":101,"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<recommended_plugins>not a user turn</recommended_plugins>"}]}}).to_string(),
+            json!({"timestamp":101,"type":"event_msg","payload":{"type":"user_message","message":"<environment_context>also injected</environment_context>"}}).to_string(),
+            json!({"timestamp":102,"type":"event_msg","payload":{"type":"user_message","message":"Actual prompt"}}).to_string(),
+            json!({"timestamp":103,"type":"event_msg","payload":{"type":"agent_message","message":"Answer","phase":"final"}}).to_string(),
+            json!({"timestamp":104,"type":"response_item","payload":{"type":"function_call","name":"exec_command"}}).to_string(),
+            json!({"timestamp":105,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":1200}}}}).to_string(),
+            json!({"timestamp":106,"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":900}}}}).to_string(),
+        ];
+        let parsed = parse_rollout_lines(lines.iter().map(String::as_str), 999).unwrap();
+
+        assert_eq!(parsed.thread.summary, "Actual prompt");
+        assert_eq!(parsed.thread.user_round_count, 1);
+        assert_eq!(parsed.thread.agent_message_count, 1);
+        assert_eq!(parsed.thread.tool_call_count, 1);
+        assert_eq!(parsed.thread.total_tokens, Some(1200));
+        assert_eq!(parsed.thread.started_at, 100);
+        assert_eq!(parsed.thread.ended_at, 106);
+    }
+
+    #[test]
+    fn chat_detail_pages_only_visible_user_and_agent_messages() {
+        let lines = vec![
+            json!({"timestamp":100,"type":"event_msg","payload":{"type":"user_message","message":"First user message"}}).to_string(),
+            json!({"timestamp":101,"type":"event_msg","payload":{"type":"agent_reasoning","text":"hidden"}}).to_string(),
+            json!({"timestamp":102,"type":"event_msg","payload":{"type":"agent_message","message":"First agent answer","phase":"final"}}).to_string(),
+            json!({"timestamp":103,"type":"event_msg","payload":{"type":"user_message","message":"Second user message"}}).to_string(),
+        ];
+
+        let page = parse_thread_detail_lines(lines.iter().map(String::as_str), None, 2);
+        assert_eq!(page.turns.len(), 2);
+        assert_eq!(page.turns[0].role, ChatTurnRole::User);
+        assert_eq!(page.turns[1].role, ChatTurnRole::Assistant);
+        assert_eq!(page.next_cursor, Some(2));
+    }
+
+    #[test]
+    fn chat_details_include_assistant_response_items_without_duplicate_event_copies() {
+        let lines = vec![
+            json!({"timestamp":100,"type":"event_msg","payload":{"type":"agent_message","message":"Same answer"}}).to_string(),
+            json!({"timestamp":100,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Same answer"}]}}).to_string(),
+            json!({"timestamp":101,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Response-only answer"}]}}).to_string(),
+            json!({"timestamp":102,"type":"event_msg","payload":{"type":"user_message","message":"<permissions instructions>injected</permissions instructions>"}}).to_string(),
+        ];
+
+        let page = parse_thread_detail_lines(lines.iter().map(String::as_str), None, 50);
+        assert_eq!(page.turns.len(), 2);
+        assert_eq!(page.turns[0].preview, "Same answer");
+        assert_eq!(page.turns[1].preview, "Response-only answer");
+        assert!(page
+            .turns
+            .iter()
+            .all(|turn| turn.role == ChatTurnRole::Assistant));
+    }
+
+    #[test]
+    fn malformed_metrics_do_not_override_valid_rollout_endpoints_with_index_time() {
+        let lines = vec![
+            json!({"timestamp":100,"type":"session_meta","payload":{"id":"019f742a-a206-7932-876c-9db8d8ce575a","cwd":"/tmp/project"}}).to_string(),
+            "malformed".to_string(),
+            json!({"timestamp":200,"type":"event_msg","payload":{"type":"agent_message","message":"done"}}).to_string(),
+        ];
+        let parsed = parse_rollout_lines(lines.iter().map(String::as_str), 999).unwrap();
+        assert!(!parsed.thread.metrics_complete);
+        assert!(parsed.has_record_endpoints);
+        let mut thread = parsed.thread;
+        apply_index_metadata(
+            &mut thread,
+            true,
+            &SessionIndexEntry {
+                title: None,
+                updated_at: Some(10_000),
+            },
+        );
+        assert_eq!(thread.ended_at, 200);
+    }
+
+    #[test]
+    fn bounded_line_reader_discards_oversized_unterminated_content() {
+        let mut input = std::io::Cursor::new(format!("{}\n{{}}\n", "x".repeat(200)));
+        let mut output = Vec::new();
+        assert_eq!(
+            read_bounded_line(&mut input, &mut output, 32).unwrap(),
+            BoundedLine::Oversized
+        );
+        assert!(output.capacity() <= 32);
+        assert_eq!(
+            read_bounded_line(&mut input, &mut output, 32).unwrap(),
+            BoundedLine::Line
+        );
+        assert_eq!(output, b"{}");
+    }
+
+    #[test]
+    fn rollout_uses_mtime_fallback_and_truncates_unicode_summary() {
+        let long_message = "界".repeat(MAX_SUMMARY_CHARS + 20);
+        let lines = vec![
+            json!({"type":"session_meta","payload":{"session_id":"019f742a-a206-7932-876c-9db8d8ce575a","working_directory":"/tmp/project"}}).to_string(),
+            json!({"payload":{"role":"user","content":long_message}}).to_string(),
+        ];
+        let parsed = parse_rollout_lines(lines.iter().map(String::as_str), 456).unwrap();
+
+        assert_eq!(parsed.thread.started_at, 456);
+        assert_eq!(parsed.thread.ended_at, 456);
+        assert_eq!(parsed.thread.summary.chars().count(), MAX_SUMMARY_CHARS);
+        assert!(parsed.thread.summary.ends_with('…'));
+    }
+
+    #[test]
+    fn index_title_and_time_override_rollout_fallbacks() {
+        let index = parse_session_index_lines([
+            r#"{"id":"019f742a-a206-7932-876c-9db8d8ce575a","thread_name":"First","updated_at":100}"#,
+            r#"{"thread_id":"019f742a-a206-7932-876c-9db8d8ce575a","title":"Renamed","updatedAt":"2026-07-18T16:20:00Z"}"#,
+        ]);
+        let item = index.get("019f742a-a206-7932-876c-9db8d8ce575a").unwrap();
+        assert_eq!(item.title.as_deref(), Some("Renamed"));
+        assert_eq!(item.updated_at, Some(1_784_391_600));
+
+        let long_title = "界".repeat(MAX_SUMMARY_CHARS + 20);
+        let line = json!({"id":"thread-long","title":long_title}).to_string();
+        let truncated = parse_session_index_lines([line.as_str()]);
+        let title = truncated["thread-long"].title.as_deref().unwrap();
+        assert_eq!(title.chars().count(), MAX_SUMMARY_CHARS);
+        assert!(title.ends_with('…'));
+    }
+
+    #[test]
+    fn oversized_or_malformed_lines_become_partial_warnings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session_index.jsonl");
+        fs::write(
+            &path,
+            format!("not json\n{{\"id\":\"{}\"}}\n", "x".repeat(MAX_LINE_BYTES)),
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let index = read_session_index(&path, &mut warnings).unwrap();
+        assert!(index.is_empty());
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn ownership_uses_canonical_path_boundaries() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let child = project.join("packages/app");
+        let sibling = temp.path().join("project-copy");
+        fs::create_dir_all(&child).unwrap();
+        fs::create_dir_all(&sibling).unwrap();
+        let canonical = fs::canonicalize(&project).unwrap();
+
+        assert!(cwd_belongs_to_project(&child, &canonical));
+        assert!(!cwd_belongs_to_project(&sibling, &canonical));
+        assert!(!cwd_belongs_to_project(Path::new("../project"), &canonical));
+    }
+
+    #[test]
+    fn git_history_is_first_parent_and_cursor_is_validated() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init", "-b", "main"]);
+        git(root, &["config", "user.name", "Test"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        for (name, value) in [("first", "1"), ("second", "2"), ("third", "3")] {
+            fs::write(root.join("file"), value).unwrap();
+            git(root, &["add", "file"]);
+            git(root, &["commit", "-m", name]);
+        }
+        let discovery = discover_git_history(root, None, None, 2).unwrap().unwrap();
+        assert_eq!(discovery.commits.len(), 2);
+        assert!(discovery.next_cursor.is_some());
+        let next = discover_git_history(root, Some("main"), discovery.next_cursor.as_deref(), 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.commits.len(), 1);
+        assert!(discover_git_history(root, Some("main; touch /tmp/nope"), None, 2).is_err());
+        assert!(discover_git_history(root, Some("main"), Some("not-a-sha"), 2).is_err());
+    }
+
+    #[test]
+    fn recorded_deleted_branch_remains_selectable_but_unavailable() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init", "-b", "main"]);
+        git(root, &["config", "user.name", "Test"]);
+        git(root, &["config", "user.email", "test@example.com"]);
+        fs::write(root.join("file"), "one").unwrap();
+        git(root, &["add", "file"]);
+        git(root, &["commit", "-m", "first"]);
+        let recorded = BTreeSet::from(["deleted/history".to_string()]);
+
+        let discovery = discover_git_history_with_recorded_branches(
+            root,
+            Some("deleted/history"),
+            None,
+            50,
+            &recorded,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(!discovery.selected_available);
+        assert!(discovery.commits.is_empty());
+        assert_eq!(
+            discovery
+                .branches
+                .iter()
+                .find(|branch| branch.name == "deleted/history")
+                .map(|branch| branch.available),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn active_session_detection_rejects_large_clock_skew() {
+        assert!(session_mtime_is_active(1_000, 900));
+        assert!(session_mtime_is_active(1_000, 1_100));
+        assert!(!session_mtime_is_active(1_000, 699));
+        assert!(!session_mtime_is_active(1_000, 1_301));
+    }
+
+    #[test]
+    fn terminal_command_is_shell_safe_and_uuid_is_strict() {
+        let id = "019f742a-a206-7932-876c-9db8d8ce575a";
+        let command = terminal_resume_command(
+            Path::new("/opt/homebrew/bin/codex"),
+            id,
+            Path::new("/tmp/client's project"),
+            Path::new("/tmp/client's config/.codex"),
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            "CODEX_HOME='/tmp/client'\"'\"'s config/.codex' '/opt/homebrew/bin/codex' resume '019f742a-a206-7932-876c-9db8d8ce575a' -C '/tmp/client'\"'\"'s project'"
+        );
+        assert!(terminal_resume_command(
+            Path::new("/opt/homebrew/bin/codex"),
+            "bad; open -a Calculator",
+            Path::new("/tmp/p"),
+            Path::new("/tmp/.codex"),
+        )
+        .is_err());
+        assert!(terminal_resume_command(
+            Path::new("codex"),
+            id,
+            Path::new("/tmp/p"),
+            Path::new("/tmp/.codex"),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn app_command_pins_codex_home_and_selected_thread() {
+        let command = codex_app_command(
+            "019f742a-a206-7932-876c-9db8d8ce575a",
+            Path::new("/tmp/client's config/.codex"),
+        )
+        .unwrap();
+        assert_eq!(
+            command,
+            "'/usr/bin/open' -n -a '/Applications/ChatGPT.app' --env 'CODEX_HOME=/tmp/client'\"'\"'s config/.codex' 'codex://threads/019f742a-a206-7932-876c-9db8d8ce575a'"
+        );
+    }
+
+    fn git(root: &Path, args: &[&str]) {
+        let result = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+}

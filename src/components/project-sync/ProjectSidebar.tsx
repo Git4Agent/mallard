@@ -1,5 +1,6 @@
 import type { LocalProjectSummary, SetupDraftSummary, StorageConfigV3 } from "../../types";
 import Icon from "../Icons";
+import { projectLabel } from "./model";
 
 interface Props {
   projects: LocalProjectSummary[];
@@ -148,7 +149,7 @@ export default function ProjectSidebar({
             </button>
           ) : projects.map((project) => {
             const profileRequired = Object.keys(project.profile_ids ?? {}).length === 0;
-            const label = project.local_alias?.trim() || project.display_name;
+            const label = projectLabel(project);
             const aliased = label !== project.display_name;
             return (
               <div
@@ -166,6 +167,13 @@ export default function ProjectSidebar({
                 >
                   <Icon name="folder" size={15} />
                   <span>{label}</span>
+                  {project.is_git_repository != null && (
+                    <span className={`v3-repository-kind${project.is_git_repository ? " git" : " folder"}`}
+                      title={project.is_git_repository ? "Git based project" : "Non-Git based project"}>
+                      {project.is_git_repository ? <Icon name="git-branch" size={10} /> : <Icon name="folder" size={10} />}
+                      {project.is_git_repository ? "Git Based" : "Non-Git Based"}
+                    </span>
+                  )}
                   {profileRequired && <Icon name="alert-triangle" size={12} className="v3-sidebar-profile-warning" />}
                 </button>
                 <div className="sidebar-profile-actions">

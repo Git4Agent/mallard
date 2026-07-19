@@ -7,21 +7,29 @@ import { build } from "esbuild";
 
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputDirectory = await mkdtemp(join(tmpdir(), "agent-sync-frontend-tests-"));
-const outputFile = join(outputDirectory, "pull-review.integration.test.cjs");
+const entries = [
+  "tests/frontend/pull-review.integration.test.tsx",
+  "tests/frontend/project-chat-history.integration.test.tsx",
+];
 
 try {
-  await build({
-    absWorkingDir: projectRoot,
-    entryPoints: ["tests/frontend/pull-review.integration.test.tsx"],
-    outfile: outputFile,
-    bundle: true,
-    platform: "node",
-    format: "cjs",
-    target: "node20",
-    define: { "process.env.NODE_ENV": '"test"' },
-    logLevel: "warning",
-  });
-  const result = spawnSync(process.execPath, ["--test", outputFile], {
+  const outputs = [];
+  for (const entry of entries) {
+    const outputFile = join(outputDirectory, `${entry.split("/").at(-1).replace(/\.tsx$/, "")}.cjs`);
+    await build({
+      absWorkingDir: projectRoot,
+      entryPoints: [entry],
+      outfile: outputFile,
+      bundle: true,
+      platform: "node",
+      format: "cjs",
+      target: "node20",
+      define: { "process.env.NODE_ENV": '"test"' },
+      logLevel: "warning",
+    });
+    outputs.push(outputFile);
+  }
+  const result = spawnSync(process.execPath, ["--test", ...outputs], {
     cwd: projectRoot,
     stdio: "inherit",
   });

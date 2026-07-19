@@ -120,6 +120,7 @@ function defaultProfileIds(): Partial<Record<ProjectProvider, string>> {
 export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Props) {
   const [config, setConfig] = useState<SyncConfigV3>(EMPTY_CONFIG);
   const [registrations, setRegistrations] = useState<LocalProjectRegistration[]>([]);
+  const [repositoryKinds, setRepositoryKinds] = useState<Record<string, boolean>>({});
   const [bindings, setBindings] = useState<ProjectBinding[]>([]);
   const [profiles, setProfiles] = useState<ProviderProfileSummary[]>([]);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
@@ -165,6 +166,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const [restoreProjectName, setRestoreProjectName] = useState("project");
   const [dependencyPlan, setDependencyPlan] = useState<DependencyPlan | null>(null);
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
+  const [historyRefreshEpoch, setHistoryRefreshEpoch] = useState(0);
   const [dependencyResult, setDependencyResult] = useState<DependencyResult | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
   const restoreRequest = useRef(0);
@@ -295,8 +297,9 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       selected_resource_count: Object.keys(registration.recipe.entries).length,
       linked_storage_ids: links.map((link) => link.storage_id),
       readiness_state: active ? readiness?.state : undefined,
+      is_git_repository: repositoryKinds[registration.local_project_id],
     };
-  }), [activeProjectId, bindings, config.links, readiness?.state, registrations, resources]);
+  }), [activeProjectId, bindings, config.links, readiness?.state, registrations, repositoryKinds, resources]);
 
   const activeSummary = projects.find((candidate) => candidate.local_project_id === activeProjectId) ?? null;
   const pendingConnectionProject = pendingBundleConnection
@@ -347,6 +350,12 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       setRegistrations([]);
     }
     await refreshSetupDrafts();
+    try {
+      setRepositoryKinds(await projectSyncApi.listProjectRepositoryKinds());
+    } catch (reason) {
+      failures.push(`Repository types: ${errorMessage(reason)}`);
+      setRepositoryKinds({});
+    }
     try {
       nextProfiles = await projectSyncApi.listProviderProfiles();
       setProfiles(nextProfiles);
@@ -649,6 +658,14 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     }
   };
 
+  const refreshRepositoryKinds = async () => {
+    try {
+      setRepositoryKinds(await projectSyncApi.listProjectRepositoryKinds());
+    } catch {
+      setRepositoryKinds({});
+    }
+  };
+
   const saveRemap = async (nextBinding: ProjectBindingDraft) => {
     if (!activeProjectId) return;
     setBusy(true);
@@ -663,6 +680,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       setEditingBinding(null);
       setBindings((current) => upsertBinding(current, saved));
       setDetail((current) => current ? { ...current, binding: saved } : current);
+      await refreshRepositoryKinds();
       setNotice("Machine binding updated. Cloud identity and logical paths were unchanged.");
       await loadProjectData(activeProjectId, config, activeStorageId);
     } catch (reason) {
@@ -709,6 +727,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         expected_revision: nextDetail.binding.revision,
       });
       setBindings((current) => upsertBinding(current, saved));
+      await refreshRepositoryKinds();
       setProfiles(await projectSyncApi.listProviderProfiles());
       if (activeProjectId === projectId) {
         setDetail((current) => current ? { ...current, binding: saved } : current);
@@ -743,6 +762,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         expected_revision: nextDetail.binding.revision,
       });
       setBindings((current) => upsertBinding(current, saved));
+      await refreshRepositoryKinds();
       if (activeProjectId === projectId) {
         setDetail((current) => current ? { ...current, binding: saved } : current);
         await loadProjectData(projectId, config, activeStorageByProject[projectId]);
@@ -990,6 +1010,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     try {
       const result = await projectSyncApi.applyRestore(restorePlan.plan_id, actionIds);
       setRestoreResult(result);
+      if (result.success) setHistoryRefreshEpoch((epoch) => epoch + 1);
       setReadiness(await projectSyncApi.getReadiness(restorePlan.bundle_id, restoreBinding));
       if (activeProjectId) await loadProjectData(activeProjectId, config, activeStorageId);
     } catch (reason) {
@@ -1249,6 +1270,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
             onStorageEditorRequestHandled={() => setStorageEditorRequest(null)}
             projectEditorRequest={projectEditorRequest}
             onProjectEditorRequestHandled={() => setProjectEditorRequest(null)}
+            historyRefreshEpoch={historyRefreshEpoch}
             newProjectSetup={setupDraftId ? (
               <ProjectSetupWorkspace
                 key={setupDraftId}

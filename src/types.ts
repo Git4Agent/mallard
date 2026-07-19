@@ -378,6 +378,8 @@ export interface LocalProjectRegistration {
     manifest_sha256: string;
     recipe_revision: number;
     binding_revision?: number | null;
+    last_pull_at?: number | null;
+    last_push_at?: number | null;
   }>;
   revision: number;
   created_at: number;
@@ -418,6 +420,7 @@ export interface LocalProjectSummary {
   selected_resource_count?: number;
   linked_storage_ids?: string[];
   readiness_state?: "ready" | "needs_setup" | "blocked" | string;
+  is_git_repository?: boolean;
 }
 
 export interface ApplyReceipt {
@@ -782,4 +785,88 @@ export interface BundleReadiness {
   state: "ready" | "needs_setup" | "blocked" | string;
   issues: BundleReadinessIssue[];
   generated_at?: number;
+}
+
+export interface CodexThreadSummary {
+  thread_id: string;
+  title: string;
+  summary: string;
+  started_at: number;
+  ended_at: number;
+  branch?: string | null;
+  recorded_sha?: string | null;
+  is_active?: boolean;
+  user_round_count: number;
+  agent_message_count: number;
+  tool_call_count: number;
+  total_tokens?: number | null;
+  metrics_complete: boolean;
+  commit_occurrence_count: number;
+}
+
+export interface CommitThreadReference {
+  thread_id: string;
+}
+
+export type ChatTurnRole = "user" | "assistant";
+
+export interface ChatTurnPreview {
+  ordinal: number;
+  role: ChatTurnRole;
+  timestamp?: number | null;
+  preview: string;
+}
+
+export interface CodexThreadDetailsPage {
+  thread_id: string;
+  turns: ChatTurnPreview[];
+  next_cursor?: number | null;
+}
+
+export interface StorageSyncSummary {
+  storage_id: string;
+  storage_name: string;
+  last_pull_at?: number | null;
+  last_push_at?: number | null;
+}
+
+export interface GitCommitSummary {
+  sha: string;
+  short_sha: string;
+  committed_at: number;
+  subject: string;
+  thread_refs: CommitThreadReference[];
+}
+
+export interface GitBranchSummary {
+  name: string;
+  is_current: boolean;
+  available: boolean;
+}
+
+export interface GitHistoryPage {
+  selected_branch: string;
+  branches: GitBranchSummary[];
+  commits: GitCommitSummary[];
+  next_cursor?: string | null;
+  unique_thread_count: number;
+  reference_count: number;
+}
+
+export interface UnmappedThreadReference {
+  thread_id: string;
+  reason: string;
+}
+
+export interface ProjectChatHistory {
+  project_id: string;
+  codex_home: string;
+  threads: CodexThreadSummary[];
+  git?: GitHistoryPage | null;
+  unmapped: UnmappedThreadReference[];
+  warnings: string[];
+  window_start: number;
+  window_end: number;
+  next_before?: number | null;
+  storage_sync: StorageSyncSummary[];
 }

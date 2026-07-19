@@ -5,6 +5,7 @@
 //! configuration.
 
 pub mod bundle_engine;
+pub mod chat_history;
 pub mod commands;
 pub mod domain;
 pub mod persistence;

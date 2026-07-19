@@ -5,11 +5,13 @@ import type {
   BundleRecipe,
   BundleSnapshotSummary,
   ConnectProjectBundleRequest,
+  CodexThreadDetailsPage,
   CreateSetupDraftResult,
   DependencyPlan,
   DependencyResult,
   LocalProjectRegistration,
   ProjectBinding,
+  ProjectChatHistory,
   ProjectDiscovery,
   ProjectDetail,
   ProjectOperationResult,
@@ -56,6 +58,9 @@ export const projectSyncApi = {
 
   listProjects: () =>
     invoke<LocalProjectRegistration[]>("list_local_projects"),
+
+  listProjectRepositoryKinds: () =>
+    invoke<Record<string, boolean>>("list_project_repository_kinds"),
 
   getProject: (localProjectId: string) =>
     invoke<ProjectDetail | null>("get_project", { localProjectId }),
@@ -152,4 +157,39 @@ export const projectSyncApi = {
 
   finalizeProjectSetup: (draftId: string, expectedRevision: number) =>
     invoke<ProjectDetail>("finalize_project_setup", { draftId, expectedRevision }),
+
+  getProjectChatHistory: (
+    localProjectId: string,
+    branch?: string | null,
+    beforeTime?: number | null,
+    windowDays = 30,
+    forceRevalidate = false,
+  ) => invoke<ProjectChatHistory>("get_project_chat_history", {
+    localProjectId,
+    branch: branch ?? null,
+    beforeTime: beforeTime ?? null,
+    windowDays,
+    forceRevalidate,
+  }),
+
+  getProjectChatThreadDetails: (
+    localProjectId: string,
+    threadId: string,
+    cursor?: number | null,
+    limit = 50,
+  ) => invoke<CodexThreadDetailsPage>("get_project_chat_thread_details", {
+    localProjectId,
+    threadId,
+    cursor: cursor ?? null,
+    limit,
+  }),
+
+  openCodexThreadInApp: (localProjectId: string, threadId: string) =>
+    invoke<void>("open_codex_thread_in_app", { localProjectId, threadId }),
+
+  openCodexThreadInTerminal: (localProjectId: string, threadId: string) =>
+    invoke<void>("open_codex_thread_in_terminal", { localProjectId, threadId }),
+
+  validateCodexThreadOwnership: (localProjectId: string, threadId: string) =>
+    invoke<void>("validate_codex_thread_ownership", { localProjectId, threadId }),
 };
