@@ -42,6 +42,7 @@ import { beginPullReview } from "./pullReviewFlow";
 import {
   errorMessage,
   inventoryResources,
+  projectLabel,
   recipeSelection,
   recipeWithSelection,
   statusMap,
@@ -282,6 +283,8 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       local_project_id: registration.local_project_id,
       bundle_id: registration.bundle_id,
       display_name: registration.display_name,
+      local_alias: registration.local_alias,
+      revision: registration.revision,
       repository_fingerprint: registration.repository_fingerprint,
       project_root: localBinding?.project_root ?? null,
       profile_ids: localBinding?.profile_ids ?? {},
@@ -554,15 +557,15 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     const projectId = detail.project.local_project_id;
     const storageId = detail.links[0]?.storage_id ?? null;
     setNotice(completion === "pull"
-      ? `${detail.project.display_name} connected. Review Pull before files are applied.`
-      : `${detail.project.display_name} is set up${storageId ? "" : " — link storage when ready"}.`);
+      ? `${projectLabel(detail.project)} connected. Review Pull before files are applied.`
+      : `${projectLabel(detail.project)} is set up${storageId ? "" : " — link storage when ready"}.`);
     const { nextConfig } = await loadShell();
     await refreshSetupDrafts();
     setActiveProjectId(projectId);
     if (detail.binding) setBindings((current) => upsertBinding(current, detail.binding as ProjectBinding));
     await loadProjectData(projectId, nextConfig, storageId);
     if (completion === "pull" && storageId && detail.binding) {
-      await planRestore(storageId, detail.project.bundle_id, detail.binding, detail.project.display_name);
+      await planRestore(storageId, detail.project.bundle_id, detail.binding, projectLabel(detail.project));
     } else if (completion === "push" && storageId) {
       await pushProject(projectId, storageId);
     }
@@ -752,6 +755,29 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     }
   };
 
+  const renameProject = async (projectId: string, alias: string | null) => {
+    setBusy(true);
+    setError(null);
+    try {
+      const registration = registrations.find((candidate) => candidate.local_project_id === projectId);
+      if (!registration) throw new Error("Project not found.");
+      const updated = await projectSyncApi.renameProject(projectId, alias, registration.revision);
+      setRegistrations((current) => current.map((candidate) => (
+        candidate.local_project_id === projectId ? updated : candidate
+      )));
+      if (activeProjectId === projectId) {
+        setDetail((current) => current ? { ...current, project: updated } : current);
+      }
+      setNotice(alias
+        ? `Project shown as “${alias}” on this machine. The shared repo name is unchanged.`
+        : "Custom name cleared; showing the shared repo name again.");
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const planRestore = async (
     storageId: string,
     bundleId: string,
@@ -832,7 +858,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         storageId,
         nextDetail.project.bundle_id,
         nextDetail.binding,
-        nextDetail.project.display_name,
+        projectLabel(nextDetail.project),
       );
       if (failure?.includes("does not exist")) {
         const bundles = await projectSyncApi.listRemoteBundleSnapshots(storageId);
@@ -908,7 +934,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         storageId,
         bundleId,
         connected.binding,
-        connected.project.display_name,
+        projectLabel(connected.project),
       );
     } catch (reason) {
       setError(errorMessage(reason));
@@ -939,7 +965,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const removeProject = async (projectId: string) => {
     const summary = projects.find((candidate) => candidate.local_project_id === projectId);
     const approved = await confirm(
-      `Remove “${summary?.display_name ?? "this project"}” from Agent Sync?\n\nThe checkout and provider files stay on disk. Only this app's project registration, links, and active binding are removed.`,
+      `Remove “${summary ? projectLabel(summary) : "this project"}” from Agent Sync?\n\nThe checkout and provider files stay on disk. Only this app's project registration, links, and active binding are removed.`,
       { title: "Remove project" },
     );
     if (!approved) return;
@@ -947,7 +973,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     setError(null);
     try {
       await projectSyncApi.removeProject(projectId);
-      setNotice(`${summary?.display_name ?? "Project"} removed from Agent Sync. Files were not deleted.`);
+      setNotice(`${summary ? projectLabel(summary) : "Project"} removed from Agent Sync. Files were not deleted.`);
       await refresh();
     } catch (reason) {
       setError(errorMessage(reason));
@@ -1205,6 +1231,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
             onPull={(projectId, storageId) => beginProjectRestore(projectId, storageId)}
             onRepair={(projectId, storageId) => beginProjectRestore(projectId, storageId)}
             onSaveProjectPath={(projectId, path) => saveProjectPath(projectId, path)}
+            onRenameProject={(projectId, alias) => renameProject(projectId, alias)}
             onAssignProfile={(projectId, provider, profileId) => assignProjectProfile(projectId, provider, profileId)}
             onAddProfilePath={(projectId, provider, path) => addProfilePathToProject(projectId, provider, path)}
             onRemoveProject={(projectId) => removeProject(projectId)}
@@ -1266,7 +1293,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
 
       {pendingBundleConnection && pendingConnectionProject && pendingConnectionStorage && (
         <BundleConnectionDialog
-          projectName={pendingConnectionProject.display_name}
+          projectName={projectLabel(pendingConnectionProject)}
           currentBundleId={pendingConnectionProject.bundle_id}
           projectFingerprint={pendingConnectionProject.repository_fingerprint}
           storage={pendingConnectionStorage}
@@ -1282,7 +1309,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
 
       {editingBinding && (
         <ProjectBindingEditor
-          title={`Project setup for ${activeSummary?.display_name ?? "project"}`}
+          title={`Project setup for ${activeSummary ? projectLabel(activeSummary) : "project"}`}
           description="Choose this machine's checkout and provider profiles. Existing files and provider state are never moved or deleted."
           binding={editingBinding}
           profiles={profiles}

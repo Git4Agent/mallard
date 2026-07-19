@@ -428,6 +428,21 @@ pub async fn remove_local_project(
 }
 
 #[tauri::command]
+pub async fn rename_local_project(
+    app: tauri::AppHandle,
+    local_project_id: LocalProjectId,
+    local_alias: Option<String>,
+    expected_revision: u64,
+) -> Result<LocalProjectRegistration, String> {
+    rename_local_project_with_repository(
+        &repository(&app)?,
+        &local_project_id,
+        local_alias,
+        expected_revision,
+    )
+}
+
+#[tauri::command]
 pub async fn save_bundle_recipe(
     app: tauri::AppHandle,
     local_project_id: LocalProjectId,
@@ -3094,6 +3109,7 @@ fn register_local_project_with_repository(
             None => BundleId::generate()?,
         },
         display_name: request.display_name,
+        local_alias: None,
         repository_fingerprint: request.repository_fingerprint,
         recipe: BundleRecipe::default(),
         recipe_bases: Default::default(),
@@ -3563,6 +3579,38 @@ fn detach_project_binding_with_repository(
         Ok(())
     })?;
     Ok(true)
+}
+
+/// Sets or clears the machine-local alias.  The synced `display_name` stays
+/// untouched so a rename here never propagates to the remote bundle or other
+/// replicas.
+fn rename_local_project_with_repository(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    local_alias: Option<String>,
+    expected_revision: u64,
+) -> Result<LocalProjectRegistration, String> {
+    let alias = local_alias
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    repository.mutate_config(|config| {
+        let project = config
+            .projects
+            .iter_mut()
+            .find(|project| &project.local_project_id == local_project_id)
+            .ok_or_else(|| format!("unknown local project '{}'", local_project_id))?;
+        if project.revision != expected_revision {
+            return Err(format!(
+                "project changed (expected revision {}, current {})",
+                expected_revision, project.revision
+            ));
+        }
+        project.local_alias = alias;
+        project.revision = project.revision.saturating_add(1);
+        project.updated_at = now_secs();
+        project.validate()?;
+        Ok(project.clone())
+    })
 }
 
 fn remove_local_project_with_repository(
@@ -4381,6 +4429,7 @@ fn build_setup_transaction(
         local_project_id: draft.local_project_id.clone(),
         bundle_id: bundle_id.clone(),
         display_name,
+        local_alias: None,
         repository_fingerprint: fingerprint,
         recipe,
         recipe_bases: BTreeMap::new(),
@@ -4961,6 +5010,47 @@ mod tests {
         assert_eq!(first.bundle_id, bundle_id);
         assert_eq!(second.bundle_id, bundle_id);
         assert_eq!(repo.load_config().unwrap().projects.len(), 2);
+    }
+
+    #[test]
+    fn local_alias_renames_stay_off_the_shared_display_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp);
+        let project = register(&repo);
+        let renamed = rename_local_project_with_repository(
+            &repo,
+            &project.local_project_id,
+            Some("  game3 checkout  ".to_string()),
+            project.revision,
+        )
+        .unwrap();
+        assert_eq!(renamed.local_alias.as_deref(), Some("game3 checkout"));
+        assert_eq!(renamed.display_name, project.display_name);
+        assert_eq!(renamed.revision, project.revision + 1);
+
+        // A stale revision must not clobber a concurrent edit.
+        assert!(rename_local_project_with_repository(
+            &repo,
+            &project.local_project_id,
+            Some("other".to_string()),
+            project.revision,
+        )
+        .unwrap_err()
+        .contains("changed"));
+
+        // Clearing falls back to the shared name; blank input counts as clearing.
+        let cleared = rename_local_project_with_repository(
+            &repo,
+            &project.local_project_id,
+            Some("   ".to_string()),
+            renamed.revision,
+        )
+        .unwrap();
+        assert_eq!(cleared.local_alias, None);
+        assert_eq!(
+            repo.load_config().unwrap().projects[0].local_alias,
+            None
+        );
     }
 
     #[test]

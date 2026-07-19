@@ -753,6 +753,7 @@ mod tests {
             local_project_id: LocalProjectId::parse("project-a").unwrap(),
             bundle_id: BundleId::parse("0123456789abcdef0123456789abcdef").unwrap(),
             display_name: "Project A".to_string(),
+            local_alias: None,
             repository_fingerprint: None,
             recipe: BundleRecipe::default(),
             recipe_bases: BTreeMap::new(),

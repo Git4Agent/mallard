@@ -66,6 +66,9 @@ export const projectSyncApi = {
   removeProject: (localProjectId: string) =>
     invoke<boolean>("remove_local_project", { localProjectId }),
 
+  renameProject: (localProjectId: string, localAlias: string | null, expectedRevision: number) =>
+    invoke<LocalProjectRegistration>("rename_local_project", { localProjectId, localAlias, expectedRevision }),
+
   getConfig: () =>
     invoke<SyncConfigV3>("get_project_sync_config"),
 

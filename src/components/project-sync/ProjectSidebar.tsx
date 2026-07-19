@@ -148,6 +148,8 @@ export default function ProjectSidebar({
             </button>
           ) : projects.map((project) => {
             const profileRequired = Object.keys(project.profile_ids ?? {}).length === 0;
+            const label = project.local_alias?.trim() || project.display_name;
+            const aliased = label !== project.display_name;
             return (
               <div
                 key={project.local_project_id}
@@ -157,10 +159,13 @@ export default function ProjectSidebar({
                   type="button"
                   className="sidebar-profile-main"
                   onClick={() => onSelectProject(project.local_project_id)}
-                  title={project.project_root ?? project.display_name}
+                  title={[
+                    aliased ? `Repo: ${project.display_name}` : null,
+                    project.project_root ?? null,
+                  ].filter(Boolean).join("\n") || label}
                 >
                   <Icon name="folder" size={15} />
-                  <span>{project.display_name}</span>
+                  <span>{label}</span>
                   {profileRequired && <Icon name="alert-triangle" size={12} className="v3-sidebar-profile-warning" />}
                 </button>
                 <div className="sidebar-profile-actions">
@@ -168,8 +173,8 @@ export default function ProjectSidebar({
                     type="button"
                     onClick={() => onConfigureProject(project.local_project_id)}
                     disabled={busy}
-                    title={`Project settings for ${project.display_name}`}
-                    aria-label={`Project settings for ${project.display_name}`}
+                    title={`Project settings for ${label}`}
+                    aria-label={`Project settings for ${label}`}
                   >
                     <Icon name="settings" size={13} />
                   </button>
@@ -178,8 +183,8 @@ export default function ProjectSidebar({
                     className="sidebar-profile-remove"
                     onClick={() => onRemoveProject(project.local_project_id)}
                     disabled={busy}
-                    title={`Remove ${project.display_name} from Agent Sync; project files stay on disk`}
-                    aria-label={`Remove ${project.display_name} from Agent Sync`}
+                    title={`Remove ${label} from Agent Sync; project files stay on disk`}
+                    aria-label={`Remove ${label} from Agent Sync`}
                   >
                     <Icon name="trash" size={13} />
                   </button>

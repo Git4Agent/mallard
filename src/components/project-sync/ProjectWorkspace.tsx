@@ -10,7 +10,7 @@ import type {
 } from "../../types";
 import Icon from "../Icons";
 import ResourceInventory from "./ResourceInventory";
-import { compactProjectPath, providerLabel } from "./model";
+import { compactProjectPath, projectLabel, providerLabel } from "./model";
 
 interface Props {
   summary: LocalProjectSummary;
@@ -90,8 +90,11 @@ export default function ProjectWorkspace({
         <div className="v3-project-identity">
           <span className="v3-project-large-icon"><Icon name="folder" size={22} /></span>
           <div>
-            <span className="v3-eyebrow">Portable project repo</span>
-            <h1>{summary.display_name}</h1>
+            <span className="v3-eyebrow">
+              Portable project repo
+              {projectLabel(summary) !== summary.display_name && ` · ${summary.display_name}`}
+            </span>
+            <h1>{projectLabel(summary)}</h1>
             <button type="button" className="v3-path-button" onClick={onRemap} title="Change this machine's checkout binding">
               {compactProjectPath(binding?.project_root ?? summary.project_root)} <Icon name="settings" size={12} />
             </button>

@@ -3833,6 +3833,10 @@ summary:focus-visible {
   font-weight: 600;
 }
 
+.v3-inline-project-settings > label {
+  grid-column: 2;
+}
+
 .v3-inline-project-settings > .v3-callout {
   grid-column: 2;
 }
@@ -5838,6 +5842,7 @@ div.storage-link-main {
     grid-template-columns: 1fr;
   }
 
+  .v3-inline-project-settings > label,
   .v3-inline-project-settings > .v3-callout {
     grid-column: 1;
   }

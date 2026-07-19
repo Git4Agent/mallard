@@ -623,6 +623,11 @@ pub struct LocalProjectRegistration {
     pub local_project_id: LocalProjectId,
     pub bundle_id: BundleId,
     pub display_name: String,
+    /// Machine-local nickname shown instead of `display_name`. Never pushed:
+    /// the remote bundle keeps `display_name`, so two checkouts of the same
+    /// repo can be told apart without renaming it for every replica.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_alias: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repository_fingerprint: Option<String>,
     pub recipe: BundleRecipe,
@@ -636,6 +641,9 @@ pub struct LocalProjectRegistration {
 impl LocalProjectRegistration {
     pub fn validate(&self) -> Result<(), String> {
         validate_display_text("project display name", &self.display_name, false)?;
+        if let Some(alias) = &self.local_alias {
+            validate_display_text("project local alias", alias, false)?;
+        }
         if let Some(fingerprint) = &self.repository_fingerprint {
             validate_sha256("repository fingerprint", fingerprint)?;
         }
@@ -2045,6 +2053,7 @@ mod tests {
             local_project_id: LocalProjectId::parse("project-a").unwrap(),
             bundle_id: bundle_id(),
             display_name: "Project A".to_string(),
+            local_alias: None,
             repository_fingerprint: None,
             recipe: BundleRecipe::default(),
             recipe_bases: BTreeMap::new(),

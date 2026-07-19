@@ -15,7 +15,7 @@ import Icon from "../Icons";
 import ResourceInventory from "./ResourceInventory";
 import { newStorage, StorageEditor } from "./StorageSettingsV3";
 import { projectSyncApi } from "./api";
-import { compactProjectPath, errorMessage, formatRelativeTime } from "./model";
+import { compactProjectPath, errorMessage, formatRelativeTime, projectLabel } from "./model";
 
 type LinkKey = { projectId: string; storageId: string };
 type StorageEditorRequest =
@@ -47,6 +47,7 @@ interface Props {
   onPull: (projectId: string, storageId: string) => Promise<void> | void;
   onRepair: (projectId: string, storageId: string) => Promise<void> | void;
   onSaveProjectPath: (projectId: string, path: string) => Promise<void> | void;
+  onRenameProject: (projectId: string, alias: string | null) => Promise<void> | void;
   onAssignProfile: (projectId: string, provider: ProjectProvider, profileId: string | null) => Promise<void> | void;
   onAddProfilePath: (projectId: string, provider: ProjectProvider, path: string) => Promise<void> | void;
   onRemoveProject: (projectId: string) => Promise<void> | void;
@@ -105,6 +106,7 @@ export default function ProjectLinksWorkspace({
   onPull,
   onRepair,
   onSaveProjectPath,
+  onRenameProject,
   onAssignProfile,
   onAddProfilePath,
   onRemoveProject,
@@ -130,6 +132,7 @@ export default function ProjectLinksWorkspace({
   const [providerPathDraft, setProviderPathDraft] = useState("");
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [projectPathDraft, setProjectPathDraft] = useState("");
+  const [projectAliasDraft, setProjectAliasDraft] = useState("");
   const bundleRequestRef = useRef(0);
   const storageSettingsRef = useRef<HTMLDivElement>(null);
   const projectSettingsRef = useRef<HTMLDivElement>(null);
@@ -301,6 +304,7 @@ export default function ProjectLinksWorkspace({
     setStorageDraft(null);
     setEditingProjectId(project.local_project_id);
     setProjectPathDraft(projectBinding?.project_root ?? project.project_root ?? "");
+    setProjectAliasDraft(project.local_alias ?? "");
     void onSelectProject(project.local_project_id);
     onProjectEditorRequestHandled?.();
   }, [projectEditorRequest?.requestId]);
@@ -317,6 +321,9 @@ export default function ProjectLinksWorkspace({
     setStorageDraft(null);
     setEditingProjectId(projectId);
     setProjectPathDraft(currentPath);
+    setProjectAliasDraft(
+      projects.find((candidate) => candidate.local_project_id === projectId)?.local_alias ?? "",
+    );
     await onSelectProject(projectId);
   };
 
@@ -457,7 +464,7 @@ export default function ProjectLinksWorkspace({
               {settingsProject ? "Project settings" : "Project links"}
             </h1>
             <div className="profile-links-subtitle">
-              {settingsProject ? settingsProject.display_name : "Choose where each project repo syncs."}
+              {settingsProject ? projectLabel(settingsProject) : "Choose where each project repo syncs."}
             </div>
           </div>
           {!settingsProject && <div className="profile-links-heading-actions">
@@ -520,6 +527,8 @@ export default function ProjectLinksWorkspace({
               const projectProfileSummary = assignedProfiles.length === 1 && profilesReadable
                 ? `${assignedProfiles[0].provider === "codex" ? "Codex" : "Claude"} · ${assignedProfiles[0].profile.display_name}`
                 : profileTitle;
+              const label = projectLabel(project);
+              const aliased = label !== project.display_name;
 
               return (
                 <article
@@ -530,7 +539,8 @@ export default function ProjectLinksWorkspace({
                   <div className="profile-link-profile">
                     <span className="profile-link-profile-icon"><Icon name="folder" size={25} /></span>
                     <div className="profile-link-profile-copy">
-                      <strong>{project.display_name}</strong>
+                      <strong title={aliased ? `Shared repo name: ${label}` : undefined}>{label}</strong>
+                      {aliased && <span className="profile-link-path">Repo · {project.display_name}</span>}
                       <span>{resourceCount} selected resources</span>
                       <span className="profile-link-path" title={project.project_root ?? undefined}>
                         {compactProjectPath(project.project_root)}
@@ -538,13 +548,13 @@ export default function ProjectLinksWorkspace({
                       <span className={`v3-project-profile-summary${canSync ? "" : " missing"}`}>
                         {projectProfileSummary}
                       </span>
-                      <div className="profile-link-profile-actions" role="group" aria-label={`Actions for ${project.display_name}`}>
+                      <div className="profile-link-profile-actions" role="group" aria-label={`Actions for ${label}`}>
                         <button
                           type="button"
                           className="profile-utility-btn"
                           disabled={!firstLink || !canRestore || busy || !!runningAction || (active && selectionDirty)}
                           onClick={() => firstLink && void run(`pull:${project.local_project_id}:${firstLink.storage_id}`, () => onPull(project.local_project_id, firstLink.storage_id))}
-                          title={!profilesWritable && projectBinding ? "Selected provider profile is unavailable or read only" : `Pull ${project.display_name} from its first linked storage`}
+                          title={!profilesWritable && projectBinding ? "Selected provider profile is unavailable or read only" : `Pull ${label} from its first linked storage`}
                         >
                           <Icon name="download" size={14} />
                         </button>
@@ -553,7 +563,7 @@ export default function ProjectLinksWorkspace({
                           className="profile-utility-btn"
                           disabled={!firstLink || !canSync || busy || !!runningAction}
                           onClick={() => firstLink && void run(`push:${project.local_project_id}:${firstLink.storage_id}`, () => onPush(project.local_project_id, firstLink.storage_id))}
-                          title={!profilesReadable && projectBinding ? "Selected provider profile is unavailable" : `Push ${project.display_name} to its first linked storage`}
+                          title={!profilesReadable && projectBinding ? "Selected provider profile is unavailable" : `Push ${label} to its first linked storage`}
                         >
                           <Icon name="upload" size={14} />
                         </button>
@@ -565,7 +575,7 @@ export default function ProjectLinksWorkspace({
                             project.local_project_id,
                             projectBinding?.project_root ?? project.project_root ?? "",
                           )}
-                          title={`Project settings for ${project.display_name}`}
+                          title={`Project settings for ${label}`}
                           aria-expanded={editingProjectId === project.local_project_id}
                         >
                           <Icon name="settings" size={13} />
@@ -575,7 +585,7 @@ export default function ProjectLinksWorkspace({
                           className="profile-utility-btn profile-remove-btn"
                           disabled={busy}
                           onClick={() => void onRemoveProject(project.local_project_id)}
-                          title={`Remove ${project.display_name} from Agent Sync; files stay on disk`}
+                          title={`Remove ${label} from Agent Sync; files stay on disk`}
                         >
                           <Icon name="trash" size={13} />
                         </button>
@@ -822,9 +832,52 @@ export default function ProjectLinksWorkspace({
                   {editingProjectId === project.local_project_id && (
                     <div ref={projectSettingsRef} className="v3-inline-project-settings">
                       <div className="v3-inline-project-copy">
-                        <strong>Project — {project.display_name}</strong>
+                        <strong>Project — {label}</strong>
                         <span>Folder on this machine</span>
                       </div>
+                      <label>
+                        <span>Custom name</span>
+                        <div className="v3-simple-path-row">
+                          <input
+                            value={projectAliasDraft}
+                            onChange={(event) => setProjectAliasDraft(event.target.value)}
+                            placeholder={project.display_name}
+                            disabled={busy}
+                            title="Shown only on this machine; the shared repo name stays unchanged"
+                          />
+                          <button
+                            type="button"
+                            className="btn btn-primary"
+                            disabled={
+                              busy
+                              || (projectAliasDraft.trim() || null) === (project.local_alias ?? null)
+                            }
+                            onClick={() => void run(
+                              `rename:${project.local_project_id}`,
+                              () => onRenameProject(project.local_project_id, projectAliasDraft.trim() || null),
+                            )}
+                          >
+                            {runningAction === `rename:${project.local_project_id}` ? "Saving…" : "Save"}
+                          </button>
+                          {project.local_alias && (
+                            <button
+                              type="button"
+                              className="btn"
+                              disabled={busy}
+                              onClick={() => {
+                                setProjectAliasDraft("");
+                                void run(
+                                  `rename:${project.local_project_id}`,
+                                  () => onRenameProject(project.local_project_id, null),
+                                );
+                              }}
+                              title={`Show the shared repo name “${project.display_name}” again`}
+                            >
+                              Use repo name
+                            </button>
+                          )}
+                        </div>
+                      </label>
                       <label>
                         <span>Project path</span>
                         <div className="v3-simple-path-row">

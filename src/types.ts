@@ -369,6 +369,8 @@ export interface LocalProjectRegistration {
   local_project_id: string;
   bundle_id: string;
   display_name: string;
+  /** Machine-local nickname; never pushed, so it can differ per checkout. */
+  local_alias?: string | null;
   repository_fingerprint?: string | null;
   recipe: BundleRecipe;
   recipe_bases: Record<string, {
@@ -406,6 +408,8 @@ export interface LocalProjectSummary {
   local_project_id: string;
   bundle_id: string;
   display_name: string;
+  local_alias?: string | null;
+  revision: number;
   repository_fingerprint?: string | null;
   project_root?: string | null;
   profile_ids?: Partial<Record<ProjectProvider, string>>;
