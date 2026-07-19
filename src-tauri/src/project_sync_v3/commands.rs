@@ -9,6 +9,7 @@ use super::bundle_engine::{
     ImmutablePutOutcome, LocalBundleObjectStore, ObjectKey, ObjectPrefix, PublishBundleRequest,
     PublishExpectation, RemoteBundlePage, StoreListPage, StoredObject,
 };
+use super::chat_history::{self, ProjectChatHistory};
 use super::domain::{
     generated_named_id, validate_absolute_clean_path, ActionId, ActionStatus, ApplyPolicy,
     BindingState, BundleId, BundleIdentity, BundleKind, BundleRecipe, BundleSnapshot, CapturedWith,
@@ -409,6 +410,61 @@ pub async fn get_local_project(
         .projects
         .into_iter()
         .find(|project| project.local_project_id == local_project_id))
+}
+
+#[tauri::command]
+pub async fn get_project_chat_history(
+    app: tauri::AppHandle,
+    local_project_id: LocalProjectId,
+    branch: Option<String>,
+    before_commit: Option<String>,
+    limit: Option<usize>,
+) -> Result<ProjectChatHistory, String> {
+    let repository = repository(&app)?;
+    run_blocking(move || {
+        chat_history::get_project_chat_history(
+            &repository,
+            &local_project_id,
+            branch.as_deref(),
+            before_commit.as_deref(),
+            limit,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn open_codex_thread_in_terminal(
+    app: tauri::AppHandle,
+    local_project_id: LocalProjectId,
+    thread_id: String,
+) -> Result<(), String> {
+    let repository = repository(&app)?;
+    run_blocking(move || {
+        chat_history::open_codex_thread_in_terminal(
+            &repository,
+            &local_project_id,
+            &thread_id,
+        )
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn validate_codex_thread_ownership(
+    app: tauri::AppHandle,
+    local_project_id: LocalProjectId,
+    thread_id: String,
+) -> Result<(), String> {
+    let repository = repository(&app)?;
+    run_blocking(move || {
+        chat_history::validate_codex_thread_ownership(
+            &repository,
+            &local_project_id,
+            &thread_id,
+        )
+    })
+    .await
 }
 
 #[tauri::command]

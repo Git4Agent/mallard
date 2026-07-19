@@ -13,6 +13,7 @@ import type {
 } from "../../types";
 import Icon from "../Icons";
 import ResourceInventory from "./ResourceInventory";
+import ProjectChatHistoryPage from "./ProjectChatHistoryPage";
 import { newStorage, StorageEditor } from "./StorageSettingsV3";
 import { projectSyncApi } from "./api";
 import { compactProjectPath, errorMessage, formatRelativeTime, projectLabel } from "./model";
@@ -60,6 +61,7 @@ interface Props {
   projectEditorRequest?: ProjectEditorRequest | null;
   onProjectEditorRequestHandled?: () => void;
   newProjectSetup?: ReactNode;
+  historyRefreshEpoch?: number;
 }
 
 function storageSubtitle(storage: StorageConfigV3): string {
@@ -119,6 +121,7 @@ export default function ProjectLinksWorkspace({
   projectEditorRequest,
   onProjectEditorRequestHandled,
   newProjectSetup,
+  historyRefreshEpoch = 0,
 }: Props) {
   const [expandedLink, setExpandedLink] = useState<LinkKey | null>(null);
   const [expandedProvider, setExpandedProvider] = useState<ProjectProvider | null>(null);
@@ -442,12 +445,28 @@ export default function ProjectLinksWorkspace({
   }
 
   if (!settingsProject && !editingStorage && !newProjectSetup) {
+    const activeProject = projects.find((project) => project.local_project_id === activeProjectId) ?? null;
+    const activeBinding = activeProject ? bindingByProject.get(activeProject.local_project_id) ?? null : null;
+    if (activeProject) {
+      return (
+        <ProjectChatHistoryPage
+          project={activeProject}
+          binding={activeBinding}
+          refreshEpoch={historyRefreshEpoch}
+          onOpenProjectSettings={() => void toggleProjectEditor(
+            activeProject.local_project_id,
+            activeBinding?.project_root ?? activeProject.project_root ?? "",
+          )}
+        />
+      );
+    }
     return (
       <main className="v3-main v3-project-links-page v3-git-info-page">
         <section className="profile-links-section" aria-labelledby="git-info-heading">
           <div className="profile-links-heading">
             <div className="profile-links-copy">
-              <h1 id="git-info-heading" className="settings-section-title">Git Info</h1>
+              <h1 id="git-info-heading" className="settings-section-title">Project history</h1>
+              <div className="profile-links-subtitle">Select a completed project to view its Codex history.</div>
             </div>
           </div>
         </section>

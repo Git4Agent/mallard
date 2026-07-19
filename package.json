@@ -8,7 +8,7 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test:frontend-integration": "node scripts/run-frontend-integration-tests.mjs",
-    "test:backend-integration": "cargo test --manifest-path src-tauri/Cargo.toml --lib project_sync_v3::commands::tests",
+    "test:backend-integration": "cargo test --manifest-path src-tauri/Cargo.toml --lib project_sync_v3::commands::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib project_sync_v3::chat_history::tests",
     "test:integration": "npm run test:frontend-integration && npm run test:backend-integration",
     "tauri": "tauri"
   },

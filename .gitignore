@@ -14,6 +14,7 @@ dist-ssr
 
 # Generated UI captures
 /output/
+.superdesign/tmp/
 
 # Editor directories and files
 .vscode/*

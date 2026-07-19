@@ -783,3 +783,57 @@ export interface BundleReadiness {
   issues: BundleReadinessIssue[];
   generated_at?: number;
 }
+
+export type ThreadMatchKind = "during_session" | "after_session" | "started_from";
+
+export interface CodexThreadSummary {
+  thread_id: string;
+  title: string;
+  summary: string;
+  started_at: number;
+  ended_at: number;
+  branch?: string | null;
+  recorded_sha?: string | null;
+  is_active?: boolean;
+}
+
+export interface CommitThreadReference {
+  thread_id: string;
+  match_kind: ThreadMatchKind;
+}
+
+export interface GitCommitSummary {
+  sha: string;
+  short_sha: string;
+  committed_at: number;
+  subject: string;
+  thread_refs: CommitThreadReference[];
+}
+
+export interface GitBranchSummary {
+  name: string;
+  is_current: boolean;
+  available: boolean;
+}
+
+export interface GitHistoryPage {
+  selected_branch: string;
+  branches: GitBranchSummary[];
+  commits: GitCommitSummary[];
+  next_cursor?: string | null;
+  unique_thread_count: number;
+  reference_count: number;
+}
+
+export interface UnmappedThreadReference {
+  thread_id: string;
+  reason: string;
+}
+
+export interface ProjectChatHistory {
+  project_id: string;
+  threads: CodexThreadSummary[];
+  git?: GitHistoryPage | null;
+  unmapped: UnmappedThreadReference[];
+  warnings: string[];
+}

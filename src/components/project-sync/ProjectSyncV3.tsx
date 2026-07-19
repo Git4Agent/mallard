@@ -165,6 +165,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const [restoreProjectName, setRestoreProjectName] = useState("project");
   const [dependencyPlan, setDependencyPlan] = useState<DependencyPlan | null>(null);
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
+  const [historyRefreshEpoch, setHistoryRefreshEpoch] = useState(0);
   const [dependencyResult, setDependencyResult] = useState<DependencyResult | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
   const restoreRequest = useRef(0);
@@ -990,6 +991,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     try {
       const result = await projectSyncApi.applyRestore(restorePlan.plan_id, actionIds);
       setRestoreResult(result);
+      if (result.success) setHistoryRefreshEpoch((epoch) => epoch + 1);
       setReadiness(await projectSyncApi.getReadiness(restorePlan.bundle_id, restoreBinding));
       if (activeProjectId) await loadProjectData(activeProjectId, config, activeStorageId);
     } catch (reason) {
@@ -1249,6 +1251,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
             onStorageEditorRequestHandled={() => setStorageEditorRequest(null)}
             projectEditorRequest={projectEditorRequest}
             onProjectEditorRequestHandled={() => setProjectEditorRequest(null)}
+            historyRefreshEpoch={historyRefreshEpoch}
             newProjectSetup={setupDraftId ? (
               <ProjectSetupWorkspace
                 key={setupDraftId}

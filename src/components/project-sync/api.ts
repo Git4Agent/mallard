@@ -10,6 +10,7 @@ import type {
   DependencyResult,
   LocalProjectRegistration,
   ProjectBinding,
+  ProjectChatHistory,
   ProjectDiscovery,
   ProjectDetail,
   ProjectOperationResult,
@@ -152,4 +153,22 @@ export const projectSyncApi = {
 
   finalizeProjectSetup: (draftId: string, expectedRevision: number) =>
     invoke<ProjectDetail>("finalize_project_setup", { draftId, expectedRevision }),
+
+  getProjectChatHistory: (
+    localProjectId: string,
+    branch?: string | null,
+    beforeCommit?: string | null,
+    limit = 50,
+  ) => invoke<ProjectChatHistory>("get_project_chat_history", {
+    localProjectId,
+    branch: branch ?? null,
+    beforeCommit: beforeCommit ?? null,
+    limit,
+  }),
+
+  openCodexThreadInTerminal: (localProjectId: string, threadId: string) =>
+    invoke<void>("open_codex_thread_in_terminal", { localProjectId, threadId }),
+
+  validateCodexThreadOwnership: (localProjectId: string, threadId: string) =>
+    invoke<void>("validate_codex_thread_ownership", { localProjectId, threadId }),
 };

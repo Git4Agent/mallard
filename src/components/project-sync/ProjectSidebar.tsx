@@ -1,5 +1,6 @@
 import type { LocalProjectSummary, SetupDraftSummary, StorageConfigV3 } from "../../types";
 import Icon from "../Icons";
+import { projectLabel } from "./model";
 
 interface Props {
   projects: LocalProjectSummary[];
@@ -148,7 +149,7 @@ export default function ProjectSidebar({
             </button>
           ) : projects.map((project) => {
             const profileRequired = Object.keys(project.profile_ids ?? {}).length === 0;
-            const label = project.local_alias?.trim() || project.display_name;
+            const label = projectLabel(project);
             const aliased = label !== project.display_name;
             return (
               <div
@@ -169,6 +170,15 @@ export default function ProjectSidebar({
                   {profileRequired && <Icon name="alert-triangle" size={12} className="v3-sidebar-profile-warning" />}
                 </button>
                 <div className="sidebar-profile-actions">
+                  <button
+                    type="button"
+                    onClick={() => onSelectProject(project.local_project_id)}
+                    disabled={busy}
+                    title={`View history for ${label}`}
+                    aria-label={`View history for ${label}`}
+                  >
+                    <Icon name="git-branch" size={13} />
+                  </button>
                   <button
                     type="button"
                     onClick={() => onConfigureProject(project.local_project_id)}
