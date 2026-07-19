@@ -456,7 +456,7 @@ export default function ProjectLinksWorkspace({
   }
 
   return (
-    <main className="v3-main v3-project-links-page">
+    <main className={`v3-main v3-project-links-page${settingsProject ? " v3-project-settings-page" : ""}`}>
       <section className="profile-links-section" aria-labelledby="project-links-heading">
         <div className="profile-links-heading">
           <div className="profile-links-copy">
@@ -467,20 +467,31 @@ export default function ProjectLinksWorkspace({
               {settingsProject ? projectLabel(settingsProject) : "Choose where each project repo syncs."}
             </div>
           </div>
-          {!settingsProject && <div className="profile-links-heading-actions">
-            <div className="profile-links-counts">
-              {projects.length} projects <span>·</span> {storages.length} storage <span>·</span> {links.length} links
+          {settingsProject ? (
+            <button
+              type="button"
+              className="btn btn-ghost v3-project-settings-close"
+              onClick={() => setEditingProjectId(null)}
+              aria-label="Close project settings"
+            >
+              <Icon name="x" size={15} />
+            </button>
+          ) : (
+            <div className="profile-links-heading-actions">
+              <div className="profile-links-counts">
+                {projects.length} projects <span>·</span> {storages.length} storage <span>·</span> {links.length} links
+              </div>
+              <div className="profile-links-primary-actions">
+                <button type="button" className="btn profile-refresh-linkage" onClick={onRefresh} disabled={loading || busy}>
+                  <Icon name="refresh" size={16} className={loading ? "icon-spin" : undefined} />
+                  {loading ? "Refreshing…" : "Refresh"}
+                </button>
+                <button type="button" className="btn profile-add-profile" onClick={onAddProject} disabled={busy}>
+                  <Icon name="plus" size={16} /> Add project
+                </button>
+              </div>
             </div>
-            <div className="profile-links-primary-actions">
-              <button type="button" className="btn profile-refresh-linkage" onClick={onRefresh} disabled={loading || busy}>
-                <Icon name="refresh" size={16} className={loading ? "icon-spin" : undefined} />
-                {loading ? "Refreshing…" : "Refresh"}
-              </button>
-              <button type="button" className="btn profile-add-profile" onClick={onAddProject} disabled={busy}>
-                <Icon name="plus" size={16} /> Add project
-              </button>
-            </div>
-          </div>}
+          )}
         </div>
 
         {newProjectSetup}
@@ -832,11 +843,11 @@ export default function ProjectLinksWorkspace({
                   {editingProjectId === project.local_project_id && (
                     <div ref={projectSettingsRef} className="v3-inline-project-settings">
                       <div className="v3-inline-project-copy">
-                        <strong>Project — {label}</strong>
-                        <span>Folder on this machine</span>
+                        <strong>Local settings</strong>
+                        <span>Only affects this machine.</span>
                       </div>
                       <label>
-                        <span>Custom name</span>
+                        <span>Display name</span>
                         <div className="v3-simple-path-row">
                           <input
                             value={projectAliasDraft}
@@ -857,7 +868,7 @@ export default function ProjectLinksWorkspace({
                               () => onRenameProject(project.local_project_id, projectAliasDraft.trim() || null),
                             )}
                           >
-                            {runningAction === `rename:${project.local_project_id}` ? "Saving…" : "Save"}
+                            {runningAction === `rename:${project.local_project_id}` ? "Saving…" : "Save name"}
                           </button>
                           {project.local_alias && (
                             <button
@@ -879,7 +890,7 @@ export default function ProjectLinksWorkspace({
                         </div>
                       </label>
                       <label>
-                        <span>Project path</span>
+                        <span>Checkout path</span>
                         <div className="v3-simple-path-row">
                           <input
                             value={projectPathDraft}
@@ -897,7 +908,7 @@ export default function ProjectLinksWorkspace({
                               if (typeof picked === "string") setProjectPathDraft(picked);
                             })()}
                           >
-                            Browse
+                            <Icon name="folder" size={13} /> Browse
                           </button>
                           <button
                             type="button"
@@ -912,15 +923,7 @@ export default function ProjectLinksWorkspace({
                               () => onSaveProjectPath(project.local_project_id, projectPathDraft.trim()),
                             )}
                           >
-                            {runningAction === `project:${project.local_project_id}` ? "Saving…" : "Save"}
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-ghost"
-                            onClick={() => setEditingProjectId(null)}
-                            aria-label="Close project settings"
-                          >
-                            <Icon name="x" size={14} />
+                            {runningAction === `project:${project.local_project_id}` ? "Saving…" : "Save path"}
                           </button>
                         </div>
                       </label>

@@ -343,48 +343,65 @@ export default function ProjectSetupWorkspace({
   const profileRow = (provider: ProjectProvider, label: string) => {
     const selection = draft.profiles[provider] ?? null;
     const options = profiles.filter((profile) => profile.provider === provider);
+    const existingProfile = selection?.kind === "existing"
+      ? options.find((profile) => profile.profile_id === selection.profile_id) ?? null
+      : null;
     const value = selection?.kind === "existing"
       ? selection.profile_id
       : selection?.kind === "pending" ? "__pending" : "";
+    const path = selection?.kind === "pending" ? selection.path : existingProfile?.path ?? "";
+    const inputId = `setup-${draftId}-${provider}-path`;
     return (
-      <label key={provider}>
-        <span>{label} profile <small>machine-local</small></span>
-        <div className="v3-profile-select-row">
-          <select
-            value={value}
-            disabled={working}
-            onChange={(event) => {
-              const next = event.target.value;
-              edit((current) => {
-                const nextProfiles = { ...current.profiles };
-                if (!next || next === "__pending") delete nextProfiles[provider];
-                else nextProfiles[provider] = { kind: "existing", profile_id: next };
-                return { ...current, profiles: nextProfiles };
-              });
-            }}
-          >
-            <option value="">Not used</option>
-            {selection?.kind === "pending" && (
-              <option value="__pending">{compactProjectPath(selection.path)} (new)</option>
-            )}
-            {options.map((profile) => (
-              <option key={profile.profile_id} value={profile.profile_id} disabled={!profile.available || !profile.readable}>
-                {profile.display_name}{!profile.available || !profile.readable ? " (unavailable)" : ""}
-              </option>
-            ))}
-          </select>
-          <button type="button" className="btn" onClick={() => void chooseProfileFolder(provider)} disabled={working}>
-            <Icon name="plus" size={13} /> Folder…
-          </button>
-        </div>
-        <small>
-          {selection?.kind === "pending"
-            ? `${compactProjectPath(selection.path)} · created when setup finishes`
-            : selection?.kind === "existing"
-              ? compactProjectPath(options.find((profile) => profile.profile_id === selection.profile_id)?.path)
-              : `Choose the ${label} home to scan.`}
-        </small>
-      </label>
+      <div className="v3-agent-profile-row" key={provider}>
+        <label className="v3-agent-profile-label" htmlFor={inputId}>
+          <strong>{label}</strong>
+          <small>machine-local</small>
+        </label>
+        <select
+          value={value}
+          disabled={working}
+          aria-label={`${label} profile`}
+          onChange={(event) => {
+            const next = event.target.value;
+            edit((current) => {
+              const nextProfiles = { ...current.profiles };
+              if (!next || next === "__pending") delete nextProfiles[provider];
+              else nextProfiles[provider] = { kind: "existing", profile_id: next };
+              return { ...current, profiles: nextProfiles };
+            });
+          }}
+        >
+          <option value="">Not used</option>
+          {selection?.kind === "pending" && <option value="__pending">Custom path</option>}
+          {options.map((profile) => (
+            <option key={profile.profile_id} value={profile.profile_id} disabled={!profile.available || !profile.readable}>
+              {profile.display_name}{!profile.available || !profile.readable ? " (unavailable)" : ""}
+            </option>
+          ))}
+        </select>
+        <input
+          id={inputId}
+          value={path}
+          disabled={working}
+          placeholder={`Enter ${label} home path`}
+          spellCheck={false}
+          onChange={(event) => {
+            const nextPath = event.target.value;
+            edit((current) => {
+              const nextProfiles = { ...current.profiles };
+              if (nextPath) {
+                nextProfiles[provider] = { kind: "pending", path: nextPath, display_name: "" };
+              } else {
+                delete nextProfiles[provider];
+              }
+              return { ...current, profiles: nextProfiles };
+            });
+          }}
+        />
+        <button type="button" className="btn" onClick={() => void chooseProfileFolder(provider)} disabled={working}>
+          <Icon name="folder" size={13} /> Browse…
+        </button>
+      </div>
     );
   };
 
@@ -394,7 +411,7 @@ export default function ProjectSetupWorkspace({
         <div>
           <span className="v3-eyebrow">Project setup</span>
           <h1 id="v3-setup-title">Set up {draft.display_name || "project"}</h1>
-          <p>Everything on this page is a resumable draft. Nothing is registered, uploaded, or written until Finish.</p>
+          <p>Saved automatically. Nothing changes until you finish setup.</p>
         </div>
         <button type="button" className="btn btn-ghost" onClick={onClose} disabled={finalizing} aria-label="Close setup; the draft is kept">
           <Icon name="x" size={17} />
@@ -452,14 +469,14 @@ export default function ProjectSetupWorkspace({
           <div className="v3-card-heading">
             <div>
               <strong>Agent profiles</strong>
-              <span>Which Codex or Claude homes this machine uses for the project.</span>
+              <span>Choose the agent homes used by this project.</span>
             </div>
             <span className={`v3-setup-state ${stateBadge(profilesSection?.state).className}`}>
               {stateBadge(profilesSection?.state).label}
             </span>
           </div>
           {profilesSection?.message && <div className="v3-callout error"><Icon name="alert-triangle" size={15} /> {profilesSection.message}</div>}
-          <div className="v3-provider-home-grid">
+          <div className="v3-agent-profile-list">
             {profileRow("codex", "Codex")}
             {profileRow("claude", "Claude")}
           </div>
@@ -470,7 +487,7 @@ export default function ProjectSetupWorkspace({
           <div className="v3-card-heading">
             <div>
               <strong>Storage</strong>
-              <span>One primary destination during setup; more can be linked later from project settings.</span>
+              <span>Choose one destination. Add more later from project settings.</span>
             </div>
             <span className={`v3-setup-state ${stateBadge(storageSection?.state).className}`}>
               {stateBadge(storageSection?.state).label}
