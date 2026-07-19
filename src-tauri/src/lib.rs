@@ -10596,6 +10596,7 @@ fn commands_used_by_run() {
         project_sync_v3::commands::get_local_project,
         project_sync_v3::commands::register_local_project,
         project_sync_v3::commands::remove_local_project,
+        project_sync_v3::commands::rename_local_project,
         project_sync_v3::commands::save_bundle_recipe,
         project_sync_v3::commands::save_project_link,
         project_sync_v3::commands::connect_project_to_remote_bundle,
@@ -10625,6 +10626,13 @@ fn commands_used_by_run() {
         project_sync_v3::commands::plan_dependencies,
         project_sync_v3::commands::apply_dependency_actions,
         project_sync_v3::commands::get_bundle_readiness,
+        project_sync_v3::commands::list_setup_drafts,
+        project_sync_v3::commands::create_setup_draft,
+        project_sync_v3::commands::get_setup_draft,
+        project_sync_v3::commands::update_setup_draft,
+        project_sync_v3::commands::discard_setup_draft,
+        project_sync_v3::commands::inspect_setup_draft,
+        project_sync_v3::commands::finalize_project_setup,
         UploadControl::default,
     );
 }
@@ -10674,6 +10682,7 @@ pub fn run() {
             project_sync_v3::commands::get_local_project,
             project_sync_v3::commands::register_local_project,
             project_sync_v3::commands::remove_local_project,
+            project_sync_v3::commands::rename_local_project,
             project_sync_v3::commands::save_bundle_recipe,
             project_sync_v3::commands::save_project_link,
             project_sync_v3::commands::connect_project_to_remote_bundle,
@@ -10703,6 +10712,13 @@ pub fn run() {
             project_sync_v3::commands::plan_dependencies,
             project_sync_v3::commands::apply_dependency_actions,
             project_sync_v3::commands::get_bundle_readiness,
+            project_sync_v3::commands::list_setup_drafts,
+            project_sync_v3::commands::create_setup_draft,
+            project_sync_v3::commands::get_setup_draft,
+            project_sync_v3::commands::update_setup_draft,
+            project_sync_v3::commands::discard_setup_draft,
+            project_sync_v3::commands::inspect_setup_draft,
+            project_sync_v3::commands::finalize_project_setup,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

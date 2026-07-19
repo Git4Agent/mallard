@@ -1349,63 +1349,65 @@ export default function SyncPanel({
                                 </div>
 
                                 <div className="storage-link-actions">
-                                  {isEmptyProfile ? (
-                                    <button
-                                      type="button"
-                                      className="storage-link-sync"
-                                      disabled={!onSetupLink || setupBusy || busy || saving || !!runningLinkAction}
-                                      onClick={(event) => {
-                                        event.stopPropagation();
-                                        void setupLink(link);
-                                      }}
-                                      title="Create this profile, pull its cloud files, install the agent CLI if needed, and restore plugins"
-                                      aria-label={`Set up ${profileLabel(profile)} from ${storage.name || "storage"}`}
-                                      aria-busy={setupBusy}
-                                    >
-                                      <Icon name="download" size={16} />
-                                      {setupBusy ? "Setting up…" : "Set up"}
-                                    </button>
-                                  ) : (
+                                  <div className="storage-link-action-group" role="group" aria-label="Storage actions">
+                                    {isEmptyProfile ? (
+                                      <button
+                                        type="button"
+                                        className="storage-link-sync storage-link-sync-primary"
+                                        disabled={!onSetupLink || setupBusy || busy || saving || !!runningLinkAction}
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          void setupLink(link);
+                                        }}
+                                        title="Create this profile, pull its cloud files, install the agent CLI if needed, and restore plugins"
+                                        aria-label={`Set up ${profileLabel(profile)} from ${storage.name || "storage"}`}
+                                        aria-busy={setupBusy}
+                                      >
+                                        <Icon name="download" size={15} />
+                                        {setupBusy ? "Setting up…" : "Set up"}
+                                      </button>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        className="storage-link-sync storage-link-sync-primary"
+                                        disabled={busy || saving || !!runningLinkAction}
+                                        onClick={(event) => {
+                                          event.stopPropagation();
+                                          void syncLinks("pull", [link]);
+                                        }}
+                                        title="Get files from this storage"
+                                      >
+                                        <Icon name="download" size={15} />
+                                        Pull
+                                      </button>
+                                    )}
                                     <button
                                       type="button"
                                       className="storage-link-sync"
                                       disabled={busy || saving || !!runningLinkAction}
                                       onClick={(event) => {
                                         event.stopPropagation();
-                                        void syncLinks("pull", [link]);
+                                        void syncLinks("push", [link]);
                                       }}
-                                      title="Get files from this storage"
+                                      title="Send local changes to this storage"
                                     >
-                                      <Icon name="download" size={16} />
-                                      Pull
+                                      <Icon name="upload" size={15} />
+                                      Push
                                     </button>
-                                  )}
-                                  <button
-                                    type="button"
-                                    className="storage-link-sync"
-                                    disabled={busy || saving || !!runningLinkAction}
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      void syncLinks("push", [link]);
-                                    }}
-                                    title="Send local changes to this storage"
-                                  >
-                                    <Icon name="upload" size={16} />
-                                    Push
-                                  </button>
-                                  <button
-                                    type="button"
-                                    className="storage-link-sync"
-                                    disabled={!onRepairProfile || busy || saving || setupBusy || !!runningLinkAction}
-                                    onClick={(event) => {
-                                      event.stopPropagation();
-                                      void repairProfile(profile);
-                                    }}
-                                    title={`Restore missing ${profile.root === ".codex" ? "Codex" : "Claude"} plugins into this profile`}
-                                  >
-                                    <Icon name="refresh" size={15} />
-                                    Repair
-                                  </button>
+                                    <button
+                                      type="button"
+                                      className="storage-link-sync"
+                                      disabled={!onRepairProfile || busy || saving || setupBusy || !!runningLinkAction}
+                                      onClick={(event) => {
+                                        event.stopPropagation();
+                                        void repairProfile(profile);
+                                      }}
+                                      title={`Restore missing ${profile.root === ".codex" ? "Codex" : "Claude"} plugins into this profile`}
+                                    >
+                                      <Icon name="refresh" size={14} />
+                                      Repair
+                                    </button>
+                                  </div>
                                 </div>
                               </div>
 

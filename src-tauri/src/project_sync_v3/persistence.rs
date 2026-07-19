@@ -1,13 +1,14 @@
 //! Bounded, atomic, schema-3 local persistence.
 //!
-//! Every file lives below `app_data/v3`; schema-2 configuration, baselines,
-//! backups, and machine records are neither read nor overwritten.  All
+//! Every file lives below `~/.mallard`; schema-2 configuration, baselines,
+//! backups, and machine records are neither read nor overwritten. All
 //! read-modify-write operations share a process lock and revision check so
 //! concurrent Tauri commands cannot silently lose changes.
 
 use super::domain::{
     DependencyApplications, DependencyPlan, MachineProjectState, Materializations, PlanId,
-    RestorePlan, SyncConfigV3, MACHINE_PROJECT_SCHEMA_V1,
+    ProjectSetupDraft, RestorePlan, SetupDraftId, SetupTransaction, SyncConfigV3,
+    MACHINE_PROJECT_SCHEMA_V1, MAX_SETUP_DRAFTS,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -15,7 +16,6 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use tauri::Manager;
 
 const MAX_CONFIG_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_BINDINGS_BYTES: u64 = 8 * 1024 * 1024;
@@ -23,6 +23,8 @@ const MAX_MATERIALIZATIONS_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_RESTORE_PLAN_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_DEPENDENCY_PLAN_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DEPENDENCY_APPLICATIONS_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_SETUP_DRAFT_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_SETUP_TRANSACTION_BYTES: u64 = 8 * 1024 * 1024;
 
 static PERSISTENCE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -32,27 +34,24 @@ pub struct V3Repository {
 }
 
 impl V3Repository {
-    /// Resolve the clean schema-3 namespace for any Tauri runtime.
-    pub fn from_app<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Result<Self, String> {
-        let app_data = app
-            .path()
-            .app_data_dir()
-            .map_err(|error| error.to_string())?;
-        Self::from_app_data_dir(app_data)
+    /// Resolve the machine-global metadata directory for any Tauri runtime.
+    pub fn from_app<R: tauri::Runtime>(_app: &tauri::AppHandle<R>) -> Result<Self, String> {
+        let home = dirs::home_dir().ok_or_else(|| "cannot find home directory".to_string())?;
+        Self::from_home_dir(home)
     }
 
-    /// Construct from the application-data directory.  Tests and non-Tauri
-    /// helpers use this to exercise exactly the production paths.
-    pub fn from_app_data_dir(app_data: impl Into<PathBuf>) -> Result<Self, String> {
-        let app_data = app_data.into();
-        if !app_data.is_absolute() {
+    /// Construct from a home directory. Tests and non-Tauri helpers use this
+    /// to exercise exactly the production path without touching the real home.
+    pub fn from_home_dir(home: impl Into<PathBuf>) -> Result<Self, String> {
+        let home = home.into();
+        if !home.is_absolute() {
             return Err(format!(
-                "app-data directory must be absolute: '{}'",
-                app_data.display()
+                "home directory must be absolute: '{}'",
+                home.display()
             ));
         }
         let repository = Self {
-            root: app_data.join("v3"),
+            root: home.join(".mallard"),
         };
         repository.ensure_root()?;
         Ok(repository)
@@ -215,6 +214,219 @@ impl V3Repository {
         Ok(result)
     }
 
+    pub fn setup_draft_path(&self, draft_id: &SetupDraftId) -> PathBuf {
+        self.root
+            .join("project_drafts")
+            .join(format!("{}.json", draft_id.as_str()))
+    }
+
+    pub fn setup_transaction_path(&self, draft_id: &SetupDraftId) -> PathBuf {
+        self.root
+            .join("setup_transactions")
+            .join(format!("{}.json", draft_id.as_str()))
+    }
+
+    /// Load every setup draft.  A malformed draft file becomes a warning
+    /// instead of hiding the readable drafts behind one error.
+    pub fn list_setup_drafts(&self) -> Result<(Vec<ProjectSetupDraft>, Vec<String>), String> {
+        let _guard = persistence_guard()?;
+        let (loaded, mut warnings): (Vec<ProjectSetupDraft>, _) =
+            self.list_documents(&self.root.join("project_drafts"), MAX_SETUP_DRAFT_BYTES)?;
+        let mut drafts = Vec::new();
+        for draft in loaded {
+            match draft.validate() {
+                Ok(()) => drafts.push(draft),
+                Err(error) => warnings.push(format!("invalid draft '{}': {}", draft.draft_id, error)),
+            }
+        }
+        drafts.sort_by(|left, right| {
+            right
+                .updated_at
+                .cmp(&left.updated_at)
+                .then_with(|| left.draft_id.cmp(&right.draft_id))
+        });
+        Ok((drafts, warnings))
+    }
+
+    pub fn load_setup_draft(
+        &self,
+        draft_id: &SetupDraftId,
+    ) -> Result<Option<ProjectSetupDraft>, String> {
+        let _guard = persistence_guard()?;
+        let draft: Option<ProjectSetupDraft> = read_json_bounded(
+            &self.root,
+            &self.setup_draft_path(draft_id),
+            MAX_SETUP_DRAFT_BYTES,
+        )?;
+        if let Some(draft) = &draft {
+            draft.validate()?;
+            if &draft.draft_id != draft_id {
+                return Err(format!(
+                    "setup draft file '{}' contains draft '{}'",
+                    draft_id, draft.draft_id
+                ));
+            }
+        }
+        Ok(draft)
+    }
+
+    /// Revision-guarded draft save.  Creation submits revision 0 against a
+    /// missing file; updates must submit the revision they read.  The stored
+    /// document gets the next revision, which is also returned.
+    pub fn save_setup_draft(&self, mut draft: ProjectSetupDraft) -> Result<ProjectSetupDraft, String> {
+        let _guard = persistence_guard()?;
+        let path = self.setup_draft_path(&draft.draft_id);
+        let current: Option<ProjectSetupDraft> =
+            read_json_bounded(&self.root, &path, MAX_SETUP_DRAFT_BYTES)?;
+        match &current {
+            Some(existing) => {
+                if draft.revision != existing.revision {
+                    return Err(format!(
+                        "setup draft changed (expected revision {}, current {})",
+                        draft.revision, existing.revision
+                    ));
+                }
+            }
+            None => {
+                if draft.revision != 0 {
+                    return Err("new setup draft must start at revision 0".to_string());
+                }
+                let (existing, _) =
+                    self.list_documents::<ProjectSetupDraft>(
+                        &self.root.join("project_drafts"),
+                        MAX_SETUP_DRAFT_BYTES,
+                    )?;
+                if existing.len() >= MAX_SETUP_DRAFTS {
+                    return Err(format!(
+                        "too many setup drafts (limit {}); discard one first",
+                        MAX_SETUP_DRAFTS
+                    ));
+                }
+            }
+        }
+        draft.revision = draft.revision.saturating_add(1);
+        draft.validate()?;
+        self.ensure_directory(path.parent().ok_or("setup draft has no parent")?)?;
+        write_json_atomic(&self.root, &path, &draft, MAX_SETUP_DRAFT_BYTES)?;
+        Ok(draft)
+    }
+
+    pub fn delete_setup_draft(&self, draft_id: &SetupDraftId) -> Result<bool, String> {
+        let _guard = persistence_guard()?;
+        let path = self.setup_draft_path(draft_id);
+        ensure_no_symlinks(&self.root, &path)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!("remove setup draft '{}': {}", draft_id, error)),
+        }
+    }
+
+    pub fn list_setup_transactions(&self) -> Result<(Vec<SetupTransaction>, Vec<String>), String> {
+        let _guard = persistence_guard()?;
+        let (loaded, mut warnings) = self.list_documents::<SetupTransaction>(
+            &self.root.join("setup_transactions"),
+            MAX_SETUP_TRANSACTION_BYTES,
+        )?;
+        let mut transactions = Vec::new();
+        for transaction in loaded {
+            match transaction.validate() {
+                // An invalid transaction is preserved on disk for inspection;
+                // recovery must not complete or delete what it cannot trust.
+                Ok(()) => transactions.push(transaction),
+                Err(error) => warnings.push(format!(
+                    "invalid setup transaction '{}': {}",
+                    transaction.draft_id, error
+                )),
+            }
+        }
+        Ok((transactions, warnings))
+    }
+
+    pub fn load_setup_transaction(
+        &self,
+        draft_id: &SetupDraftId,
+    ) -> Result<Option<SetupTransaction>, String> {
+        let _guard = persistence_guard()?;
+        let transaction: Option<SetupTransaction> = read_json_bounded(
+            &self.root,
+            &self.setup_transaction_path(draft_id),
+            MAX_SETUP_TRANSACTION_BYTES,
+        )?;
+        if let Some(transaction) = &transaction {
+            transaction.validate()?;
+        }
+        Ok(transaction)
+    }
+
+    /// A transaction is one finalize attempt's committed intent; replacing an
+    /// existing file would silently reinterpret an in-flight application.
+    pub fn save_setup_transaction(&self, transaction: &SetupTransaction) -> Result<(), String> {
+        let _guard = persistence_guard()?;
+        transaction.validate()?;
+        let path = self.setup_transaction_path(&transaction.draft_id);
+        self.ensure_directory(path.parent().ok_or("setup transaction has no parent")?)?;
+        if fs::symlink_metadata(&path).is_ok() {
+            return Err(format!(
+                "setup transaction for draft '{}' already exists",
+                transaction.draft_id
+            ));
+        }
+        write_json_atomic(&self.root, &path, transaction, MAX_SETUP_TRANSACTION_BYTES)
+    }
+
+    pub fn delete_setup_transaction(&self, draft_id: &SetupDraftId) -> Result<bool, String> {
+        let _guard = persistence_guard()?;
+        let path = self.setup_transaction_path(draft_id);
+        ensure_no_symlinks(&self.root, &path)?;
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(format!(
+                "remove setup transaction '{}': {}",
+                draft_id, error
+            )),
+        }
+    }
+
+    fn list_documents<T: DeserializeOwned>(
+        &self,
+        directory: &Path,
+        max_bytes: u64,
+    ) -> Result<(Vec<T>, Vec<String>), String> {
+        match fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "'{}' is not a real directory",
+                    directory.display()
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok((Vec::new(), Vec::new()))
+            }
+            Err(error) => return Err(format!("inspect '{}': {}", directory.display(), error)),
+        }
+        let entries = fs::read_dir(directory)
+            .map_err(|error| format!("list '{}': {}", directory.display(), error))?;
+        let mut documents = Vec::new();
+        let mut warnings = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("list '{}': {}", directory.display(), error))?;
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "json") {
+                continue;
+            }
+            match read_json_bounded::<T>(&self.root, &path, max_bytes) {
+                Ok(Some(document)) => documents.push(document),
+                Ok(None) => {}
+                Err(error) => warnings.push(format!("unreadable '{}': {}", path.display(), error)),
+            }
+        }
+        Ok((documents, warnings))
+    }
+
     /// Restore plans are immutable, generation-pinned documents.  Reusing a
     /// plan ID is always an error instead of replacing an approval surface.
     pub fn save_restore_plan(&self, plan: &RestorePlan) -> Result<(), String> {
@@ -319,10 +531,10 @@ impl V3Repository {
         let parent = self
             .root
             .parent()
-            .ok_or_else(|| format!("v3 root '{}' has no parent", self.root.display()))?;
+            .ok_or_else(|| format!("metadata root '{}' has no parent", self.root.display()))?;
         fs::create_dir_all(parent).map_err(|error| {
             format!(
-                "create app-data directory '{}': {}",
+                "create metadata parent directory '{}': {}",
                 parent.display(),
                 error
             )
@@ -330,13 +542,17 @@ impl V3Repository {
         if let Ok(metadata) = fs::symlink_metadata(&self.root) {
             if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
                 return Err(format!(
-                    "schema-3 app directory '{}' is not a real directory",
+                    "metadata directory '{}' is not a real directory",
                     self.root.display()
                 ));
             }
         } else {
             fs::create_dir(&self.root).map_err(|error| {
-                format!("create v3 directory '{}': {}", self.root.display(), error)
+                format!(
+                    "create metadata directory '{}': {}",
+                    self.root.display(),
+                    error
+                )
             })?;
         }
         ensure_no_symlinks(&self.root, &self.root)
@@ -529,7 +745,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn repository(temp: &tempfile::TempDir) -> V3Repository {
-        V3Repository::from_app_data_dir(temp.path()).unwrap()
+        V3Repository::from_home_dir(temp.path()).unwrap()
     }
 
     fn project() -> LocalProjectRegistration {
@@ -537,6 +753,7 @@ mod tests {
             local_project_id: LocalProjectId::parse("project-a").unwrap(),
             bundle_id: BundleId::parse("0123456789abcdef0123456789abcdef").unwrap(),
             display_name: "Project A".to_string(),
+            local_alias: None,
             repository_fingerprint: None,
             recipe: BundleRecipe::default(),
             recipe_bases: BTreeMap::new(),
@@ -547,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn v3_persistence_never_touches_schema2_files() {
+    fn mallard_persistence_never_touches_schema2_files() {
         let temp = tempfile::tempdir().unwrap();
         let old = temp.path().join("sync_config.json");
         fs::write(&old, b"{\"schema\":2,\"keep\":true}\n").unwrap();
@@ -557,7 +774,7 @@ mod tests {
         assert_eq!(saved.schema, LOCAL_SCHEMA_V3);
         assert_eq!(saved.revision, 1);
         assert_eq!(fs::read(&old).unwrap(), b"{\"schema\":2,\"keep\":true}\n");
-        assert!(repo.config_path().starts_with(temp.path().join("v3")));
+        assert!(repo.config_path().starts_with(temp.path().join(".mallard")));
     }
 
     #[test]
@@ -595,7 +812,7 @@ mod tests {
         let repo = repository(&temp);
         let plan = PlanId::parse(generated_named_id("plan").unwrap()).unwrap();
         let path = repo.restore_plan_path(&plan);
-        assert!(path.starts_with(temp.path().join("v3/restore_plans")));
+        assert!(path.starts_with(temp.path().join(".mallard/restore_plans")));
         assert_eq!(
             path.file_name().unwrap().to_string_lossy(),
             format!("{}.json", plan)
@@ -604,13 +821,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn app_owned_v3_root_must_not_be_a_symlink() {
+    fn metadata_root_must_not_be_a_symlink() {
         use std::os::unix::fs::symlink;
 
         let temp = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
-        symlink(outside.path(), temp.path().join("v3")).unwrap();
-        let error = V3Repository::from_app_data_dir(temp.path()).unwrap_err();
+        symlink(outside.path(), temp.path().join(".mallard")).unwrap();
+        let error = V3Repository::from_home_dir(temp.path()).unwrap_err();
         assert!(error.contains("not a real directory"));
     }
 }

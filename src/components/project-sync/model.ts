@@ -9,6 +9,11 @@ import type {
 } from "../../types";
 import { userFacingRepoTerms } from "../../terminology";
 
+/** Machine-local alias wins over the shared repo name wherever a project is labelled. */
+export function projectLabel(project: { display_name: string; local_alias?: string | null }): string {
+  return project.local_alias?.trim() || project.display_name;
+}
+
 export const RESOURCE_GROUPS: Array<{
   id: ProjectResourceCategory;
   label: string;

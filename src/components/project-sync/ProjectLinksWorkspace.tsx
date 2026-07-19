@@ -15,13 +15,14 @@ import Icon from "../Icons";
 import ResourceInventory from "./ResourceInventory";
 import { newStorage, StorageEditor } from "./StorageSettingsV3";
 import { projectSyncApi } from "./api";
-import { compactProjectPath, errorMessage } from "./model";
+import { compactProjectPath, errorMessage, formatRelativeTime, projectLabel } from "./model";
 
 type LinkKey = { projectId: string; storageId: string };
 type StorageEditorRequest =
-  | { mode: "edit"; storageId: string; requestId: number }
-  | { mode: "create"; storageKind: "local" | "s3"; requestId: number };
-type ProjectEditorRequest = { projectId: string; requestId: number };
+  | { mode: "toggle"; storageId: string; requestId: number }
+  | { mode: "create"; storageKind: "local" | "s3"; requestId: number }
+  | { mode: "close"; requestId: number };
+type ProjectEditorRequest = { mode: "toggle" | "close"; projectId: string; requestId: number };
 
 interface Props {
   projects: LocalProjectSummary[];
@@ -46,6 +47,7 @@ interface Props {
   onPull: (projectId: string, storageId: string) => Promise<void> | void;
   onRepair: (projectId: string, storageId: string) => Promise<void> | void;
   onSaveProjectPath: (projectId: string, path: string) => Promise<void> | void;
+  onRenameProject: (projectId: string, alias: string | null) => Promise<void> | void;
   onAssignProfile: (projectId: string, provider: ProjectProvider, profileId: string | null) => Promise<void> | void;
   onAddProfilePath: (projectId: string, provider: ProjectProvider, path: string) => Promise<void> | void;
   onRemoveProject: (projectId: string) => Promise<void> | void;
@@ -53,12 +55,6 @@ interface Props {
   onAddProject: () => void;
   onOpenStorageSettings: (storageId?: string) => void;
   onSaveStorage: (storage: StorageConfigV3) => Promise<void> | void;
-  onSelectBundle: (
-    projectId: string,
-    storageId: string,
-    bundleId: string,
-    allowRepositoryMismatch: boolean,
-  ) => Promise<void> | void;
   storageEditorRequest?: StorageEditorRequest | null;
   onStorageEditorRequestHandled?: () => void;
   projectEditorRequest?: ProjectEditorRequest | null;
@@ -110,6 +106,7 @@ export default function ProjectLinksWorkspace({
   onPull,
   onRepair,
   onSaveProjectPath,
+  onRenameProject,
   onAssignProfile,
   onAddProfilePath,
   onRemoveProject,
@@ -117,7 +114,6 @@ export default function ProjectLinksWorkspace({
   onAddProject,
   onOpenStorageSettings,
   onSaveStorage,
-  onSelectBundle,
   storageEditorRequest,
   onStorageEditorRequestHandled,
   projectEditorRequest,
@@ -133,12 +129,12 @@ export default function ProjectLinksWorkspace({
   const [bundlePage, setBundlePage] = useState<BundlePage | null>(null);
   const [bundleLoading, setBundleLoading] = useState(false);
   const [bundleError, setBundleError] = useState<string | null>(null);
-  const [selectedBundleId, setSelectedBundleId] = useState("");
   const [providerPathDraft, setProviderPathDraft] = useState("");
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [projectPathDraft, setProjectPathDraft] = useState("");
+  const [projectAliasDraft, setProjectAliasDraft] = useState("");
   const bundleRequestRef = useRef(0);
-  const storageSettingsRef = useRef<HTMLElement>(null);
+  const storageSettingsRef = useRef<HTMLDivElement>(null);
   const projectSettingsRef = useRef<HTMLDivElement>(null);
   const counts = statusCounts(statuses);
 
@@ -190,31 +186,7 @@ export default function ProjectLinksWorkspace({
   const editedStorageConfig = savedEditedStorage
     ?? (storageDraft?.id === editingStorage?.storageId ? storageDraft : null);
   const creatingStorage = !!editingStorage && !savedEditedStorage;
-  const editedStorageProject = editingStorage
-    ? projects.find((project) => project.local_project_id === editingStorage.projectId) ?? null
-    : null;
-  const editedStorageLink = editingStorage
-    ? links.find((link) => (
-      link.local_project_id === editingStorage.projectId
-      && link.storage_id === editingStorage.storageId
-    )) ?? null
-    : null;
-  const selectedRemoteBundle = bundlePage?.bundles.find((bundle) => (
-    bundle.bundle_id === selectedBundleId
-  )) ?? null;
-  const selectedFingerprintDiffers = !!editedStorageProject?.repository_fingerprint
-    && !!selectedRemoteBundle?.repository_fingerprint
-    && editedStorageProject.repository_fingerprint !== selectedRemoteBundle.repository_fingerprint;
-  const selectedFingerprintUnknown = !!editedStorageProject?.repository_fingerprint
-    && !!selectedRemoteBundle
-    && !selectedRemoteBundle.repository_fingerprint;
-  const allowRepositoryMismatch = selectedFingerprintDiffers || selectedFingerprintUnknown;
   const orderedRemoteBundles = [...(bundlePage?.bundles ?? [])].sort((left, right) => {
-    const leftMatches = !!editedStorageProject?.repository_fingerprint
-      && left.repository_fingerprint === editedStorageProject.repository_fingerprint;
-    const rightMatches = !!editedStorageProject?.repository_fingerprint
-      && right.repository_fingerprint === editedStorageProject.repository_fingerprint;
-    if (leftMatches !== rightMatches) return leftMatches ? -1 : 1;
     return (right.updated_at ?? 0) - (left.updated_at ?? 0);
   });
 
@@ -235,7 +207,6 @@ export default function ProjectLinksWorkspace({
     }
 
     bundleRequestRef.current += 1;
-    setEditingProjectId(null);
     setEditingStorage(null);
     setStorageDraft(null);
     setBundleLoading(false);
@@ -263,6 +234,16 @@ export default function ProjectLinksWorkspace({
 
   useEffect(() => {
     if (!storageEditorRequest) return;
+    if (storageEditorRequest.mode === "close") {
+      bundleRequestRef.current += 1;
+      setEditingStorage(null);
+      setStorageDraft(null);
+      setBundlePage(null);
+      setBundleError(null);
+      setBundleLoading(false);
+      onStorageEditorRequestHandled?.();
+      return;
+    }
     if (storageEditorRequest.mode === "create") {
       const storage = newStorage(storageEditorRequest.storageKind, storages.length + 1);
       bundleRequestRef.current += 1;
@@ -274,31 +255,47 @@ export default function ProjectLinksWorkspace({
       setBundlePage(null);
       setBundleError(null);
       setBundleLoading(false);
-      setSelectedBundleId("");
       onStorageEditorRequestHandled?.();
       return;
     }
     const storage = storages.find((candidate) => candidate.id === storageEditorRequest.storageId);
     if (!storage) return;
-    const storageLinks = links.filter((link) => link.storage_id === storage.id);
-    const link = storageLinks.find((candidate) => candidate.local_project_id === activeProjectId)
-      ?? storageLinks[0]
-      ?? null;
+    if (editingStorage?.storageId === storage.id) {
+      bundleRequestRef.current += 1;
+      setEditingStorage(null);
+      setStorageDraft(null);
+      setBundlePage(null);
+      setBundleError(null);
+      setBundleLoading(false);
+      onStorageEditorRequestHandled?.();
+      return;
+    }
 
     setExpandedLink(null);
     setExpandedProvider(null);
     setEditingProjectId(null);
-    setEditingStorage({ projectId: link?.local_project_id ?? "", storageId: storage.id });
+    setEditingStorage({ projectId: "", storageId: storage.id });
     setStorageDraft({ ...storage });
-    setSelectedBundleId(link?.bundle_id ?? "");
     void loadStorageBundles(storage.id);
     onStorageEditorRequestHandled?.();
   }, [storageEditorRequest?.requestId]);
 
   useEffect(() => {
     if (!projectEditorRequest) return;
+    if (projectEditorRequest.mode === "close") {
+      setEditingProjectId(null);
+      setProjectPathDraft("");
+      onProjectEditorRequestHandled?.();
+      return;
+    }
     const project = projects.find((candidate) => candidate.local_project_id === projectEditorRequest.projectId);
     if (!project) return;
+    if (editingProjectId === project.local_project_id) {
+      setEditingProjectId(null);
+      setProjectPathDraft("");
+      onProjectEditorRequestHandled?.();
+      return;
+    }
     const projectBinding = bindingByProject.get(project.local_project_id);
     bundleRequestRef.current += 1;
     setExpandedLink(null);
@@ -307,6 +304,7 @@ export default function ProjectLinksWorkspace({
     setStorageDraft(null);
     setEditingProjectId(project.local_project_id);
     setProjectPathDraft(projectBinding?.project_root ?? project.project_root ?? "");
+    setProjectAliasDraft(project.local_alias ?? "");
     void onSelectProject(project.local_project_id);
     onProjectEditorRequestHandled?.();
   }, [projectEditorRequest?.requestId]);
@@ -323,15 +321,14 @@ export default function ProjectLinksWorkspace({
     setStorageDraft(null);
     setEditingProjectId(projectId);
     setProjectPathDraft(currentPath);
+    setProjectAliasDraft(
+      projects.find((candidate) => candidate.local_project_id === projectId)?.local_alias ?? "",
+    );
     await onSelectProject(projectId);
   };
 
-  const toggleStorageEditor = async (
-    projectId: string,
-    storage: StorageConfigV3,
-    currentBundleId: string,
-  ) => {
-    if (sameLink(editingStorage, projectId, storage.id)) {
+  const toggleStorageEditor = async (storage: StorageConfigV3) => {
+    if (editingStorage?.storageId === storage.id) {
       setEditingStorage(null);
       setStorageDraft(null);
       return;
@@ -339,35 +336,162 @@ export default function ProjectLinksWorkspace({
 
     setExpandedLink(null);
     setExpandedProvider(null);
-    setEditingProjectId(null);
-    setEditingStorage({ projectId, storageId: storage.id });
+    setEditingStorage({ projectId: "", storageId: storage.id });
     setStorageDraft({ ...storage });
-    setSelectedBundleId(currentBundleId);
     await loadStorageBundles(storage.id);
   };
 
+  const settingsProject = editingProjectId
+    ? projects.find((project) => project.local_project_id === editingProjectId) ?? null
+    : null;
+
+  if (editingStorage && storageDraft && editedStorageConfig) {
+    return (
+      <main className="v3-main v3-project-links-page v3-storage-settings-page">
+        <section className="profile-links-section" aria-labelledby="storage-settings-heading">
+          <div className="profile-links-heading">
+            <div className="profile-links-copy">
+              <h1 id="storage-settings-heading" className="settings-section-title">
+                {creatingStorage ? "New storage" : "Storage settings"}
+              </h1>
+              <div className="profile-links-subtitle">
+                {creatingStorage ? "Configure a storage destination." : editedStorageConfig.name || "Unnamed storage"}
+              </div>
+            </div>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={() => {
+                setEditingStorage(null);
+                setStorageDraft(null);
+              }}
+              aria-label="Close storage settings"
+            >
+              <Icon name="x" size={14} />
+            </button>
+          </div>
+
+          <div ref={storageSettingsRef} className="v3-storage-settings-below v3-storage-settings-dedicated">
+            <StorageEditor storage={storageDraft} disabled={busy} onChange={setStorageDraft} />
+
+            <div className="v3-inline-storage-save">
+              <span>Credentials and storage details stay on this machine.</span>
+              <button
+                type="button"
+                className="btn"
+                disabled={busy || (!creatingStorage && JSON.stringify(storageDraft) === JSON.stringify(editedStorageConfig))}
+                onClick={() => void run(`storage:${editedStorageConfig.id}`, async () => {
+                  await onSaveStorage(storageDraft);
+                  await loadStorageBundles(editedStorageConfig.id);
+                })}
+              >
+                {runningAction === `storage:${editedStorageConfig.id}` ? "Saving…" : creatingStorage ? "Create storage" : "Save storage"}
+              </button>
+            </div>
+
+            {!creatingStorage && (
+              <section className="v3-storage-repositories" aria-labelledby="storage-repositories-heading">
+                <div className="v3-storage-repositories-heading">
+                  <div>
+                    <h2 id="storage-repositories-heading">Repositories</h2>
+                    <span>{orderedRemoteBundles.length} repo{orderedRemoteBundles.length === 1 ? "" : "s"} in this storage</span>
+                  </div>
+                  <button
+                    type="button"
+                    className="btn btn-ghost"
+                    onClick={() => void loadStorageBundles(editedStorageConfig.id)}
+                    disabled={busy || bundleLoading}
+                    title="Refresh repositories"
+                    aria-label={`Refresh repositories in ${editedStorageConfig.name || "storage"}`}
+                  >
+                    <Icon name="refresh" size={14} className={bundleLoading ? "icon-spin" : undefined} />
+                  </button>
+                </div>
+
+                {bundleLoading ? (
+                  <div className="v3-storage-repository-state"><span className="status-loader" /> Loading repositories…</div>
+                ) : bundleError ? (
+                  <div className="v3-callout error"><Icon name="alert-triangle" size={15} /> {bundleError}</div>
+                ) : orderedRemoteBundles.length === 0 ? (
+                  <div className="v3-storage-repository-state">No repositories in this storage.</div>
+                ) : (
+                  <div className="v3-storage-repository-list">
+                    {orderedRemoteBundles.map((bundle) => (
+                      <div key={bundle.bundle_id} className="v3-storage-repository-row">
+                        <span className="v3-storage-repository-icon"><Icon name="folder" size={17} /></span>
+                        <div className="v3-storage-repository-copy">
+                          <strong>{bundle.display_name || "Unnamed repository"}</strong>
+                          <code>{bundle.bundle_id}</code>
+                        </div>
+                        <div className="v3-storage-repository-meta">
+                          <strong>Generation {bundle.generation ?? "—"}</strong>
+                          <span>{bundle.resource_count ?? 0} resources · {formatRelativeTime(bundle.updated_at)}</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </section>
+            )}
+
+            {error && <div className="v3-callout error"><Icon name="alert-triangle" size={15} /> {error}</div>}
+          </div>
+        </section>
+      </main>
+    );
+  }
+
+  if (!settingsProject && !editingStorage && !newProjectSetup) {
+    return (
+      <main className="v3-main v3-project-links-page v3-git-info-page">
+        <section className="profile-links-section" aria-labelledby="git-info-heading">
+          <div className="profile-links-heading">
+            <div className="profile-links-copy">
+              <h1 id="git-info-heading" className="settings-section-title">Git Info</h1>
+            </div>
+          </div>
+        </section>
+      </main>
+    );
+  }
+
   return (
-    <main className="v3-main v3-project-links-page">
+    <main className={`v3-main v3-project-links-page${settingsProject ? " v3-project-settings-page" : ""}`}>
       <section className="profile-links-section" aria-labelledby="project-links-heading">
         <div className="profile-links-heading">
           <div className="profile-links-copy">
-            <h1 id="project-links-heading" className="settings-section-title">Project links</h1>
-            <div className="profile-links-subtitle">Choose where each project repo syncs.</div>
-          </div>
-          <div className="profile-links-heading-actions">
-            <div className="profile-links-counts">
-              {projects.length} projects <span>·</span> {storages.length} storage <span>·</span> {links.length} links
-            </div>
-            <div className="profile-links-primary-actions">
-              <button type="button" className="btn profile-refresh-linkage" onClick={onRefresh} disabled={loading || busy}>
-                <Icon name="refresh" size={16} className={loading ? "icon-spin" : undefined} />
-                {loading ? "Refreshing…" : "Refresh"}
-              </button>
-              <button type="button" className="btn profile-add-profile" onClick={onAddProject} disabled={busy}>
-                <Icon name="plus" size={16} /> Add project
-              </button>
+            <h1 id="project-links-heading" className="settings-section-title">
+              {settingsProject ? "Project settings" : "Project links"}
+            </h1>
+            <div className="profile-links-subtitle">
+              {settingsProject ? projectLabel(settingsProject) : "Choose where each project repo syncs."}
             </div>
           </div>
+          {settingsProject ? (
+            <button
+              type="button"
+              className="btn btn-ghost v3-project-settings-close"
+              onClick={() => setEditingProjectId(null)}
+              aria-label="Close project settings"
+            >
+              <Icon name="x" size={15} />
+            </button>
+          ) : (
+            <div className="profile-links-heading-actions">
+              <div className="profile-links-counts">
+                {projects.length} projects <span>·</span> {storages.length} storage <span>·</span> {links.length} links
+              </div>
+              <div className="profile-links-primary-actions">
+                <button type="button" className="btn profile-refresh-linkage" onClick={onRefresh} disabled={loading || busy}>
+                  <Icon name="refresh" size={16} className={loading ? "icon-spin" : undefined} />
+                  {loading ? "Refreshing…" : "Refresh"}
+                </button>
+                <button type="button" className="btn profile-add-profile" onClick={onAddProject} disabled={busy}>
+                  <Icon name="plus" size={16} /> Add project
+                </button>
+              </div>
+            </div>
+          )}
         </div>
 
         {newProjectSetup}
@@ -382,7 +506,7 @@ export default function ProjectLinksWorkspace({
           </div>
         ) : (
           <div className="profile-links-list">
-            {projects.map((project) => {
+            {(settingsProject ? [settingsProject] : projects).map((project) => {
               const projectLinks = linkedByProject.get(project.local_project_id) ?? [];
               const availableStorages = storages.filter((storage) => (
                 !projectLinks.some((link) => link.storage_id === storage.id)
@@ -414,6 +538,8 @@ export default function ProjectLinksWorkspace({
               const projectProfileSummary = assignedProfiles.length === 1 && profilesReadable
                 ? `${assignedProfiles[0].provider === "codex" ? "Codex" : "Claude"} · ${assignedProfiles[0].profile.display_name}`
                 : profileTitle;
+              const label = projectLabel(project);
+              const aliased = label !== project.display_name;
 
               return (
                 <article
@@ -424,7 +550,8 @@ export default function ProjectLinksWorkspace({
                   <div className="profile-link-profile">
                     <span className="profile-link-profile-icon"><Icon name="folder" size={25} /></span>
                     <div className="profile-link-profile-copy">
-                      <strong>{project.display_name}</strong>
+                      <strong title={aliased ? `Shared repo name: ${label}` : undefined}>{label}</strong>
+                      {aliased && <span className="profile-link-path">Repo · {project.display_name}</span>}
                       <span>{resourceCount} selected resources</span>
                       <span className="profile-link-path" title={project.project_root ?? undefined}>
                         {compactProjectPath(project.project_root)}
@@ -432,13 +559,13 @@ export default function ProjectLinksWorkspace({
                       <span className={`v3-project-profile-summary${canSync ? "" : " missing"}`}>
                         {projectProfileSummary}
                       </span>
-                      <div className="profile-link-profile-actions" role="group" aria-label={`Actions for ${project.display_name}`}>
+                      <div className="profile-link-profile-actions" role="group" aria-label={`Actions for ${label}`}>
                         <button
                           type="button"
                           className="profile-utility-btn"
                           disabled={!firstLink || !canRestore || busy || !!runningAction || (active && selectionDirty)}
                           onClick={() => firstLink && void run(`pull:${project.local_project_id}:${firstLink.storage_id}`, () => onPull(project.local_project_id, firstLink.storage_id))}
-                          title={!profilesWritable && projectBinding ? "Selected provider profile is unavailable or read only" : `Pull ${project.display_name} from its first linked storage`}
+                          title={!profilesWritable && projectBinding ? "Selected provider profile is unavailable or read only" : `Pull ${label} from its first linked storage`}
                         >
                           <Icon name="download" size={14} />
                         </button>
@@ -447,7 +574,7 @@ export default function ProjectLinksWorkspace({
                           className="profile-utility-btn"
                           disabled={!firstLink || !canSync || busy || !!runningAction}
                           onClick={() => firstLink && void run(`push:${project.local_project_id}:${firstLink.storage_id}`, () => onPush(project.local_project_id, firstLink.storage_id))}
-                          title={!profilesReadable && projectBinding ? "Selected provider profile is unavailable" : `Push ${project.display_name} to its first linked storage`}
+                          title={!profilesReadable && projectBinding ? "Selected provider profile is unavailable" : `Push ${label} to its first linked storage`}
                         >
                           <Icon name="upload" size={14} />
                         </button>
@@ -459,7 +586,7 @@ export default function ProjectLinksWorkspace({
                             project.local_project_id,
                             projectBinding?.project_root ?? project.project_root ?? "",
                           )}
-                          title={`Project settings for ${project.display_name}`}
+                          title={`Project settings for ${label}`}
                           aria-expanded={editingProjectId === project.local_project_id}
                         >
                           <Icon name="settings" size={13} />
@@ -469,7 +596,7 @@ export default function ProjectLinksWorkspace({
                           className="profile-utility-btn profile-remove-btn"
                           disabled={busy}
                           onClick={() => void onRemoveProject(project.local_project_id)}
-                          title={`Remove ${project.display_name} from Agent Sync; files stay on disk`}
+                          title={`Remove ${label} from Agent Sync; files stay on disk`}
                         >
                           <Icon name="trash" size={13} />
                         </button>
@@ -502,11 +629,11 @@ export default function ProjectLinksWorkspace({
                               </div>
                               <button
                                 type="button"
-                                className={`storage-link-configure${sameLink(editingStorage, project.local_project_id, storage.id) ? " active" : ""}`}
-                                onClick={() => void toggleStorageEditor(project.local_project_id, storage, link.bundle_id)}
+                                className={`storage-link-configure${editingStorage?.storageId === storage.id ? " active" : ""}`}
+                                onClick={() => void toggleStorageEditor(storage)}
                                 title={`Configure ${storage.name || "storage"}`}
                                 aria-label={`Configure ${storage.name || "storage"}`}
-                                aria-expanded={sameLink(editingStorage, project.local_project_id, storage.id)}
+                                aria-expanded={editingStorage?.storageId === storage.id}
                               >
                                 <Icon name="settings" size={16} />
                               </button>
@@ -546,36 +673,38 @@ export default function ProjectLinksWorkspace({
                             })}
 
                             <div className="storage-link-actions">
-                              <button
-                                type="button"
-                                className="storage-link-sync"
-                                disabled={busy || !!runningAction || (!!projectBinding && !canRestore)}
-                                onClick={() => void run(`pull:${actionPrefix}`, () => onPull(project.local_project_id, storage.id))}
-                                title={!profilesWritable && projectBinding ? "Selected provider profile is unavailable or read only" : "Review the Pull actions before applying them"}
-                              >
-                                <Icon name="download" size={16} />
-                                {runningAction === `pull:${actionPrefix}` ? "Preparing…" : project.project_root ? "Review & Apply" : "Set up"}
-                              </button>
-                              <button
-                                type="button"
-                                className="storage-link-sync"
-                                disabled={busy || !!runningAction || !canSync || resourceCount === 0 || (active && selectionDirty)}
-                                onClick={() => void run(`push:${actionPrefix}`, () => onPush(project.local_project_id, storage.id))}
-                                title={!profilesReadable && projectBinding ? "Selected provider profile is unavailable" : "Push this project's selected resources"}
-                              >
-                                <Icon name="upload" size={16} />
-                                {runningAction === `push:${actionPrefix}` ? "Pushing…" : "Push"}
-                              </button>
-                              <button
-                                type="button"
-                                className="storage-link-sync"
-                                disabled={busy || !!runningAction || !canRestore}
-                                onClick={() => void run(`repair:${actionPrefix}`, () => onRepair(project.local_project_id, storage.id))}
-                                title={!profilesWritable && projectBinding ? "Selected provider profile is unavailable or read only" : "Review missing dependencies and repair this project"}
-                              >
-                                <Icon name="refresh" size={15} />
-                                {runningAction === `repair:${actionPrefix}` ? "Checking…" : "Repair"}
-                              </button>
+                              <div className="storage-link-action-group" role="group" aria-label="Project storage actions">
+                                <button
+                                  type="button"
+                                  className="storage-link-sync storage-link-sync-primary"
+                                  disabled={busy || !!runningAction || (!!projectBinding && !canRestore)}
+                                  onClick={() => void run(`pull:${actionPrefix}`, () => onPull(project.local_project_id, storage.id))}
+                                  title={!profilesWritable && projectBinding ? "Selected provider profile is unavailable or read only" : "Review the Pull actions before applying them"}
+                                >
+                                  <Icon name="download" size={15} />
+                                  {runningAction === `pull:${actionPrefix}` ? "Reviewing…" : project.project_root ? "Pull" : "Set up"}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="storage-link-sync"
+                                  disabled={busy || !!runningAction || !canSync || resourceCount === 0 || (active && selectionDirty)}
+                                  onClick={() => void run(`push:${actionPrefix}`, () => onPush(project.local_project_id, storage.id))}
+                                  title={!profilesReadable && projectBinding ? "Selected provider profile is unavailable" : "Push this project's selected resources"}
+                                >
+                                  <Icon name="upload" size={15} />
+                                  {runningAction === `push:${actionPrefix}` ? "Pushing…" : "Push"}
+                                </button>
+                                <button
+                                  type="button"
+                                  className="storage-link-sync"
+                                  disabled={busy || !!runningAction || !canRestore}
+                                  onClick={() => void run(`repair:${actionPrefix}`, () => onRepair(project.local_project_id, storage.id))}
+                                  title={!profilesWritable && projectBinding ? "Selected provider profile is unavailable or read only" : "Review missing dependencies and repair this project"}
+                                >
+                                  <Icon name="refresh" size={14} />
+                                  {runningAction === `repair:${actionPrefix}` ? "Checking…" : "Repair"}
+                                </button>
+                              </div>
                             </div>
                           </div>
 
@@ -714,11 +843,54 @@ export default function ProjectLinksWorkspace({
                   {editingProjectId === project.local_project_id && (
                     <div ref={projectSettingsRef} className="v3-inline-project-settings">
                       <div className="v3-inline-project-copy">
-                        <strong>Project — {project.display_name}</strong>
-                        <span>Folder on this machine</span>
+                        <strong>Local settings</strong>
+                        <span>Only affects this machine.</span>
                       </div>
                       <label>
-                        <span>Project path</span>
+                        <span>Display name</span>
+                        <div className="v3-simple-path-row">
+                          <input
+                            value={projectAliasDraft}
+                            onChange={(event) => setProjectAliasDraft(event.target.value)}
+                            placeholder={project.display_name}
+                            disabled={busy}
+                            title="Shown only on this machine; the shared repo name stays unchanged"
+                          />
+                          <button
+                            type="button"
+                            className="btn btn-primary"
+                            disabled={
+                              busy
+                              || (projectAliasDraft.trim() || null) === (project.local_alias ?? null)
+                            }
+                            onClick={() => void run(
+                              `rename:${project.local_project_id}`,
+                              () => onRenameProject(project.local_project_id, projectAliasDraft.trim() || null),
+                            )}
+                          >
+                            {runningAction === `rename:${project.local_project_id}` ? "Saving…" : "Save name"}
+                          </button>
+                          {project.local_alias && (
+                            <button
+                              type="button"
+                              className="btn"
+                              disabled={busy}
+                              onClick={() => {
+                                setProjectAliasDraft("");
+                                void run(
+                                  `rename:${project.local_project_id}`,
+                                  () => onRenameProject(project.local_project_id, null),
+                                );
+                              }}
+                              title={`Show the shared repo name “${project.display_name}” again`}
+                            >
+                              Use repo name
+                            </button>
+                          )}
+                        </div>
+                      </label>
+                      <label>
+                        <span>Checkout path</span>
                         <div className="v3-simple-path-row">
                           <input
                             value={projectPathDraft}
@@ -736,7 +908,7 @@ export default function ProjectLinksWorkspace({
                               if (typeof picked === "string") setProjectPathDraft(picked);
                             })()}
                           >
-                            Browse
+                            <Icon name="folder" size={13} /> Browse
                           </button>
                           <button
                             type="button"
@@ -751,15 +923,7 @@ export default function ProjectLinksWorkspace({
                               () => onSaveProjectPath(project.local_project_id, projectPathDraft.trim()),
                             )}
                           >
-                            {runningAction === `project:${project.local_project_id}` ? "Saving…" : "Save"}
-                          </button>
-                          <button
-                            type="button"
-                            className="btn btn-ghost"
-                            onClick={() => setEditingProjectId(null)}
-                            aria-label="Close project settings"
-                          >
-                            <Icon name="x" size={14} />
+                            {runningAction === `project:${project.local_project_id}` ? "Saving…" : "Save path"}
                           </button>
                         </div>
                       </label>
@@ -773,120 +937,6 @@ export default function ProjectLinksWorkspace({
         )}
       </section>
 
-      {editingStorage && storageDraft && editedStorageConfig && (
-        <section ref={storageSettingsRef} className="v3-storage-settings-below" aria-label="Storage settings">
-          <div className="v3-inline-storage-heading">
-            <div>
-              <strong>{creatingStorage ? "New storage" : `Storage — ${editedStorageConfig.name || "(unnamed)"}`}</strong>
-              <span>
-                {editedStorageProject
-                  ? `Linked to ${editedStorageProject.display_name}. Credentials stay on this machine.`
-                  : "Credentials stay on this machine."}
-              </span>
-            </div>
-            <button
-              type="button"
-              className="btn btn-ghost"
-              onClick={() => {
-                setEditingStorage(null);
-                setStorageDraft(null);
-              }}
-              aria-label="Close storage settings"
-            >
-              <Icon name="x" size={14} />
-            </button>
-          </div>
-
-          <StorageEditor storage={storageDraft} disabled={busy} onChange={setStorageDraft} />
-
-          <div className="v3-inline-storage-save">
-            <span>Storage changes apply to every project linked to this destination.</span>
-            <button
-              type="button"
-              className="btn"
-              disabled={busy || (!creatingStorage && JSON.stringify(storageDraft) === JSON.stringify(editedStorageConfig))}
-              onClick={() => void run(`storage:${editedStorageConfig.id}`, async () => {
-                await onSaveStorage(storageDraft);
-                if (editedStorageLink) await loadStorageBundles(editedStorageConfig.id);
-              })}
-            >
-              {runningAction === `storage:${editedStorageConfig.id}` ? "Saving…" : creatingStorage ? "Create storage" : "Save storage"}
-            </button>
-          </div>
-
-          {editedStorageProject && editedStorageLink && (
-          <div className="v3-inline-bundle-picker">
-            <div>
-              <strong>Repo for {editedStorageProject.display_name}</strong>
-              <span>Select which remote repo this project should use in this storage.</span>
-              <button
-                type="button"
-                className="btn btn-ghost v3-inline-bundle-refresh"
-                onClick={() => void loadStorageBundles(editedStorageConfig.id)}
-                disabled={busy || bundleLoading}
-                title="Refresh repos"
-                aria-label={`Refresh repos in ${editedStorageConfig.name || "storage"}`}
-              >
-                <Icon name="refresh" size={13} className={bundleLoading ? "icon-spin" : undefined} />
-              </button>
-            </div>
-            <div className="v3-inline-bundle-controls">
-              <select
-                value={selectedBundleId}
-                disabled={busy || bundleLoading || !!bundleError}
-                onChange={(event) => setSelectedBundleId(event.target.value)}
-                aria-label={`Repo in ${editedStorageConfig.name || "storage"}`}
-              >
-                {bundleLoading && <option value={selectedBundleId}>Loading repos…</option>}
-                {!bundleLoading && !orderedRemoteBundles.some((bundle) => bundle.bundle_id === editedStorageLink.bundle_id) && (
-                  <option value={editedStorageLink.bundle_id}>Current repo · {editedStorageLink.bundle_id.slice(0, 12)}…</option>
-                )}
-                {!bundleLoading && orderedRemoteBundles.map((bundle) => (
-                  <option key={bundle.bundle_id} value={bundle.bundle_id}>
-                    {editedStorageProject.repository_fingerprint
-                      && bundle.repository_fingerprint === editedStorageProject.repository_fingerprint
-                      ? "Recommended · "
-                      : ""}{bundle.display_name || "Unnamed repo"} · gen {bundle.generation ?? "—"} · {bundle.bundle_id.slice(0, 12)}…
-                  </option>
-                ))}
-              </select>
-              <button
-                type="button"
-                className="btn btn-primary"
-                disabled={busy || bundleLoading || !!bundleError || !selectedBundleId || selectedBundleId === editedStorageLink.bundle_id}
-                onClick={() => void run(`bundle:${editedStorageProject.local_project_id}:${editedStorageConfig.id}`, async () => {
-                  await onSelectBundle(
-                    editedStorageProject.local_project_id,
-                    editedStorageConfig.id,
-                    selectedBundleId,
-                    allowRepositoryMismatch,
-                  );
-                })}
-              >
-                {runningAction === `bundle:${editedStorageProject.local_project_id}:${editedStorageConfig.id}` ? "Connecting…" : "Use repo"}
-              </button>
-            </div>
-            {bundleError && <span className="v3-inline-bundle-error">{bundleError}</span>}
-            {selectedFingerprintDiffers && (
-              <div className="v3-callout warning">
-                <Icon name="alert-triangle" size={15} />
-                <span>This repo has a different Git fingerprint. Connecting will adopt its repository identity.</span>
-              </div>
-            )}
-            {selectedFingerprintUnknown && (
-              <div className="v3-callout warning">
-                <Icon name="alert-triangle" size={15} />
-                <span>This repo has no Git fingerprint, so Agent Sync cannot verify that it belongs to this checkout.</span>
-              </div>
-            )}
-            {!bundleLoading && !bundleError && orderedRemoteBundles.length === 0 && (
-              <span className="v3-inline-bundle-empty">No repos found. Push to create this project's repo here.</span>
-            )}
-          </div>
-          )}
-          {error && <div className="v3-callout error"><Icon name="alert-triangle" size={15} /> {error}</div>}
-        </section>
-      )}
     </main>
   );
 }
