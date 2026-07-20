@@ -92,24 +92,32 @@ test("history content uses the local alias and renders commit/thread actions", (
       onOpenSettings={() => undefined}
       onOpenCodex={() => undefined}
       onOpenTerminal={() => undefined}
+      onToggleDetails={() => undefined}
     />,
   );
-  assert.match(html, /Project Name/);
+  assert.doesNotMatch(html, /Project Name/);
   assert.match(html, /Mallard local/);
-  assert.match(html, /Codex configuration/);
+  assert.match(html, /v3-history-project-context/);
+  assert.match(html, /title="Codex configuration:/);
   assert.match(html, /\/Users\/test\/config\/mallard\/\.codex/);
   assert.match(html, /Local storage 1/);
-  assert.match(html, /Last Pull/);
+  assert.match(html, /aria-label="Last pull:/);
+  assert.match(html, /aria-label="Last push:/);
   assert.match(html, /Repository: mallard/);
   assert.match(html, /Add project-scoped history/);
-  assert.match(html, /User rounds/);
-  assert.match(html, />3</);
-  assert.match(html, /24\.8K/);
-  assert.match(html, /Appears under 2 commits/);
+  assert.match(html, /aria-label="Show session details"/);
+  assert.doesNotMatch(html, /aria-label="User rounds: 3"/);
+  assert.doesNotMatch(html, /24\.8K/);
+  assert.doesNotMatch(html, /Appears under 2 commits/);
   assert.doesNotMatch(html, /during session|after session|started from/);
   assert.doesNotMatch(html, /Map project-owned Codex sessions onto/);
-  assert.match(html, /Open in Codex/);
-  assert.match(html, /Open in Terminal/);
+  assert.match(html, /aria-label="Show conversation details"/);
+  assert.match(html, /aria-label="Open in Codex"/);
+  assert.match(html, /aria-label="Open in Terminal"/);
+  assert.match(html, /v3-openai-icon/);
+  assert.match(html, />Open in Codex</);
+  assert.match(html, /> Open in Terminal</);
+  assert.doesNotMatch(html, /Show chat details/);
 });
 
 test("non-Git history renders a flat Codex thread list", () => {

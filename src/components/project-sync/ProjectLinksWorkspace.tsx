@@ -738,6 +738,34 @@ export default function ProjectLinksWorkspace({
                       <Icon name="link" size={12} className="project-profile-storage-icon" />
                       <span>Storage</span>
                       <small>{projectLinks.length}</small>
+                      <span className="project-profile-storage-actions">
+                        {availableStorages.length > 0 && (
+                          <button
+                            type="button"
+                            className={`profile-link-another${linkingProjectId === project.local_project_id ? " active" : ""}`}
+                            disabled={busy}
+                            aria-expanded={linkingProjectId === project.local_project_id}
+                            onClick={() => {
+                              setLinkingProjectId((current) => current === project.local_project_id ? null : project.local_project_id);
+                            }}
+                          >
+                            <Icon name="link" size={13} />
+                            Link storage
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="profile-link-another"
+                          disabled={busy}
+                          onClick={() => {
+                            setLinkingProjectId(null);
+                            onOpenStorageSettings();
+                          }}
+                        >
+                          <Icon name="plus" size={14} />
+                          Add storage
+                        </button>
+                      </span>
                     </div>
                     {projectLinks.length === 0 && <div className="profile-link-no-storage">No storage linked yet.</div>}
 
@@ -844,53 +872,28 @@ export default function ProjectLinksWorkspace({
                     })}
                     </div>
 
-                    <div className="project-profile-group-footer">
-                    {availableStorages.length > 0 && (
-                      <button
-                        type="button"
-                        className="profile-link-another"
-                        disabled={busy}
-                        onClick={() => {
-                          setLinkingProjectId((current) => current === project.local_project_id ? null : project.local_project_id);
-                        }}
-                      >
-                        <Icon name="link" size={14} />
-                        Link storage
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      className="profile-link-another"
-                      disabled={busy}
-                      onClick={() => {
-                        setLinkingProjectId(null);
-                        onOpenStorageSettings();
-                      }}
-                    >
-                      <Icon name="plus" size={15} />
-                      Add storage
-                    </button>
                     {linkingProjectId === project.local_project_id && (
-                      <div className="storage-link-picker">
-                        <span>Choose a storage destination</span>
-                        {availableStorages.map((storage) => (
-                          <button
-                            key={storage.id}
-                            type="button"
-                            disabled={busy}
-                            onClick={() => void run(`link:${project.local_project_id}:${storage.id}`, async () => {
-                              await onLinkStorage(project.local_project_id, storage.id);
-                              setLinkingProjectId(null);
-                            })}
-                          >
-                            <Icon name={storage.kind === "local" ? "drive" : "cloud"} size={15} />
-                            {storage.name || "(unnamed)"}
-                            <Icon name="chevron-right" size={13} />
-                          </button>
-                        ))}
+                      <div className="project-profile-group-footer">
+                        <div className="storage-link-picker">
+                          <span>Choose a storage destination</span>
+                          {availableStorages.map((storage) => (
+                            <button
+                              key={storage.id}
+                              type="button"
+                              disabled={busy}
+                              onClick={() => void run(`link:${project.local_project_id}:${storage.id}`, async () => {
+                                await onLinkStorage(project.local_project_id, storage.id);
+                                setLinkingProjectId(null);
+                              })}
+                            >
+                              <Icon name={storage.kind === "local" ? "drive" : "cloud"} size={15} />
+                              {storage.name || "(unnamed)"}
+                              <Icon name="chevron-right" size={13} />
+                            </button>
+                          ))}
+                        </div>
                       </div>
                     )}
-                    </div>
                     </section>
                   </div>
 

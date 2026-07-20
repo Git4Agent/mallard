@@ -72,46 +72,56 @@ interface ThreadCardProps {
 function ThreadCard({
   thread, occurrenceKey, busy = false, details, detailsOpen = false, onOpenCodex, onOpenTerminal, onToggleDetails, onLoadMoreDetails,
 }: ThreadCardProps) {
+  const [metadataOpen, setMetadataOpen] = useState(false);
   const launchable = THREAD_UUID.test(thread.thread_id);
   const detailsId = `thread-details-${occurrenceKey.replace(/[^a-z0-9_-]/gi, "-")}`;
+  const metadataId = `thread-metadata-${occurrenceKey.replace(/[^a-z0-9_-]/gi, "-")}`;
+  const startedLabel = `Started ${formatDate(thread.started_at)}`;
+  const endedLabel = `${thread.is_active ? "Last activity" : "Ended"} ${formatDate(thread.ended_at)}${thread.is_active ? ", active" : ""}`;
+  const detailsLabel = detailsOpen ? "Hide conversation details" : "Show conversation details";
+  const metadataLabel = metadataOpen ? "Hide session details" : "Show session details";
   return (
     <article className="v3-history-thread-card">
       <div className="v3-history-thread-topline">
         <strong>{thread.title || "Untitled Codex session"}</strong>
         <div className="v3-history-thread-actions">
-          <button type="button" className="btn btn-ghost" disabled={!launchable || busy}
-            onClick={() => onOpenCodex(thread.thread_id)} title="Open this session in the Codex desktop app">
-            <Icon name="external-link" size={13} /> {busy ? "Opening…" : "Open in Codex"}
+          <button type="button" className={`v3-history-icon-action${metadataOpen ? " active" : ""}`}
+            aria-label={metadataLabel} title={metadataLabel} aria-expanded={metadataOpen} aria-controls={metadataId}
+            onClick={() => setMetadataOpen((current) => !current)}>
+            <Icon name="info" size={14} />
           </button>
-          <button type="button" className="btn btn-ghost" disabled={!launchable || busy}
-            onClick={() => onOpenTerminal(thread.thread_id)} title="Resume this session in Terminal">
-            <Icon name="terminal" size={13} /> Open in Terminal
+          {onToggleDetails && (
+            <button type="button" className={`v3-history-icon-action${detailsOpen ? " active" : ""}`}
+              aria-label={detailsLabel} title={detailsLabel} aria-expanded={detailsOpen} aria-controls={detailsId}
+              onClick={() => onToggleDetails(thread.thread_id, occurrenceKey)}>
+              <Icon name="message" size={14} />
+            </button>
+          )}
+          <button type="button" className="btn btn-ghost v3-history-launch-action" disabled={!launchable || busy}
+            onClick={() => onOpenCodex(thread.thread_id)} title={busy ? "Opening in Codex…" : "Open in Codex"}
+            aria-label={busy ? "Opening in Codex" : "Open in Codex"}>
+            <Icon name={busy ? "refresh" : "openai"} size={15} className={busy ? "icon-spin" : "v3-openai-icon"} />
+            {busy ? "Opening…" : "Open in Codex"}
+          </button>
+          <button type="button" className="btn btn-ghost v3-history-launch-action" disabled={!launchable || busy}
+            onClick={() => onOpenTerminal(thread.thread_id)} title="Open in Terminal" aria-label="Open in Terminal">
+            <Icon name="terminal" size={14} /> Open in Terminal
           </button>
         </div>
       </div>
 
-      <dl className="v3-history-session-facts">
-        <div><dt>Started</dt><dd>{formatDate(thread.started_at)}</dd></div>
-        <div><dt>{thread.is_active ? "Last activity" : "Ended"}</dt><dd>{formatDate(thread.ended_at)}{thread.is_active ? " · Active" : ""}</dd></div>
-      </dl>
-      <dl className="v3-history-metrics" aria-label="Session metrics">
-        <div><dt>User rounds</dt><dd>{thread.user_round_count}</dd></div>
-        <div><dt>Total tokens</dt><dd>{formatCount(thread.total_tokens)}</dd></div>
-        <div><dt>Agent messages</dt><dd>{thread.agent_message_count}</dd></div>
-        <div><dt>Tool calls</dt><dd>{thread.tool_call_count}</dd></div>
-      </dl>
-      {!thread.metrics_complete && <p className="v3-history-partial">Some session metrics are unavailable.</p>}
-      {thread.commit_occurrence_count > 1 && (
-        <p className="v3-history-occurrences">Appears under {thread.commit_occurrence_count} commits</p>
-      )}
-
-      {onToggleDetails && (
-        <button type="button" className="v3-history-details-toggle" aria-expanded={detailsOpen}
-          aria-controls={detailsId} onClick={() => onToggleDetails(thread.thread_id, occurrenceKey)}>
-          <Icon name={detailsOpen ? "chevron-down" : "chevron-right"} size={13} />
-          {detailsOpen ? "Hide chat details" : "Show chat details"}
-        </button>
-      )}
+      {metadataOpen && <div id={metadataId} className="v3-history-thread-meta" aria-label="Session details">
+        <span title={startedLabel} aria-label={startedLabel}><Icon name="play" size={12} /><time>{formatDate(thread.started_at)}</time></span>
+        <span title={endedLabel} aria-label={endedLabel}><Icon name={thread.is_active ? "activity" : "check-circle"} size={12} /><time>{formatDate(thread.ended_at)}</time></span>
+        <span title={`User rounds: ${thread.user_round_count}`} aria-label={`User rounds: ${thread.user_round_count}`}><Icon name="user" size={12} /><b>{thread.user_round_count}</b></span>
+        <span title={`Tokens: ${formatCount(thread.total_tokens)}`} aria-label={`Tokens: ${formatCount(thread.total_tokens)}`}><Icon name="token" size={12} /><b>{formatCount(thread.total_tokens)}</b></span>
+        <span title={`Agent messages: ${thread.agent_message_count}`} aria-label={`Agent messages: ${thread.agent_message_count}`}><Icon name="message" size={12} /><b>{thread.agent_message_count}</b></span>
+        <span title={`Tool calls: ${thread.tool_call_count}`} aria-label={`Tool calls: ${thread.tool_call_count}`}><Icon name="tool" size={12} /><b>{thread.tool_call_count}</b></span>
+        {thread.commit_occurrence_count > 1 && (
+          <span title={`Appears under ${thread.commit_occurrence_count} commits`} aria-label={`Appears under ${thread.commit_occurrence_count} commits`}><Icon name="git-branch" size={12} /><b>{thread.commit_occurrence_count}</b></span>
+        )}
+        {!thread.metrics_complete && <span className="v3-history-partial" title="Some session metrics are unavailable" aria-label="Some session metrics are unavailable"><Icon name="alert-triangle" size={12} /></span>}
+      </div>}
       {detailsOpen && (
         <div id={detailsId} className="v3-history-chat-details" aria-live="polite">
           {details?.loading && !details.page ? <div className="v3-history-detail-state"><span className="status-loader" /> Loading messages…</div> : null}
@@ -164,18 +174,19 @@ export function ProjectChatHistoryContent({
       <section className="profile-links-section" aria-labelledby="project-activity-heading">
         <header className="profile-links-heading v3-history-header">
           <div className="profile-links-copy">
-            <h1 id="project-activity-heading" className="settings-section-title">{label} activity</h1>
-            {aliased && <span className="profile-links-subtitle">Repository: {project.display_name}</span>}
+            <h1 id="project-activity-heading" className="settings-section-title">{label}</h1>
           </div>
           <div className="v3-history-toolbar">
             {history?.git && (
-              <label className="v3-history-branch-select"><span>Branch</span>
-                <select value={history.git.selected_branch} onChange={(event) => onBranchChange(event.target.value)} disabled={loading}>
+              <label className="v3-history-branch-select" title="Branch"><Icon name="git-branch" size={15} />
+                <span className="v3-visually-hidden">Branch</span>
+                <select aria-label="Branch" value={history.git.selected_branch} onChange={(event) => onBranchChange(event.target.value)} disabled={loading}>
                   {history.git.branches.map((branch) => <option key={branch.name} value={branch.name}>{branch.name}{branch.is_current ? " (current)" : ""}{!branch.available ? " (unavailable)" : ""}</option>)}
                 </select>
               </label>
             )}
-            <button type="button" className="btn" onClick={onRefresh} disabled={loading}><Icon name="refresh" size={14} className={loading ? "icon-spin" : undefined} /> Refresh</button>
+            <button type="button" className="v3-history-icon-action v3-history-refresh" onClick={onRefresh} disabled={loading}
+              title="Refresh activity" aria-label="Refresh activity"><Icon name="refresh" size={15} className={loading ? "icon-spin" : undefined} /></button>
           </div>
         </header>
 
@@ -184,30 +195,35 @@ export function ProjectChatHistoryContent({
           <div className="v3-history-state v3-history-profile-state"><Icon name="alert-triangle" size={18} /><div><strong>Choose a Codex profile to view this project’s sessions.</strong><span>Activity only scans the profile bound to this project.</span></div><button type="button" className="btn btn-primary" onClick={onOpenSettings}>Open Project Settings</button></div>
         ) : loading && !history ? <div className="v3-history-state" role="status" aria-live="polite"><span className="status-loader" /> Loading project activity…</div> : !history ? null : (
           <>
-            <section className="v3-history-project-summary" aria-label="Project information">
-              <dl>
-                <div><dt>Project Name</dt><dd>{label}</dd></div>
-                <div><dt>Directory</dt><dd title={binding?.canonical_project_root ?? binding?.project_root}>{compactProjectPath(binding?.canonical_project_root ?? binding?.project_root ?? project.project_root ?? "Not configured")}</dd></div>
-                <div><dt>Codex configuration</dt><dd title={history.codex_home}>{history.codex_home}</dd><button type="button" className="btn btn-ghost" onClick={onOpenSettings}>Settings</button></div>
-              </dl>
-              <div className="v3-history-storage-sync">
-                <h2>Storage sync</h2>
-                {history.storage_sync.length ? history.storage_sync.map((storage) => (
-                  <div key={storage.storage_id} className="v3-history-storage-row"><strong>{storage.storage_name}</strong><span>Last Pull <time>{formatDate(storage.last_pull_at)}</time></span><span>Last Push <time>{formatDate(storage.last_push_at)}</time></span></div>
-                )) : <p>No storage is linked to this project.</p>}
-              </div>
+            <section className="v3-history-project-context" aria-label="Project information">
+              <span className="v3-history-context-item" title={`Project directory: ${binding?.canonical_project_root ?? binding?.project_root ?? project.project_root ?? "Not configured"}`}>
+                <Icon name="folder" size={14} /><span>{compactProjectPath(binding?.canonical_project_root ?? binding?.project_root ?? project.project_root ?? "Not configured")}</span>
+              </span>
+              <span className="v3-history-context-item" title={`Codex configuration: ${history.codex_home}`}>
+                <Icon name="terminal" size={14} /><span>{compactProjectPath(history.codex_home)}</span>
+              </span>
+              {aliased && <span className="v3-history-context-item" title={`Repository: ${project.display_name}`}><Icon name="git-branch" size={14} /><span>{project.display_name}</span></span>}
+              {history.storage_sync.length ? history.storage_sync.map((storage) => (
+                <span key={storage.storage_id} className="v3-history-context-item v3-history-storage-item" title={`Storage: ${storage.storage_name}`}>
+                  <Icon name="cloud" size={14} /><strong>{storage.storage_name}</strong>
+                  <span className={storage.last_pull_at ? "recorded" : undefined} title={`Last pull: ${formatDate(storage.last_pull_at)}`} aria-label={`Last pull: ${formatDate(storage.last_pull_at)}`}><Icon name="download" size={13} /></span>
+                  <span className={storage.last_push_at ? "recorded" : undefined} title={`Last push: ${formatDate(storage.last_push_at)}`} aria-label={`Last push: ${formatDate(storage.last_push_at)}`}><Icon name="upload" size={13} /></span>
+                </span>
+              )) : <span className="v3-history-context-item muted" title="No storage linked"><Icon name="cloud" size={14} /><span>No storage</span></span>}
+              <button type="button" className="v3-history-icon-action v3-history-settings" onClick={onOpenSettings}
+                title="Project settings" aria-label="Project settings"><Icon name="settings" size={15} /></button>
             </section>
 
             {history.git ? (
               <>
                 {history.unmapped.length > 0 && (
                   <section className="v3-history-uncommitted" aria-labelledby="uncommitted-heading">
-                    <div className="v3-history-section-heading"><div><h2 id="uncommitted-heading">Uncommitted Changes</h2><span>Sessions not linked to a commit in this branch</span></div></div>
+                    <div className="v3-history-section-heading"><h2 id="uncommitted-heading">Uncommitted</h2><span className="v3-history-heading-count" title="Sessions not linked to a commit"><Icon name="message" size={12} />{history.unmapped.length}</span></div>
                     <div className="v3-history-thread-list flat">{history.unmapped.map((reference) => { const thread = threads.get(reference.thread_id); return thread ? renderThread(thread, `uncommitted:${thread.thread_id}`) : null; })}</div>
                   </section>
                 )}
                 <section className="v3-history-commit-section" aria-label={`First-parent commits on ${history.git.selected_branch}`}>
-                  <div className="v3-history-section-heading"><div><h2>Commit history</h2><span>{history.git.unique_thread_count} sessions · {history.git.reference_count} commit occurrences</span></div></div>
+                  <div className="v3-history-section-heading"><h2>Commit history</h2><div className="v3-history-heading-counts"><span title={`${history.git.unique_thread_count} sessions`} aria-label={`${history.git.unique_thread_count} sessions`}><Icon name="message" size={12} />{history.git.unique_thread_count}</span><span title={`${history.git.reference_count} commit occurrences`} aria-label={`${history.git.reference_count} commit occurrences`}><Icon name="git-branch" size={12} />{history.git.reference_count}</span></div></div>
                   {history.git.commits.length === 0 ? <div className="v3-history-state">No commits are available in this 30-day window.</div> : (
                     <ol className="v3-history-commit-rail">{history.git.commits.map((commit) => (
                       <li key={commit.sha} className="v3-history-commit"><span className="v3-history-commit-node" aria-hidden="true" />
@@ -219,7 +235,7 @@ export function ProjectChatHistoryContent({
                 </section>
               </>
             ) : (
-              <section aria-labelledby="codex-sessions-heading"><div className="v3-history-section-heading"><div><h2 id="codex-sessions-heading">Codex threads</h2><span>Ordered by last activity</span></div></div><div className="v3-history-thread-list flat">{history.threads.length ? history.threads.map((thread) => renderThread(thread, thread.thread_id)) : <div className="v3-history-state">No project-owned Codex sessions were found in this 30-day window.</div>}</div></section>
+              <section aria-labelledby="codex-sessions-heading"><div className="v3-history-section-heading"><h2 id="codex-sessions-heading">Codex threads</h2><span className="v3-history-heading-count" title={`${history.threads.length} threads`}><Icon name="message" size={12} />{history.threads.length}</span></div><div className="v3-history-thread-list flat">{history.threads.length ? history.threads.map((thread) => renderThread(thread, thread.thread_id)) : <div className="v3-history-state">No project-owned Codex sessions were found in this 30-day window.</div>}</div></section>
             )}
             {history.next_before != null && <button type="button" className="btn v3-history-load-more" disabled={loadingMore} onClick={onLoadMore}>{loadingMore ? "Loading…" : "Load previous 30 days"}</button>}
           </>

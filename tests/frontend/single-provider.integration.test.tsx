@@ -195,12 +195,17 @@ test("the configured profile keeps a repair action inline above simple storage r
   const profileIndex = html.indexOf("project-profile-group-header");
   const profileEndIndex = html.indexOf("</header>", profileIndex);
   const warningIndex = html.indexOf("conversation-path-repair-notice");
+  const storageHeadingIndex = html.indexOf("project-profile-storage-heading");
+  const addStorageIndex = html.indexOf(">Add storage<", storageHeadingIndex);
   const storageIndex = html.indexOf("storage-link-block");
 
   assert.ok(profileIndex >= 0);
   assert.ok(profileEndIndex > profileIndex);
   assert.ok(warningIndex > profileIndex);
   assert.ok(warningIndex < profileEndIndex);
+  assert.ok(storageHeadingIndex > warningIndex);
+  assert.ok(addStorageIndex > storageHeadingIndex);
+  assert.ok(addStorageIndex < storageIndex);
   assert.ok(storageIndex > warningIndex);
   assert.equal(html.match(/conversation-path-repair-notice/g)?.length, 1);
   assert.equal(html.match(/class="storage-link-block/g)?.length, 2);
@@ -210,8 +215,9 @@ test("the configured profile keeps a repair action inline above simple storage r
   assert.equal(html.match(/class="storage-link-profile-section/g)?.length ?? 0, 0);
   assert.match(html, /aria-label="2 linked storage locations"/);
   assert.match(html, /project-profile-storage-icon/);
+  assert.match(html, /project-profile-storage-actions/);
   assert.doesNotMatch(html, /Linked storage/);
-  assert.match(html, />Add storage</);
+  assert.doesNotMatch(html, /project-profile-group-footer/);
   assert.equal(html.match(/Default Codex/g)?.length, 1);
   assert.match(html, /project-profile-group-path/);
   assert.match(html, /~\/\.codex/);
