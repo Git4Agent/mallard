@@ -76,7 +76,7 @@ test("binding setup renders one profile editor behind an explicit agent choice",
   assert.doesNotMatch(html, /aria-label="Claude profile"/);
 });
 
-test("the configured profile groups its warning above simple storage rows", () => {
+test("the configured profile keeps a repair action inline above simple storage rows", () => {
   const projectId = "project-one";
   const storageId = "storage-one";
   const secondStorageId = "storage-two";
@@ -193,11 +193,14 @@ test("the configured profile groups its warning above simple storage rows", () =
   );
 
   const profileIndex = html.indexOf("project-profile-group-header");
+  const profileEndIndex = html.indexOf("</header>", profileIndex);
   const warningIndex = html.indexOf("conversation-path-repair-notice");
   const storageIndex = html.indexOf("storage-link-block");
 
   assert.ok(profileIndex >= 0);
+  assert.ok(profileEndIndex > profileIndex);
   assert.ok(warningIndex > profileIndex);
+  assert.ok(warningIndex < profileEndIndex);
   assert.ok(storageIndex > warningIndex);
   assert.equal(html.match(/conversation-path-repair-notice/g)?.length, 1);
   assert.equal(html.match(/class="storage-link-block/g)?.length, 2);
@@ -205,8 +208,14 @@ test("the configured profile groups its warning above simple storage rows", () =
   assert.match(html, /aria-label="Unlink Local storage from Project one"/);
   assert.match(html, /aria-label="Unlink R2 storage from Project one"/);
   assert.equal(html.match(/class="storage-link-profile-section/g)?.length ?? 0, 0);
+  assert.match(html, /aria-label="2 linked storage locations"/);
+  assert.match(html, /project-profile-storage-icon/);
+  assert.doesNotMatch(html, /Linked storage/);
+  assert.match(html, />Add storage</);
   assert.equal(html.match(/Default Codex/g)?.length, 1);
-  assert.match(html, /Codex · ~\/\.codex/);
+  assert.match(html, /project-profile-group-path/);
+  assert.match(html, /~\/\.codex/);
+  assert.doesNotMatch(html, /Codex ·/);
   assert.match(html, /project-profile-group-icon/);
   assert.match(html, /Agent home is fixed after project setup/);
   assert.doesNotMatch(html, /Configure project profile/);

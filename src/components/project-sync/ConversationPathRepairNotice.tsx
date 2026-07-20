@@ -41,25 +41,42 @@ export default function ConversationPathRepairNotice({
     : blocked
       ? audit?.blockers[0] ?? "Conversation ownership needs manual review."
       : `${issueCount} ${issueCount === 1 ? "conversation points" : "conversations point"} to ${sourceDescription}. Push and Pull are paused.`;
-  const summary = blocked
-    ? "Conversation paths need review"
-    : `${issueCount} conversation path${issueCount === 1 ? " needs" : "s need"} repair`;
 
   return (
     <div
-      className={`conversation-path-repair-notice${blocked ? " blocked" : ""}`}
+      className={`conversation-path-repair-notice${blocked ? " blocked" : " repairable"}`}
       role="alert"
+      aria-label={blocked
+        ? undefined
+        : `${issueCount} conversation path${issueCount === 1 ? " requires" : "s require"} repair`}
     >
-      <span className="conversation-path-repair-icon">
-        <Icon name="alert-triangle" size={15} />
-      </span>
-      <span className="conversation-path-repair-copy">
-        <strong>{summary}</strong>
-        {showScope && <span className="conversation-path-repair-scope">{configurationLabel}</span>}
-        {blocked && <span className="conversation-path-repair-detail">{detail}</span>}
-      </span>
-      {audit?.can_repair && (
-        <span className="conversation-path-repair-actions">
+      {blocked ? (
+        <>
+          <span className="conversation-path-repair-icon">
+            <Icon name="alert-triangle" size={15} />
+          </span>
+          <span className="conversation-path-repair-copy">
+            <strong>Conversation paths need review</strong>
+            {showScope && <span className="conversation-path-repair-scope">{configurationLabel}</span>}
+            <span className="conversation-path-repair-detail">{detail}</span>
+          </span>
+        </>
+      ) : (
+        <>
+          <button
+            type="button"
+            className="btn btn-ghost conversation-path-repair-button"
+            disabled={busy}
+            onClick={() => void onRepair()}
+            aria-label={`Repair ${issueCount} conversation path${issueCount === 1 ? "" : "s"}`}
+          >
+            <Icon
+              name={busy ? "refresh" : "alert-triangle"}
+              size={14}
+              className={`conversation-path-repair-button-icon${busy ? " icon-spin" : ""}`}
+            />
+            {busy ? "Repairing…" : "Repair"}
+          </button>
           <span
             className="conversation-path-repair-help"
             title={detail}
@@ -68,17 +85,7 @@ export default function ConversationPathRepairNotice({
           >
             <Icon name="help-circle" size={14} />
           </span>
-          <button
-            type="button"
-            className="btn btn-ghost conversation-path-repair-button"
-            disabled={busy}
-            onClick={() => void onRepair()}
-            aria-label={`Repair ${issueCount} conversation path${issueCount === 1 ? "" : "s"}`}
-          >
-            <Icon name="refresh" size={14} className={busy ? "icon-spin" : undefined} />
-            {busy ? "Repairing…" : "Repair"}
-          </button>
-        </span>
+        </>
       )}
     </div>
   );

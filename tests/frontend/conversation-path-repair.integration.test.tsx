@@ -39,9 +39,10 @@ test("stale assigned conversations expose a scoped repair action", () => {
     />,
   );
 
-  assert.match(html, /1 conversation path needs repair/);
-  assert.match(html, /healthGame \(hequ-mac\) · Default Codex · ~\/\.codex/);
+  assert.match(html, /aria-label="1 conversation path requires repair"/);
+  assert.doesNotMatch(html, /healthGame \(hequ-mac\) · Default Codex · ~\/\.codex/);
   assert.doesNotMatch(html, />1 conversation points to/);
+  assert.match(html, /conversation-path-repair-button-icon/);
   assert.match(html, /conversation-path-repair-help/);
   assert.match(html, /title="1 conversation points to ~\/Desktop\/project\/game3\. Push and Pull are paused\."/);
   assert.match(html, /Repair 1 conversation path/);
@@ -81,7 +82,8 @@ test("a grouped configuration can omit the repeated scope label", () => {
     />,
   );
 
-  assert.match(html, /1 conversation path needs repair/);
+  assert.match(html, /aria-label="1 conversation path requires repair"/);
+  assert.doesNotMatch(html, /<strong>/);
   assert.doesNotMatch(html, /conversation-path-repair-scope/);
   assert.doesNotMatch(html, /Default Codex/);
 });

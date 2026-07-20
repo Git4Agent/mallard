@@ -119,15 +119,15 @@ export default function LogPanel({
     <div className="log-panel">
       <div className="log-panel-header">
         <div className="log-panel-heading">
-          <span className="log-panel-title">sync log</span>
+          <span className="log-panel-title">log</span>
           {onTypeFiltersChange && (
             <details className="log-type-filter" ref={typeFilterRef}>
-              <summary aria-label={`Filter sync log by types: ${typeSelectionLabel(typeFilters)}`}>
+              <summary aria-label={`Filter log by types: ${typeSelectionLabel(typeFilters)}`}>
                 <span className="log-type-filter-key">Type</span>
                 <span className="log-type-filter-value">{typeSelectionLabel(typeFilters)}</span>
                 <Icon name="chevron-down" size={12} />
               </summary>
-              <div className="log-type-filter-menu" role="group" aria-label="Sync log types">
+              <div className="log-type-filter-menu" role="group" aria-label="Log types">
                 <div className="log-type-filter-bulk-actions">
                   <button
                     type="button"
@@ -166,7 +166,7 @@ export default function LogPanel({
             <label className="log-filter-control">
               <span>Level</span>
               <select
-                aria-label="Filter sync log by level"
+                aria-label="Filter log by level"
                 value={levelFilter}
                 onChange={(event) => onLevelFilterChange(event.target.value as ActivityLogLevel | "all")}
               >
@@ -181,7 +181,7 @@ export default function LogPanel({
                 type="search"
                 value={search}
                 placeholder="Search logs"
-                aria-label="Search sync log"
+                aria-label="Search log"
                 onChange={(event) => onSearchChange(event.target.value)}
               />
             </label>
@@ -194,11 +194,11 @@ export default function LogPanel({
             </button>
           )}
           {!onManage && onClear && (
-            <button className="btn btn-ghost log-clear-btn" onClick={onClear} aria-label="Clear sync log">
+            <button className="btn btn-ghost log-clear-btn" onClick={onClear} aria-label="Clear log">
               clear
             </button>
           )}
-          <button className="btn btn-ghost" onClick={onClose} title="Close" aria-label="Close sync log">
+          <button className="btn btn-ghost" onClick={onClose} title="Close" aria-label="Close log">
             <Icon name="x" size={13} />
           </button>
         </div>

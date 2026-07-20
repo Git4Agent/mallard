@@ -151,7 +151,7 @@ export default function ProjectSidebar({
           onClick={onToggleActivity}
           aria-expanded={activityOpen}
         >
-          <Icon name="activity" size={15} /> Synclog
+          <Icon name="activity" size={15} /> Log
           {unreadLogs > 0 && !activityOpen && (
             <span className="sidebar-nav-badge v3-activity-badge">{unreadLogs}</span>
           )}

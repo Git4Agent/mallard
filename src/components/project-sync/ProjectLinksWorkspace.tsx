@@ -548,8 +548,24 @@ export default function ProjectLinksWorkspace({
                     </div>
                   )}
                   <div className="v3-project-heading-meta">
-                    {settingsProject.local_alias && <span>Repo · {settingsProject.display_name}</span>}
-                    <span title={settingsProject.project_root ?? undefined}>{compactProjectPath(settingsProject.project_root)}</span>
+                    {settingsProject.local_alias && (
+                      <span
+                        className="v3-project-heading-meta-item"
+                        title={`Repository: ${settingsProject.display_name}`}
+                        aria-label={`Repository ${settingsProject.display_name}`}
+                      >
+                        <Icon name={settingsProject.is_git_repository ? "git-branch" : "folder"} size={12} />
+                        <span>{settingsProject.display_name}</span>
+                      </span>
+                    )}
+                    <span
+                      className="v3-project-heading-meta-item"
+                      title={settingsProject.project_root ?? undefined}
+                      aria-label={`Project folder ${settingsProject.project_root ?? "not configured"}`}
+                    >
+                      <Icon name="folder" size={12} />
+                      <span>{compactProjectPath(settingsProject.project_root)}</span>
+                    </span>
                   </div>
                   {renamingProjectId === settingsProject.local_project_id && error && (
                     <div className="v3-project-heading-error"><Icon name="alert-triangle" size={13} /> {error}</div>
@@ -648,6 +664,25 @@ export default function ProjectLinksWorkspace({
                 : !profilesReadable && projectBinding
                   ? "The selected agent profile is unavailable"
                   : null;
+              const conversationPathRepairable = codexConfigured
+                && !conversationPathAuditLoading
+                && !conversationPathAuditError
+                && !!conversationPathAudit?.can_repair;
+              const conversationPathNotice = codexConfigured && !conversationPathAuditLoading ? (
+                <ConversationPathRepairNotice
+                  audit={conversationPathAudit}
+                  auditError={conversationPathAuditError}
+                  projectName={projectLabel(project)}
+                  profileName={projectProfile?.display_name ?? "Codex"}
+                  profilePath={projectProfile?.path ?? conversationPathAudit?.profile_path}
+                  showScope={false}
+                  busy={busy || runningAction === `repair-paths:${project.local_project_id}`}
+                  onRepair={() => run(
+                    `repair-paths:${project.local_project_id}`,
+                    () => onRepairConversationPaths(project.local_project_id),
+                  )}
+                />
+              ) : null;
 
               return (
                 <article
@@ -669,14 +704,20 @@ export default function ProjectLinksWorkspace({
                               ? "Choose one agent"
                               : projectProfile?.display_name ?? "No agent configured"}
                           </strong>
-                          <span title={projectProfile?.path}>
+                          <span className="project-profile-group-path" title={projectProfile?.path}>
                             {hasMultipleProviders
-                              ? "Codex and Claude are both assigned"
+                              ? <span>Codex and Claude are both assigned</span>
                               : projectProfile
-                                ? `${providerLabel(displayedProvider)} · ${compactProjectPath(projectProfile.path)}${profilesReadable ? "" : " · Unavailable"}`
-                                : "Choose a Codex or Claude profile"}
+                                ? (
+                                  <>
+                                    <Icon name="folder" size={11} />
+                                    <span>{compactProjectPath(projectProfile.path)}{profilesReadable ? "" : " · Unavailable"}</span>
+                                  </>
+                                )
+                                : <span>Choose a Codex or Claude profile</span>}
                           </span>
                         </span>
+                        {conversationPathRepairable && conversationPathNotice}
                         {projectBinding && (
                           <span
                             className="project-profile-group-lock"
@@ -688,24 +729,14 @@ export default function ProjectLinksWorkspace({
                         )}
                       </header>
 
-                      {codexConfigured && !conversationPathAuditLoading && (
-                        <ConversationPathRepairNotice
-                          audit={conversationPathAudit}
-                          auditError={conversationPathAuditError}
-                          projectName={projectLabel(project)}
-                          profileName={projectProfile?.display_name ?? "Codex"}
-                          profilePath={projectProfile?.path ?? conversationPathAudit?.profile_path}
-                          showScope={false}
-                          busy={busy || runningAction === `repair-paths:${project.local_project_id}`}
-                          onRepair={() => run(
-                            `repair-paths:${project.local_project_id}`,
-                            () => onRepairConversationPaths(project.local_project_id),
-                          )}
-                        />
-                      )}
+                      {!conversationPathRepairable && conversationPathNotice}
 
-                    <div className="project-profile-storage-heading">
-                      <span>Linked storage</span>
+                    <div
+                      className="project-profile-storage-heading"
+                      aria-label={`${projectLinks.length} linked storage location${projectLinks.length === 1 ? "" : "s"}`}
+                    >
+                      <Icon name="link" size={12} className="project-profile-storage-icon" />
+                      <span>Storage</span>
                       <small>{projectLinks.length}</small>
                     </div>
                     {projectLinks.length === 0 && <div className="profile-link-no-storage">No storage linked yet.</div>}
@@ -814,23 +845,31 @@ export default function ProjectLinksWorkspace({
                     </div>
 
                     <div className="project-profile-group-footer">
-                    {(storages.length === 0 || availableStorages.length > 0) && (
+                    {availableStorages.length > 0 && (
                       <button
                         type="button"
                         className="profile-link-another"
                         disabled={busy}
                         onClick={() => {
-                          if (storages.length === 0) {
-                            onOpenStorageSettings();
-                            return;
-                          }
                           setLinkingProjectId((current) => current === project.local_project_id ? null : project.local_project_id);
                         }}
                       >
-                        <Icon name="plus" size={15} />
-                        {storages.length === 0 ? "Add storage" : "Link storage"}
+                        <Icon name="link" size={14} />
+                        Link storage
                       </button>
                     )}
+                    <button
+                      type="button"
+                      className="profile-link-another"
+                      disabled={busy}
+                      onClick={() => {
+                        setLinkingProjectId(null);
+                        onOpenStorageSettings();
+                      }}
+                    >
+                      <Icon name="plus" size={15} />
+                      Add storage
+                    </button>
                     {linkingProjectId === project.local_project_id && (
                       <div className="storage-link-picker">
                         <span>Choose a storage destination</span>

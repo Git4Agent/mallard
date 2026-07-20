@@ -1727,7 +1727,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
             <div
               className="log-resizer"
               role="separator"
-              aria-label="Resize sync log"
+              aria-label="Resize log"
               aria-orientation="horizontal"
               onMouseDown={startLogResize}
               onDoubleClick={() => setLogHeight(240)}
