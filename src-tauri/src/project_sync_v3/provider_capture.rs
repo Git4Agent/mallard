@@ -1862,12 +1862,15 @@ fn discover_blocked_global_skill(
 }
 
 #[derive(Debug)]
-struct SessionMetadata {
-    session_id: String,
-    cwd: PathBuf,
+pub(crate) struct SessionMetadata {
+    pub(crate) session_id: String,
+    pub(crate) cwd: PathBuf,
 }
 
-fn scan_jsonl_metadata(path: &Path, provider: Provider) -> Result<SessionMetadata, String> {
+pub(crate) fn scan_jsonl_metadata(
+    path: &Path,
+    provider: Provider,
+) -> Result<SessionMetadata, String> {
     let file = fs::File::open(path).map_err(|e| format!("open: {}", e))?;
     let mut reader = BufReader::new(file);
     let mut total = 0_usize;

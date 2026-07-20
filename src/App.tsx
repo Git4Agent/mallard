@@ -865,7 +865,8 @@ function LegacyApp({ theme, onThemeChange, onOpenProjects }: LegacyAppProps) {
           <div className="sidebar-chrome">
             <div className="sidebar-titlebar-drag-region" data-tauri-drag-region />
             <div className="sidebar-title-row" data-tauri-drag-region>
-              <span className="sidebar-product-title">Agent Sync</span>
+              <img className="sidebar-product-logo" src="/mallard-logo.png" alt="" data-tauri-drag-region />
+              <span className="sidebar-product-title">Mallard</span>
             </div>
 
             <div className="sidebar-nav">

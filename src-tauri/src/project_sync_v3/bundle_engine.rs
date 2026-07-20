@@ -23,7 +23,12 @@ use super::domain::{
 };
 use super::provider_capture::{self, CapturedResources};
 
-const BUNDLE_PREFIX: &str = "v3/bundles";
+const MALLARD_ROOT: &str = ".mallard";
+const STORAGE_MARKER_KEY: &str = ".mallard/_storage.json";
+const REPOSITORY_PREFIX: &str = ".mallard/v1/repositories";
+const STORAGE_MARKER_FORMAT: &str = "mallard-storage";
+const STORAGE_LAYOUT_VERSION: u32 = 1;
+const LOCAL_STORAGE_LOCK: &str = ".storage.lock";
 const HEAD_FILE: &str = "_head.json";
 const TAG_FILE: &str = "_tag.json";
 const MAX_OBJECT_BYTES: usize = 512 * 1024 * 1024;
@@ -36,11 +41,15 @@ pub struct ObjectKey(String);
 impl ObjectKey {
     pub fn parse(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into();
-        validate_store_path(&value, false)?;
-        if !value.starts_with("v3/bundles/") {
+        validate_store_path(&value, 2)?;
+        if value == STORAGE_MARKER_KEY {
+            return Ok(Self(value));
+        }
+        validate_store_path(&value, 5)?;
+        if !value.starts_with(&format!("{}/", REPOSITORY_PREFIX)) {
             return Err(format!(
-                "object key is outside {}: '{}'",
-                BUNDLE_PREFIX, value
+                "object key is outside the Mallard storage namespace: '{}'",
+                value
             ));
         }
         Ok(Self(value))
@@ -63,11 +72,11 @@ pub struct ObjectPrefix(String);
 impl ObjectPrefix {
     pub fn parse(value: impl Into<String>) -> Result<Self, String> {
         let value = value.into().trim_end_matches('/').to_string();
-        validate_store_path(&value, true)?;
-        if value != BUNDLE_PREFIX && !value.starts_with("v3/bundles/") {
+        validate_store_path(&value, 3)?;
+        if value != REPOSITORY_PREFIX && !value.starts_with(&format!("{}/", REPOSITORY_PREFIX)) {
             return Err(format!(
                 "object prefix is outside {}: '{}'",
-                BUNDLE_PREFIX, value
+                REPOSITORY_PREFIX, value
             ));
         }
         Ok(Self(value))
@@ -158,6 +167,49 @@ impl LocalBundleObjectStore {
         }
         let root = fs::canonicalize(root)
             .map_err(|e| format!("resolve local store '{}': {}", root.display(), e))?;
+        let mallard_root = root.join(MALLARD_ROOT);
+        match fs::symlink_metadata(&mallard_root) {
+            Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "Mallard storage namespace '{}' must be a real directory",
+                    mallard_root.display()
+                ))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match fs::create_dir(&mallard_root) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "create Mallard storage namespace '{}': {}",
+                            mallard_root.display(),
+                            error
+                        ))
+                    }
+                }
+                let meta = fs::symlink_metadata(&mallard_root).map_err(|error| {
+                    format!(
+                        "inspect Mallard storage namespace '{}': {}",
+                        mallard_root.display(),
+                        error
+                    )
+                })?;
+                if meta.file_type().is_symlink() || !meta.is_dir() {
+                    return Err(format!(
+                        "Mallard storage namespace '{}' must be a real directory",
+                        mallard_root.display()
+                    ));
+                }
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect Mallard storage namespace '{}': {}",
+                    mallard_root.display(),
+                    error
+                ))
+            }
+        }
         Ok(Self { root })
     }
 
@@ -166,10 +218,10 @@ impl LocalBundleObjectStore {
             .create(true)
             .truncate(false)
             .write(true)
-            .open(self.root.join(".bundle-store.lock"))
-            .map_err(|e| format!("open bundle-store lock: {}", e))?;
+            .open(self.root.join(MALLARD_ROOT).join(LOCAL_STORAGE_LOCK))
+            .map_err(|e| format!("open Mallard storage lock: {}", e))?;
         file.lock()
-            .map_err(|e| format!("lock local bundle store: {}", e))?;
+            .map_err(|e| format!("lock local Mallard storage: {}", e))?;
         Ok(file)
     }
 
@@ -274,8 +326,35 @@ impl BundleObjectStore for LocalBundleObjectStore {
         if let Some(cursor) = cursor {
             ObjectKey::parse(cursor.to_string())?;
         }
+        let namespace_root = self.root.join(prefix.as_str());
+        let namespace_meta = match fs::symlink_metadata(&namespace_root) {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(StoreListPage {
+                    keys: Vec::new(),
+                    next_cursor: None,
+                })
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect local Mallard repository namespace '{}': {}",
+                    namespace_root.display(),
+                    error
+                ))
+            }
+        };
+        if namespace_meta.file_type().is_symlink() || !namespace_meta.is_dir() {
+            return Err(format!(
+                "local Mallard repository namespace '{}' must be a real directory",
+                namespace_root.display()
+            ));
+        }
+
         let mut keys = Vec::new();
-        for entry in WalkDir::new(&self.root).follow_links(false).into_iter() {
+        for entry in WalkDir::new(&namespace_root)
+            .follow_links(false)
+            .into_iter()
+        {
             let entry = entry.map_err(|e| format!("walk local bundle store: {}", e))?;
             if entry.depth() == 0 {
                 continue;
@@ -290,7 +369,7 @@ impl BundleObjectStore for LocalBundleObjectStore {
                 continue;
             }
             let relative = normalized_relative_path(&self.root, entry.path())?;
-            if relative.starts_with(".bundle-store.lock") || relative.contains("/.tmp") {
+            if relative.contains("/.tmp") {
                 continue;
             }
             if relative == prefix.as_str() || relative.starts_with(&format!("{}/", prefix.as_str()))
@@ -381,6 +460,37 @@ struct BundleTag {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct StorageMarker {
+    format: String,
+    layout_version: u32,
+}
+
+impl StorageMarker {
+    fn current() -> Self {
+        Self {
+            format: STORAGE_MARKER_FORMAT.to_string(),
+            layout_version: STORAGE_LAYOUT_VERSION,
+        }
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if self.format != STORAGE_MARKER_FORMAT {
+            return Err(format!(
+                "storage marker format '{}' is not supported; expected '{}'",
+                self.format, STORAGE_MARKER_FORMAT
+            ));
+        }
+        if self.layout_version != STORAGE_LAYOUT_VERSION {
+            return Err(format!(
+                "Mallard storage layout version {} is not supported; expected version {}",
+                self.layout_version, STORAGE_LAYOUT_VERSION
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct RemoteBundleSummary {
     pub bundle_id: BundleId,
     pub display_name: String,
@@ -404,15 +514,37 @@ pub struct BundleEngine<S> {
 }
 
 impl<S: BundleObjectStore> BundleEngine<S> {
-    pub fn new(store: S, storage_id: StorageId) -> Self {
-        Self { store, storage_id }
+    pub fn open(store: S, storage_id: StorageId) -> Result<Self, String> {
+        let engine = Self { store, storage_id };
+        engine.ensure_storage_marker()?;
+        Ok(engine)
+    }
+
+    fn ensure_storage_marker(&self) -> Result<(), String> {
+        let key = ObjectKey::parse(STORAGE_MARKER_KEY)?;
+        if let Some(stored) = self.store.get(&key)? {
+            let marker: StorageMarker =
+                parse_bounded_json(&stored.bytes, "Mallard storage marker")?;
+            marker.validate()?;
+            return Ok(());
+        }
+
+        let bytes = serde_json::to_vec(&StorageMarker::current())
+            .map_err(|error| format!("serialize Mallard storage marker: {}", error))?;
+        self.store.put_immutable(&key, &bytes)?;
+        let stored = self
+            .store
+            .get(&key)?
+            .ok_or_else(|| "Mallard storage marker disappeared after creation".to_string())?;
+        let marker: StorageMarker = parse_bounded_json(&stored.bytes, "Mallard storage marker")?;
+        marker.validate()
     }
 
     pub fn read_head(
         &self,
         bundle_id: &BundleId,
     ) -> Result<Option<(BundleHead, HeadToken)>, String> {
-        let key = bundle_key(bundle_id, HEAD_FILE)?;
+        let key = repository_object_key(bundle_id, HEAD_FILE)?;
         let Some(stored) = self.store.get(&key)? else {
             return Ok(None);
         };
@@ -498,7 +630,8 @@ impl<S: BundleObjectStore> BundleEngine<S> {
             }
             let digest = sha256(&captured.bytes);
             let relative_object_key = format!("_uploads/{}/files/{}", upload_id, logical);
-            let full_object_key = bundle_key(&request.identity.bundle_id, &relative_object_key)?;
+            let full_object_key =
+                repository_object_key(&request.identity.bundle_id, &relative_object_key)?;
             self.store
                 .put_immutable(&full_object_key, &captured.bytes)?;
             files.insert(
@@ -531,7 +664,8 @@ impl<S: BundleObjectStore> BundleEngine<S> {
             .map_err(|e| format!("serialize bundle manifest: {}", e))?;
         let manifest_sha256 = sha256(&manifest_bytes);
         let manifest_relative_key = format!("_manifests/{}-{}.json", generation, commit_id);
-        let manifest_key = bundle_key(&request.identity.bundle_id, &manifest_relative_key)?;
+        let manifest_key =
+            repository_object_key(&request.identity.bundle_id, &manifest_relative_key)?;
         self.store.put_immutable(&manifest_key, &manifest_bytes)?;
 
         let (added_files, changed_files, removed_files) =
@@ -551,7 +685,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
         };
         let commit_bytes =
             serde_json::to_vec(&commit).map_err(|e| format!("serialize bundle commit: {}", e))?;
-        let commit_key = bundle_key(
+        let commit_key = repository_object_key(
             &request.identity.bundle_id,
             &format!("_commits/{}-{}.json", generation, commit_id),
         )?;
@@ -570,7 +704,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
         head.validate()?;
         let head_bytes =
             serde_json::to_vec(&head).map_err(|e| format!("serialize bundle head: {}", e))?;
-        let head_key = bundle_key(&request.identity.bundle_id, HEAD_FILE)?;
+        let head_key = repository_object_key(&request.identity.bundle_id, HEAD_FILE)?;
         let head_etag =
             match self
                 .store
@@ -609,7 +743,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
         let snapshot = self.inspect(bundle_id)?;
         let mut files = BTreeMap::new();
         for (logical_path, entry) in &snapshot.manifest.files {
-            let key = bundle_key(bundle_id, &entry.object_key)?;
+            let key = repository_object_key(bundle_id, &entry.object_key)?;
             let object = self
                 .store
                 .get(&key)?
@@ -657,7 +791,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
             return Err("bundle page limit must be between 1 and 500".to_string());
         }
         let after = cursor.map(BundleId::parse).transpose()?;
-        let prefix = ObjectPrefix::parse(BUNDLE_PREFIX)?;
+        let prefix = ObjectPrefix::parse(REPOSITORY_PREFIX)?;
         let mut object_cursor = None;
         let mut tag_keys = Vec::new();
         let mut observed = 0_usize;
@@ -684,7 +818,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
         for key in tag_keys {
             let Some(bundle_component) = key
                 .as_str()
-                .strip_prefix("v3/bundles/")
+                .strip_prefix(&format!("{}/", REPOSITORY_PREFIX))
                 .and_then(|rest| rest.strip_suffix("/_tag.json"))
             else {
                 continue;
@@ -900,7 +1034,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
     fn read_manifest(&self, head: &BundleHead) -> Result<BundleManifest, String> {
         head.validate()?;
         validate_bundle_relative_object_key(&head.manifest_key)?;
-        let key = bundle_key(&head.bundle_id, &head.manifest_key)?;
+        let key = repository_object_key(&head.bundle_id, &head.manifest_key)?;
         let stored = self
             .store
             .get(&key)?
@@ -928,7 +1062,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
             files: manifest.files.len() as u64,
         };
         let bytes = serde_json::to_vec(&tag).map_err(|e| format!("serialize bundle tag: {}", e))?;
-        let key = bundle_key(&manifest.bundle.bundle_id, TAG_FILE)?;
+        let key = repository_object_key(&manifest.bundle.bundle_id, TAG_FILE)?;
         for _ in 0..4 {
             let expectation = match self.store.get(&key)? {
                 Some(existing) => CasExpectation::Match(existing.etag),
@@ -1121,7 +1255,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = LocalBundleObjectStore::open(temp.path().join("store")).unwrap();
         let key = ObjectKey::parse(format!(
-            "v3/bundles/{}/_uploads/upload-a/files/project/AGENTS.md",
+            ".mallard/v1/repositories/{}/_uploads/upload-a/files/project/AGENTS.md",
             bundle_id(1)
         ))
         .unwrap();
@@ -1135,7 +1269,11 @@ mod tests {
         );
         assert!(store.put_immutable(&key, b"two").is_err());
 
-        let head = ObjectKey::parse(format!("v3/bundles/{}/_head.json", bundle_id(1))).unwrap();
+        let head = ObjectKey::parse(format!(
+            ".mallard/v1/repositories/{}/_head.json",
+            bundle_id(1)
+        ))
+        .unwrap();
         let first = store
             .compare_and_swap(&head, &CasExpectation::Absent, b"first")
             .unwrap();
@@ -1158,6 +1296,56 @@ mod tests {
     }
 
     #[test]
+    fn mallard_storage_marker_is_created_idempotently_and_validated() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        let store = LocalBundleObjectStore::open(&root).unwrap();
+        let engine = BundleEngine::open(store, storage_id()).unwrap();
+        drop(engine);
+
+        let marker_path = root.join(STORAGE_MARKER_KEY);
+        let marker: StorageMarker =
+            serde_json::from_slice(&fs::read(&marker_path).unwrap()).unwrap();
+        assert_eq!(marker, StorageMarker::current());
+        assert!(root.join(MALLARD_ROOT).join(LOCAL_STORAGE_LOCK).is_file());
+
+        let store = LocalBundleObjectStore::open(&root).unwrap();
+        BundleEngine::open(store, storage_id()).unwrap();
+
+        fs::write(
+            &marker_path,
+            br#"{"format":"mallard-storage","layout_version":2}"#,
+        )
+        .unwrap();
+        let store = LocalBundleObjectStore::open(&root).unwrap();
+        let error = match BundleEngine::open(store, storage_id()) {
+            Ok(_) => panic!("unsupported marker should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.contains("layout version 2"));
+    }
+
+    #[test]
+    fn legacy_bundle_namespace_is_ignored_without_migration() {
+        assert!(ObjectKey::parse("v3/bundles/0123456789abcdef0123456789abcdef/_tag.json").is_err());
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        write(
+            &root.join("v3/bundles/0123456789abcdef0123456789abcdef/_tag.json"),
+            b"legacy",
+        );
+        let store = LocalBundleObjectStore::open(&root).unwrap();
+        let engine = BundleEngine::open(store, storage_id()).unwrap();
+        let page = engine.list_remote_bundles(None, 100).unwrap();
+        assert!(page.bundles.is_empty());
+        assert!(root
+            .join("v3/bundles/0123456789abcdef0123456789abcdef/_tag.json")
+            .is_file());
+        assert!(root.join(STORAGE_MARKER_KEY).is_file());
+    }
+
+    #[test]
     fn publish_fetch_update_and_tombstone_round_trip() {
         let temp = tempfile::tempdir().unwrap();
         let project = temp.path().join("project");
@@ -1175,8 +1363,9 @@ mod tests {
         let recipe = recipe_for([resource_id]);
         let captured = capture_recipe(&request, &recipe).unwrap();
         let id = bundle_id(2);
-        let store = LocalBundleObjectStore::open(temp.path().join("store")).unwrap();
-        let engine = BundleEngine::new(store, storage_id());
+        let store_root = temp.path().join("store");
+        let store = LocalBundleObjectStore::open(&store_root).unwrap();
+        let engine = BundleEngine::open(store, storage_id()).unwrap();
         let first = engine
             .publish(PublishBundleRequest {
                 identity: identity(id.clone(), "Project"),
@@ -1188,6 +1377,13 @@ mod tests {
             })
             .unwrap();
         assert_eq!(first.snapshot.head.generation, 1);
+        let repository_root = store_root.join(format!("{}/{}", REPOSITORY_PREFIX, id));
+        assert!(store_root.join(STORAGE_MARKER_KEY).is_file());
+        assert!(repository_root.join(HEAD_FILE).is_file());
+        assert!(repository_root.join(TAG_FILE).is_file());
+        assert!(repository_root.join("_manifests").is_dir());
+        assert!(repository_root.join("_commits").is_dir());
+        assert!(repository_root.join("_uploads").is_dir());
         let fetched = engine.fetch(&id).unwrap();
         assert_eq!(fetched.files.values().next().unwrap(), b"version one");
 
@@ -1252,7 +1448,7 @@ mod tests {
                 resources: 1,
                 files: 1,
             };
-            let key = bundle_key(&id, TAG_FILE).unwrap();
+            let key = repository_object_key(&id, TAG_FILE).unwrap();
             store
                 .compare_and_swap(
                     &key,
@@ -1261,7 +1457,7 @@ mod tests {
                 )
                 .unwrap();
         }
-        let engine = BundleEngine::new(store, storage_id());
+        let engine = BundleEngine::open(store, storage_id()).unwrap();
         let mut cursor = None;
         let mut listed = Vec::new();
         loop {
@@ -1296,10 +1492,11 @@ mod tests {
             .clone();
         let recipe = recipe_for([resource_id]);
         let id = bundle_id(3);
-        let engine = BundleEngine::new(
+        let engine = BundleEngine::open(
             LocalBundleObjectStore::open(temp.path().join("store")).unwrap(),
             storage_id(),
-        );
+        )
+        .unwrap();
         engine
             .publish(PublishBundleRequest {
                 identity: identity(id.clone(), "Portable project"),
@@ -1386,10 +1583,11 @@ mod tests {
         });
         let recipe = recipe_for(resource_ids);
         let id = bundle_id(6);
-        let engine = BundleEngine::new(
+        let engine = BundleEngine::open(
             LocalBundleObjectStore::open(temp.path().join("store")).unwrap(),
             storage_id(),
-        );
+        )
+        .unwrap();
         engine
             .publish(PublishBundleRequest {
                 identity: identity(id.clone(), "Composed project"),
@@ -1495,10 +1693,11 @@ mod tests {
         });
         let recipe = recipe_for(resource_ids);
         let id = bundle_id(7);
-        let engine = BundleEngine::new(
+        let engine = BundleEngine::open(
             LocalBundleObjectStore::open(temp.path().join("store")).unwrap(),
             storage_id(),
-        );
+        )
+        .unwrap();
         engine
             .publish(PublishBundleRequest {
                 identity: identity(id.clone(), "Codex project"),
@@ -1619,10 +1818,11 @@ mod tests {
         assert_eq!(resource.relative_cwd.as_deref(), Some("apps/web"));
         let recipe = recipe_for([resource.resource_id.clone()]);
         let id = bundle_id(4);
-        let engine = BundleEngine::new(
+        let engine = BundleEngine::open(
             LocalBundleObjectStore::open(temp.path().join("store")).unwrap(),
             storage_id(),
-        );
+        )
+        .unwrap();
         engine
             .publish(PublishBundleRequest {
                 identity: identity(id.clone(), "Claude project"),
@@ -1722,10 +1922,11 @@ mod tests {
             .apply_policy = ApplyPolicy::SafeFile;
 
         let id = bundle_id(8);
-        let engine = BundleEngine::new(
+        let engine = BundleEngine::open(
             LocalBundleObjectStore::open(temp.path().join("store")).unwrap(),
             storage_id(),
-        );
+        )
+        .unwrap();
         engine
             .publish(PublishBundleRequest {
                 identity: identity(id.clone(), "Codex project"),
@@ -1837,10 +2038,11 @@ mod tests {
         assert!(skill.dependency.is_some());
         let recipe = recipe_for([skill.resource_id.clone()]);
         let id = bundle_id(5);
-        let engine = BundleEngine::new(
+        let engine = BundleEngine::open(
             LocalBundleObjectStore::open(temp.path().join("store")).unwrap(),
             storage_id(),
-        );
+        )
+        .unwrap();
         engine
             .publish(PublishBundleRequest {
                 identity: identity(id.clone(), "Executable skill"),
@@ -1911,10 +2113,11 @@ mod tests {
             .unwrap();
         let recipe = recipe_for([plugin.resource_id.clone()]);
         let id = bundle_id(51);
-        let engine = BundleEngine::new(
+        let engine = BundleEngine::open(
             LocalBundleObjectStore::open(temp.path().join("store")).unwrap(),
             storage_id(),
-        );
+        )
+        .unwrap();
         engine
             .publish(PublishBundleRequest {
                 identity: identity(id.clone(), "Plugin intent"),
@@ -1977,10 +2180,11 @@ mod tests {
         id: BundleId,
     ) -> BundleEngine<LocalBundleObjectStore> {
         let recipe = recipe_for(["codex:standalone-skill:deploy".to_string()]);
-        let engine = BundleEngine::new(
+        let engine = BundleEngine::open(
             LocalBundleObjectStore::open(temp.join("store")).unwrap(),
             storage_id(),
-        );
+        )
+        .unwrap();
         engine
             .publish(PublishBundleRequest {
                 identity: identity(id, "Global skill"),
@@ -2230,10 +2434,11 @@ mod tests {
         let resource_id = "codex:standalone-skill:get-real-hardware-rh-service";
         let recipe = recipe_for([resource_id.to_string()]);
         let id = bundle_id(24);
-        let engine = BundleEngine::new(
+        let engine = BundleEngine::open(
             LocalBundleObjectStore::open(temp.path().join("store")).unwrap(),
             storage_id(),
-        );
+        )
+        .unwrap();
         engine
             .publish(PublishBundleRequest {
                 identity: identity(id.clone(), "Differently named skill"),
@@ -3094,7 +3299,7 @@ fn prospective_canonical_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
-fn write_target_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+pub(crate) fn write_target_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
     if bytes.len() > MAX_OBJECT_BYTES || mode & !0o777 != 0 {
         return Err("unsafe target bytes or mode".to_string());
     }
@@ -3124,7 +3329,7 @@ fn write_target_atomic(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Strin
     Ok(())
 }
 
-fn write_immutable_backup(path: &Path, bytes: &[u8]) -> Result<(), String> {
+pub(crate) fn write_immutable_backup(path: &Path, bytes: &[u8]) -> Result<(), String> {
     if let Ok(existing) = fs::read(path) {
         return if existing == bytes {
             Ok(())
@@ -3499,7 +3704,7 @@ fn parse_bounded_json<T: for<'de> Deserialize<'de>>(
     serde_json::from_slice(bytes).map_err(|e| format!("parse {}: {}", label, e))
 }
 
-fn validate_store_path(value: &str, allow_namespace_root: bool) -> Result<(), String> {
+fn validate_store_path(value: &str, minimum_components: usize) -> Result<(), String> {
     if value.is_empty()
         || value.len() > 4096
         || value.starts_with('/')
@@ -3511,7 +3716,7 @@ fn validate_store_path(value: &str, allow_namespace_root: bool) -> Result<(), St
         return Err(format!("unsafe store path '{}'", value.escape_debug()));
     }
     let components = value.split('/').collect::<Vec<_>>();
-    if components.len() < if allow_namespace_root { 2 } else { 4 }
+    if components.len() < minimum_components
         || components.iter().any(|component| {
             component.is_empty() || *component == "." || *component == ".." || component.len() > 255
         })
@@ -3546,9 +3751,9 @@ fn validate_bundle_relative_object_key(value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn bundle_key(bundle_id: &BundleId, relative: &str) -> Result<ObjectKey, String> {
+fn repository_object_key(bundle_id: &BundleId, relative: &str) -> Result<ObjectKey, String> {
     validate_bundle_relative_object_key(relative)?;
-    ObjectKey::parse(format!("{}/{}/{}", BUNDLE_PREFIX, bundle_id, relative))
+    ObjectKey::parse(format!("{}/{}/{}", REPOSITORY_PREFIX, bundle_id, relative))
 }
 
 fn checked_existing_object_path(root: &Path, key: &ObjectKey) -> Result<Option<PathBuf>, String> {

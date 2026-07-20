@@ -30,8 +30,9 @@ then explicitly approves file writes and dependency installation.
 
 The authoritative design is
 [`PLAN_PROJECT_SCOPED_SYNC.md`](./PLAN_PROJECT_SCOPED_SYNC.md). Schema 3 uses
-an isolated app-data `v3/` namespace and cloud `v3/bundles/` keys. The existing
-schema-2 engine remains reference code only.
+global app data under `~/.mallard` and Mallard storage keys under
+`.mallard/v1/repositories/`. The existing schema-2 engine remains reference
+code only.
 
 ### Implemented so far
 

@@ -694,6 +694,10 @@ pub struct ProjectStorageLink {
     /// Must equal the registration's bundle ID.  Keeping it explicit makes
     /// remote requests self-contained while validation prevents split identity.
     pub bundle_id: BundleId,
+    /// Destination-specific selection from the last explicit Push. Older
+    /// schema-3 links fall back to the project's default recipe.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<BundleRecipe>,
     #[serde(default)]
     pub pinned: bool,
     pub created_at: u64,
@@ -775,6 +779,9 @@ impl SyncConfigV3 {
                     "link bundle '{}' differs from project bundle '{}'",
                     link.bundle_id, project.bundle_id
                 ));
+            }
+            if let Some(recipe) = &link.recipe {
+                recipe.validate()?;
             }
             if !cells.insert((link.local_project_id.clone(), link.storage_id.clone())) {
                 return Err(format!(
@@ -930,7 +937,8 @@ impl MachineProjectState {
         }
         let mut replicas = HashSet::new();
         let mut active_projects = HashSet::new();
-        let mut active_roots: BTreeMap<String, &LocalProjectId> = BTreeMap::new();
+        let mut active_root_profiles: BTreeMap<(String, LocalProviderProfileId), &LocalProjectId> =
+            BTreeMap::new();
         for binding in &self.bindings {
             binding.validate_structure()?;
             if !replicas.insert(binding.replica_id.clone()) {
@@ -978,12 +986,19 @@ impl MachineProjectState {
                         binding.local_project_id
                     ));
                 }
+                // Project identity is (checkout, provider config): one folder
+                // may host several active projects as long as no two of them
+                // use the same provider profile.
                 let folded = binding.canonical_project_root.to_lowercase();
-                if let Some(other) = active_roots.insert(folded, &binding.local_project_id) {
-                    return Err(format!(
-                        "projects '{}' and '{}' share one active checkout",
-                        other, binding.local_project_id
-                    ));
+                for profile_id in binding.profile_ids.values() {
+                    if let Some(other) = active_root_profiles
+                        .insert((folded.clone(), profile_id.clone()), &binding.local_project_id)
+                    {
+                        return Err(format!(
+                            "projects '{}' and '{}' use the same provider config for one checkout",
+                            other, binding.local_project_id
+                        ));
+                    }
                 }
             }
         }
@@ -2131,6 +2146,7 @@ mod tests {
                 local_project_id: project.local_project_id.clone(),
                 storage_id: StorageId::parse("personal").unwrap(),
                 bundle_id: BundleId::parse("11111111111111111111111111111111").unwrap(),
+                recipe: None,
                 pinned: false,
                 created_at: 1,
             }],
@@ -2139,6 +2155,87 @@ mod tests {
         config.links[0].bundle_id = bundle_id();
         config.links.push(config.links[0].clone());
         assert!(config.validate().unwrap_err().contains("duplicate"));
+    }
+
+    #[test]
+    fn active_bindings_share_a_checkout_only_through_distinct_provider_configs() {
+        let project = |id: &str, bundle: &str| LocalProjectRegistration {
+            local_project_id: LocalProjectId::parse(id).unwrap(),
+            bundle_id: BundleId::parse(bundle).unwrap(),
+            display_name: id.to_string(),
+            local_alias: None,
+            repository_fingerprint: None,
+            recipe: BundleRecipe::default(),
+            recipe_bases: BTreeMap::new(),
+            revision: 0,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let config = SyncConfigV3 {
+            schema: LOCAL_SCHEMA_V3,
+            revision: 0,
+            storages: Vec::new(),
+            projects: vec![
+                project("project-a", "0123456789abcdef0123456789abcdef"),
+                project("project-b", "11111111111111111111111111111111"),
+            ],
+            links: Vec::new(),
+        };
+        let profile = |id: &str, path: &str| ProviderProfile {
+            profile_id: LocalProviderProfileId::parse(id).unwrap(),
+            provider: Provider::Codex,
+            display_name: id.to_string(),
+            path: path.to_string(),
+            canonical_path: path.to_string(),
+            revision: 0,
+            created_at: 1,
+            updated_at: 1,
+        };
+        let binding = |replica: &str, project: &str, bundle: &str, profile: &str| ProjectBinding {
+            replica_id: ReplicaId::parse(replica).unwrap(),
+            local_project_id: LocalProjectId::parse(project).unwrap(),
+            bundle_id: BundleId::parse(bundle).unwrap(),
+            project_root: "/home/user/projects/health-game".to_string(),
+            canonical_project_root: "/home/user/projects/health-game".to_string(),
+            profile_ids: BTreeMap::from([(
+                Provider::Codex,
+                LocalProviderProfileId::parse(profile).unwrap(),
+            )]),
+            codex_home: None,
+            claude_home: None,
+            state: BindingState::Active,
+            revision: 0,
+            updated_at: 1,
+        };
+        let mut machine = MachineProjectState {
+            schema: MACHINE_PROJECT_SCHEMA_V1,
+            revision: 0,
+            profiles: vec![
+                profile("profile-main", "/home/user/.codex"),
+                profile("profile-alt", "/home/user/conf2/.codex"),
+            ],
+            bindings: vec![
+                binding(
+                    "replica-a",
+                    "project-a",
+                    "0123456789abcdef0123456789abcdef",
+                    "profile-main",
+                ),
+                binding(
+                    "replica-b",
+                    "project-b",
+                    "11111111111111111111111111111111",
+                    "profile-alt",
+                ),
+            ],
+        };
+        machine.validate(&config).unwrap();
+        machine.bindings[1].profile_ids = BTreeMap::from([(
+            Provider::Codex,
+            LocalProviderProfileId::parse("profile-main").unwrap(),
+        )]);
+        let error = machine.validate(&config).unwrap_err();
+        assert!(error.contains("same provider config"), "{}", error);
     }
 
     #[test]

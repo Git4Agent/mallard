@@ -9,6 +9,7 @@ interface Props {
   storages: StorageConfigV3[];
   storageUsage: Record<string, number>;
   activeProjectId: string | null;
+  activeStorageId: string | null;
   loading: boolean;
   busy: boolean;
   activityOpen: boolean;
@@ -34,6 +35,7 @@ export default function ProjectSidebar({
   storages,
   storageUsage,
   activeProjectId,
+  activeStorageId,
   loading,
   busy,
   activityOpen,
@@ -51,11 +53,19 @@ export default function ProjectSidebar({
   onAddStorage,
   onOpenLegacy,
 }: Props) {
+  // Folders hosting more than one project (one per provider config) show a
+  // config badge so same-named siblings stay tellable apart.
+  const rootCounts = new Map<string, number>();
+  for (const project of projects) {
+    const root = project.canonical_project_root?.toLowerCase();
+    if (root) rootCounts.set(root, (rootCounts.get(root) ?? 0) + 1);
+  }
   return (
     <aside className="v3-sidebar">
       <div className="v3-sidebar-drag" data-tauri-drag-region />
       <div className="v3-sidebar-brand" data-tauri-drag-region>
-        <strong>Agent Sync</strong>
+        <img className="v3-brand-logo" src="/mallard-logo.svg" alt="" data-tauri-drag-region />
+        <strong>Mallard</strong>
       </div>
 
       <nav className="v3-primary-nav" aria-label="Project sync navigation">
@@ -157,13 +167,16 @@ export default function ProjectSidebar({
               <Icon name="plus" size={15} /> Add your first project
             </button>
           ) : projects.map((project) => {
-            const profileRequired = Object.keys(project.profile_ids ?? {}).length === 0;
+            const profileRequired = Object.keys(project.profile_ids ?? {}).length !== 1;
             const label = projectLabel(project);
             const aliased = label !== project.display_name;
+            const configNames = (project.profile_names ?? []).join(" + ");
+            const sharedRoot = Boolean(project.canonical_project_root)
+              && (rootCounts.get((project.canonical_project_root as string).toLowerCase()) ?? 0) > 1;
             return (
               <div
                 key={project.local_project_id}
-                className={`sidebar-profile-item${!activeDraftId && activeProjectId === project.local_project_id ? " active" : ""}${profileRequired ? " needs-profile" : ""}`}
+                className={`sidebar-profile-item${!activeDraftId && !activeStorageId && activeProjectId === project.local_project_id ? " active" : ""}${profileRequired ? " needs-profile" : ""}`}
               >
                 <button
                   type="button"
@@ -172,15 +185,20 @@ export default function ProjectSidebar({
                   title={[
                     aliased ? `Repo: ${project.display_name}` : null,
                     project.project_root ?? null,
+                    configNames ? `Config: ${configNames}` : null,
                   ].filter(Boolean).join("\n") || label}
                 >
                   <Icon name="folder" size={15} />
                   <span>{label}</span>
-                  {project.is_git_repository != null && (
-                    <span className={`v3-repository-kind${project.is_git_repository ? " git" : " folder"}`}
-                      title={project.is_git_repository ? "Git based project" : "Non-Git based project"}>
-                      {project.is_git_repository ? <Icon name="git-branch" size={10} /> : <Icon name="folder" size={10} />}
-                      {project.is_git_repository ? "Git Based" : "Non-Git Based"}
+                  {project.is_git_repository === true && (
+                    <span className="v3-repository-kind" title="Git repository">
+                      <Icon name="git-branch" size={10} />
+                      git
+                    </span>
+                  )}
+                  {sharedRoot && configNames && (
+                    <span className="v3-repository-kind" title={`Provider config: ${configNames}`}>
+                      {configNames}
                     </span>
                   )}
                   {profileRequired && <Icon name="alert-triangle" size={12} className="v3-sidebar-profile-warning" />}
@@ -200,8 +218,8 @@ export default function ProjectSidebar({
                     className="sidebar-profile-remove"
                     onClick={() => onRemoveProject(project.local_project_id)}
                     disabled={busy}
-                    title={`Remove ${label} from Agent Sync; project files stay on disk`}
-                    aria-label={`Remove ${label} from Agent Sync`}
+                    title={`Remove ${label} from Mallard; project files stay on disk`}
+                    aria-label={`Remove ${label} from Mallard`}
                   >
                     <Icon name="trash" size={13} />
                   </button>
@@ -233,7 +251,10 @@ export default function ProjectSidebar({
             const usage = storageUsage[storage.id] ?? 0;
             const storageName = storage.name || "storage";
             return (
-              <div key={storage.id} className="sidebar-profile-item sidebar-storage-item">
+              <div
+                key={storage.id}
+                className={`sidebar-profile-item sidebar-storage-item${activeStorageId === storage.id ? " active" : ""}`}
+              >
                 <button
                   type="button"
                   className="sidebar-profile-main"

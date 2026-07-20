@@ -8,9 +8,12 @@ import { build } from "esbuild";
 const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputDirectory = await mkdtemp(join(tmpdir(), "agent-sync-frontend-tests-"));
 const entries = [
+  "tests/frontend/conversation-path-repair.integration.test.tsx",
   "tests/frontend/pull-review.integration.test.tsx",
   "tests/frontend/project-chat-history.integration.test.tsx",
   "tests/frontend/resource-inventory.integration.test.tsx",
+  "tests/frontend/single-provider.integration.test.tsx",
+  "tests/frontend/storage-settings.integration.test.tsx",
 ];
 
 try {

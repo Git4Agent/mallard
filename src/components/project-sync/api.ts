@@ -4,6 +4,8 @@ import type {
   BundleReadiness,
   BundleRecipe,
   BundleSnapshotSummary,
+  CodexConversationPathAudit,
+  CodexConversationPathRepairResult,
   ConnectProjectBundleRequest,
   CodexThreadDetailsPage,
   CreateSetupDraftResult,
@@ -110,11 +112,17 @@ export const projectSyncApi = {
   getStatus: (localProjectId: string, storageId: string) =>
     invoke<ResourceStatusReport>("get_bundle_status", { localProjectId, storageId }),
 
-  pushBundle: (localProjectId: string, storageId: string) =>
-    invoke<ProjectOperationResult>("push_bundle", { localProjectId, storageId }),
+  pushBundle: (localProjectId: string, storageId: string, recipe: BundleRecipe) =>
+    invoke<ProjectOperationResult>("push_bundle", { localProjectId, storageId, recipe }),
 
   getBinding: (localProjectId: string) =>
     invoke<ProjectBinding | null>("get_project_binding", { localProjectId }),
+
+  auditCodexConversationPaths: (localProjectId: string) =>
+    invoke<CodexConversationPathAudit>("audit_codex_conversation_paths", { localProjectId }),
+
+  repairCodexConversationPaths: (localProjectId: string) =>
+    invoke<CodexConversationPathRepairResult>("repair_codex_conversation_paths", { localProjectId }),
 
   listBindings: () =>
     invoke<ProjectBinding[]>("list_project_bindings"),
@@ -128,14 +136,17 @@ export const projectSyncApi = {
   applyRestore: (planId: string, approvedActionIds: string[]) =>
     invoke<RestoreResult>("apply_bundle_restore", { planId, approvedActionIds }),
 
-  planDependencies: (bundleId: string, binding: ProjectBinding) =>
-    invoke<DependencyPlan>("plan_dependencies", { bundleId, binding }),
+  planDependencies: (restorePlanId: string) =>
+    invoke<DependencyPlan>("plan_dependencies", { restorePlanId }),
 
   applyDependencies: (planId: string, actionIds: string[]) =>
     invoke<DependencyResult>("apply_dependency_actions", { planId, actionIds }),
 
-  getReadiness: (bundleId: string, binding: ProjectBinding) =>
-    invoke<BundleReadiness>("get_bundle_readiness", { bundleId, binding }),
+  getReadiness: (storageId: string, bundleId: string, binding: ProjectBinding) =>
+    invoke<BundleReadiness>("get_bundle_readiness", { storageId, bundleId, binding }),
+
+  getRestoreReadiness: (restorePlanId: string) =>
+    invoke<BundleReadiness>("get_restore_readiness", { restorePlanId }),
 
   listSetupDrafts: () =>
     invoke<SetupDraftList>("list_setup_drafts"),

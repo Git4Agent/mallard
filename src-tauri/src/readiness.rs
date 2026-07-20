@@ -1079,7 +1079,7 @@ fn claude_project_path_issues(
             ),
             "permission_denied" => (
                 format!("Access needed for '{}'", candidate.source_path),
-                "macOS denied access to this profile's projects folder. Grant Agent Sync access to it (or Full Disk Access when required), then repair the mapping.".to_string(),
+                "macOS denied access to this profile's projects folder. Grant Mallard access to it (or Full Disk Access when required), then repair the mapping.".to_string(),
             ),
             _ => continue,
         };

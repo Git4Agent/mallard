@@ -390,6 +390,8 @@ export interface ProjectStorageLink {
   local_project_id: string;
   storage_id: string;
   bundle_id: string;
+  /** Last resource selection explicitly published to this storage. */
+  recipe?: BundleRecipe | null;
   pinned: boolean;
   created_at: number;
 }
@@ -406,6 +408,33 @@ export interface ProjectBinding {
   updated_at: number;
 }
 
+export interface CodexConversationPathIssue {
+  thread_id: string;
+  transcript_path: string;
+  recorded_cwd: string;
+  target_cwd: string;
+}
+
+export interface CodexConversationPathAudit {
+  local_project_id: string;
+  profile_id?: string | null;
+  profile_path?: string | null;
+  project_root: string;
+  assigned_thread_count: number;
+  matching_thread_count: number;
+  issues: CodexConversationPathIssue[];
+  blockers: string[];
+  warnings: string[];
+  ready: boolean;
+  can_repair: boolean;
+}
+
+export interface CodexConversationPathRepairResult {
+  audit: CodexConversationPathAudit;
+  repaired_thread_ids: string[];
+  backup_dir?: string | null;
+}
+
 export interface LocalProjectSummary {
   local_project_id: string;
   bundle_id: string;
@@ -414,7 +443,9 @@ export interface LocalProjectSummary {
   revision: number;
   repository_fingerprint?: string | null;
   project_root?: string | null;
+  canonical_project_root?: string | null;
   profile_ids?: Partial<Record<ProjectProvider, string>>;
+  profile_names?: string[];
   providers?: ProjectProvider[];
   resource_count?: number;
   selected_resource_count?: number;

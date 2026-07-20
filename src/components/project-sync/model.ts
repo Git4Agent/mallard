@@ -111,6 +111,24 @@ export function providerLabel(provider?: ProjectProvider | null): string {
   return "Shared";
 }
 
+export const PROJECT_PROVIDERS = ["codex", "claude"] as const satisfies readonly ProjectProvider[];
+
+/** A project is configured against one machine-local agent profile at a time. */
+export function configuredProjectProvider<T>(
+  profiles: Partial<Record<ProjectProvider, T>> | null | undefined,
+): ProjectProvider | null {
+  return PROJECT_PROVIDERS.find((provider) => profiles?.[provider] != null) ?? null;
+}
+
+/** Keep only the selected agent's value when the user changes agent type. */
+export function singleProviderSelection<T>(
+  profiles: Partial<Record<ProjectProvider, T>>,
+  provider: ProjectProvider,
+): Partial<Record<ProjectProvider, T>> {
+  const selection = profiles[provider];
+  return selection == null ? {} : { [provider]: selection };
+}
+
 export function formatRelativeTime(epoch?: number): string {
   if (!epoch) return "Unknown";
   const milliseconds = epoch > 10_000_000_000 ? epoch : epoch * 1000;

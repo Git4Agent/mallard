@@ -3,6 +3,7 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type {
   BundleSnapshotSummary,
   DraftProfileSelection,
+  LocalProjectSummary,
   ProjectDetail,
   ProjectProvider,
   ProjectSetupDraft,
@@ -16,10 +17,15 @@ import ResourceInventory from "./ResourceInventory";
 import { projectSyncApi } from "./api";
 import {
   compactProjectPath,
+  configuredProjectProvider,
   errorMessage,
   formatRelativeTime,
   inventoryResources,
+  PROJECT_PROVIDERS,
+  projectLabel,
+  providerLabel,
   recipeSelection,
+  singleProviderSelection,
 } from "./model";
 
 export type SetupCompletion = "open" | "push" | "pull";
@@ -27,10 +33,12 @@ export type SetupCompletion = "open" | "push" | "pull";
 interface Props {
   draftId: string;
   profiles: ProviderProfileSummary[];
+  projects: LocalProjectSummary[];
   storages: StorageConfigV3[];
   busy: boolean;
   onClose: () => void;
   onDiscard: (draftId: string) => void;
+  onAddStorage: () => void;
   onFinalized: (detail: ProjectDetail, completion: SetupCompletion) => void;
 }
 
@@ -42,20 +50,33 @@ function sectionState(sections: SetupSectionStatus[], id: string): SetupSectionS
   return sections.find((section) => section.section === id) ?? null;
 }
 
-function stateBadge(state?: string | null): { label: string; className: string } {
-  if (state === "ready") return { label: "Ready", className: "ready" };
-  if (state === "attention") return { label: "Check", className: "attention" };
-  if (state === "blocked") return { label: "Blocked", className: "blocked" };
-  return { label: "…", className: "pending" };
+function sectionBadge(section: SetupSectionStatus | null) {
+  if (section?.state === "attention") {
+    return (
+      <span className="v3-setup-state attention" aria-label="Needs review" title="Needs review">
+        <Icon name="alert-triangle" size={14} />
+      </span>
+    );
+  }
+  if (section?.state === "blocked") {
+    return (
+      <span className="v3-setup-state blocked" aria-label="Action required" title="Action required">
+        <Icon name="alert-triangle" size={14} />
+      </span>
+    );
+  }
+  return null;
 }
 
 export default function ProjectSetupWorkspace({
   draftId,
   profiles,
+  projects,
   storages,
   busy,
   onClose,
   onDiscard,
+  onAddStorage,
   onFinalized,
 }: Props) {
   const [draft, setDraft] = useState<ProjectSetupDraft | null>(null);
@@ -68,6 +89,7 @@ export default function ProjectSetupWorkspace({
   const [remoteBundles, setRemoteBundles] = useState<BundleSnapshotSummary[]>([]);
   const [bundlesLoading, setBundlesLoading] = useState(false);
   const [bundlesError, setBundlesError] = useState<string | null>(null);
+  const [setupProvider, setSetupProvider] = useState<ProjectProvider>("codex");
 
   // Autosave bookkeeping: edits mark the draft dirty; one debounced save
   // persists the latest state and refreshes inspection afterwards.
@@ -100,7 +122,14 @@ export default function ProjectSetupWorkspace({
           setError("This setup draft no longer exists.");
           return;
         }
-        setDraft(loaded);
+        const provider = configuredProjectProvider(loaded.profiles) ?? "codex";
+        const normalizedProfiles = singleProviderSelection(loaded.profiles, provider);
+        if (Object.keys(loaded.profiles).length > 1) {
+          dirtyRef.current = true;
+          setSaveState("saving");
+        }
+        setSetupProvider(provider);
+        setDraft({ ...loaded, profiles: normalizedProfiles });
         void refreshInspection(draftId);
       } catch (reason) {
         if (!cancelled) setError(errorMessage(reason));
@@ -247,9 +276,16 @@ export default function ProjectSetupWorkspace({
     edit((current) => ({
       ...current,
       profiles: {
-        ...current.profiles,
         [provider]: { kind: "pending", path: picked, display_name: "" } satisfies DraftProfileSelection,
       },
+    }));
+  };
+
+  const selectSetupProvider = (provider: ProjectProvider) => {
+    setSetupProvider(provider);
+    edit((current) => ({
+      ...current,
+      profiles: singleProviderSelection(current.profiles, provider),
     }));
   };
 
@@ -257,33 +293,6 @@ export default function ProjectSetupWorkspace({
     const picked = await open({ directory: true, multiple: false });
     if (typeof picked !== "string" || !picked) return;
     edit((current) => ({ ...current, project_root: picked }));
-  };
-
-  const addLocalStorageInline = async () => {
-    const picked = await open({ directory: true, multiple: false });
-    if (typeof picked !== "string" || !picked) return;
-    const suffix = Math.random().toString(16).slice(2, 10);
-    edit((current) => ({
-      ...current,
-      repository: { kind: "new" },
-      storage: {
-        kind: "pending",
-        storage: {
-          id: `storage-${suffix}`,
-          name: picked.split("/").filter(Boolean).pop() ?? "Local storage",
-          kind: "local",
-          bucket: "",
-          access_key_id: "",
-          secret_access_key: "",
-          account_id: "",
-          s3_endpoint: "",
-          region: "",
-          local_dir: picked,
-          included_default_exclusions: [],
-          supports_conditional_writes: null,
-        },
-      },
-    }));
   };
 
   const finalize = async (completion: SetupCompletion) => {
@@ -338,68 +347,100 @@ export default function ProjectSetupWorkspace({
   const repositorySection = sectionState(sections, "repository");
   const resourcesSection = sectionState(sections, "resources");
   const working = busy || finalizing;
-  const canFinalize = !!inspection?.can_finalize && !working && saveState !== "saving" && saveState !== "error";
+  const canFinalize = !!inspection?.can_finalize
+    && !working
+    && !bundlesLoading
+    && saveState !== "saving"
+    && saveState !== "error";
+  const showRepositoryChoice = usesExistingRepo
+    || Boolean(bundlesError)
+    || remoteBundles.length > 0
+    || repositorySection?.state === "blocked";
+  const setupProfileSelection = draft.profiles[setupProvider] ?? null;
+  const profileNeedsSelection = !setupProfileSelection
+    || (setupProfileSelection.kind === "pending" && !setupProfileSelection.path.trim());
+  const profileBlocked = profilesSection?.state === "blocked";
+  const resourcesWaitingForProfile = profileBlocked && resourcesSection?.state === "blocked";
+  const profileErrorMessage = profileBlocked
+    ? (profileNeedsSelection ? "Choose a profile to continue." : profilesSection?.message)
+    : null;
+
+  // Configs already claimed by a project on this same folder: the composite
+  // project key (folder, config) makes them invalid choices for this draft.
+  const claimedProfiles = new Map<string, string>();
+  for (const project of projects) {
+    if (project.canonical_project_root?.toLowerCase() !== draft.canonical_project_root.toLowerCase()) continue;
+    for (const profileId of Object.values(project.profile_ids ?? {})) {
+      if (profileId) claimedProfiles.set(profileId, projectLabel(project));
+    }
+  }
 
   const profileRow = (provider: ProjectProvider, label: string) => {
     const selection = draft.profiles[provider] ?? null;
     const options = profiles.filter((profile) => profile.provider === provider);
-    const existingProfile = selection?.kind === "existing"
-      ? options.find((profile) => profile.profile_id === selection.profile_id) ?? null
-      : null;
     const value = selection?.kind === "existing"
       ? selection.profile_id
       : selection?.kind === "pending" ? "__pending" : "";
-    const path = selection?.kind === "pending" ? selection.path : existingProfile?.path ?? "";
-    const inputId = `setup-${draftId}-${provider}-path`;
+    const path = selection?.kind === "pending" ? selection.path : "";
     return (
-      <div className="v3-agent-profile-row" key={provider}>
-        <label className="v3-agent-profile-label" htmlFor={inputId}>
-          <strong>{label}</strong>
-          <small>machine-local</small>
-        </label>
+      <div
+        className={`v3-agent-profile-row${selection?.kind === "pending" ? " has-custom-path" : ""}${profileBlocked ? " has-error" : ""}`}
+        key={provider}
+      >
         <select
           value={value}
           disabled={working}
           aria-label={`${label} profile`}
+          aria-invalid={profileBlocked || undefined}
           onChange={(event) => {
             const next = event.target.value;
+            if (next === "__pending") {
+              void chooseProfileFolder(provider);
+              return;
+            }
             edit((current) => {
-              const nextProfiles = { ...current.profiles };
-              if (!next || next === "__pending") delete nextProfiles[provider];
-              else nextProfiles[provider] = { kind: "existing", profile_id: next };
-              return { ...current, profiles: nextProfiles };
-            });
-          }}
-        >
-          <option value="">Not used</option>
-          {selection?.kind === "pending" && <option value="__pending">Custom path</option>}
-          {options.map((profile) => (
-            <option key={profile.profile_id} value={profile.profile_id} disabled={!profile.available || !profile.readable}>
-              {profile.display_name}{!profile.available || !profile.readable ? " (unavailable)" : ""}
-            </option>
-          ))}
-        </select>
-        <input
-          id={inputId}
-          value={path}
-          disabled={working}
-          placeholder={`Enter ${label} home path`}
-          spellCheck={false}
-          onChange={(event) => {
-            const nextPath = event.target.value;
-            edit((current) => {
-              const nextProfiles = { ...current.profiles };
-              if (nextPath) {
-                nextProfiles[provider] = { kind: "pending", path: nextPath, display_name: "" };
-              } else {
-                delete nextProfiles[provider];
+              const nextProfiles: Partial<Record<ProjectProvider, DraftProfileSelection>> = {};
+              if (next) {
+                nextProfiles[provider] = { kind: "existing", profile_id: next };
               }
               return { ...current, profiles: nextProfiles };
             });
           }}
-        />
+        >
+          <option value="">Choose profile</option>
+          {options.map((profile) => {
+            const unavailable = !profile.available || !profile.readable;
+            const claimedBy = claimedProfiles.get(profile.profile_id);
+            return (
+              <option key={profile.profile_id} value={profile.profile_id} disabled={unavailable || Boolean(claimedBy)}>
+                {profile.display_name}{unavailable ? " (unavailable)" : claimedBy ? ` (used by ${claimedBy})` : ""}
+              </option>
+            );
+          })}
+          <option value="__pending">Custom path…</option>
+        </select>
+        {selection?.kind === "pending" && (
+          <input
+            value={path}
+            disabled={working}
+            aria-label={`${label} custom profile path`}
+            aria-invalid={profileBlocked || undefined}
+            placeholder={`${label} profile path`}
+            spellCheck={false}
+            autoFocus
+            onChange={(event) => {
+              const nextPath = event.target.value;
+              edit((current) => ({
+                ...current,
+                profiles: {
+                  [provider]: { kind: "pending", path: nextPath, display_name: "" },
+                },
+              }));
+            }}
+          />
+        )}
         <button type="button" className="btn" onClick={() => void chooseProfileFolder(provider)} disabled={working}>
-          <Icon name="folder" size={13} /> Browse…
+          <Icon name="folder" size={13} /> Browse
         </button>
       </div>
     );
@@ -409,9 +450,7 @@ export default function ProjectSetupWorkspace({
     <section className="v3-inline-new-project v3-setup-workspace" role="region" aria-labelledby="v3-setup-title">
       <header className="v3-modal-header">
         <div>
-          <span className="v3-eyebrow">Project setup</span>
           <h1 id="v3-setup-title">Set up {draft.display_name || "project"}</h1>
-          <p>Saved automatically. Nothing changes until you finish setup.</p>
         </div>
         <button type="button" className="btn btn-ghost" onClick={onClose} disabled={finalizing} aria-label="Close setup; the draft is kept">
           <Icon name="x" size={17} />
@@ -429,18 +468,12 @@ export default function ProjectSetupWorkspace({
         {/* Project */}
         <section className="v3-form-card v3-setup-section">
           <div className="v3-card-heading">
-            <div>
-              <strong>Project</strong>
-              <span title={draft.project_root}>{compactProjectPath(draft.project_root)}</span>
-            </div>
-            <span className={`v3-setup-state ${stateBadge(projectSection?.state).className}`}>
-              {stateBadge(projectSection?.state).label}
-            </span>
+            <div><strong>Project</strong></div>
+            {sectionBadge(projectSection)}
           </div>
-          {projectSection?.message && <div className="v3-callout error"><Icon name="alert-triangle" size={15} /> {projectSection.message}</div>}
-          <div className="v3-field-grid three">
+          <div className="v3-field-grid v3-setup-project-fields">
             <label>
-              <span>Project name</span>
+              <span>Name</span>
               <input
                 value={draft.display_name}
                 disabled={working || usesExistingRepo}
@@ -454,48 +487,52 @@ export default function ProjectSetupWorkspace({
                 <button type="button" className="btn" onClick={() => void changeProjectFolder()} disabled={working}>Change…</button>
               </div>
             </label>
-            <label>
-              <span>Git fingerprint</span>
-              <input value={draft.repository_fingerprint ? `${draft.repository_fingerprint.slice(0, 16)}…` : "No Git remote"} readOnly />
-            </label>
           </div>
+          {projectSection?.message && projectSection.state === "blocked" && (
+            <div className="v3-setup-field-error"><Icon name="alert-triangle" size={13} /> {projectSection.message}</div>
+          )}
           {usesExistingRepo && (
             <small className="v3-setup-hint">The project name follows the connected remote repo.</small>
           )}
         </section>
 
-        {/* Agent profiles */}
+        {/* Agent profile */}
         <section className="v3-form-card v3-setup-section">
           <div className="v3-card-heading">
-            <div>
-              <strong>Agent profiles</strong>
-              <span>Choose the agent homes used by this project.</span>
+            <div><strong>Agent</strong></div>
+            {sectionBadge(profilesSection)}
+          </div>
+          <div className="v3-single-agent-setup">
+            <div className="v3-agent-choice" role="radiogroup" aria-label="Agent used by this project">
+              {PROJECT_PROVIDERS.map((provider) => (
+                <button
+                  key={provider}
+                  type="button"
+                  role="radio"
+                  aria-checked={setupProvider === provider}
+                  className={setupProvider === provider ? "active" : undefined}
+                  disabled={working}
+                  onClick={() => selectSetupProvider(provider)}
+                >
+                  <strong>{providerLabel(provider)}</strong>
+                </button>
+              ))}
             </div>
-            <span className={`v3-setup-state ${stateBadge(profilesSection?.state).className}`}>
-              {stateBadge(profilesSection?.state).label}
-            </span>
+            <div className="v3-agent-profile-list">
+              {profileRow(setupProvider, providerLabel(setupProvider))}
+            </div>
           </div>
-          {profilesSection?.message && <div className="v3-callout error"><Icon name="alert-triangle" size={15} /> {profilesSection.message}</div>}
-          <div className="v3-agent-profile-list">
-            {profileRow("codex", "Codex")}
-            {profileRow("claude", "Claude")}
-          </div>
+          {profileErrorMessage && (
+            <div className="v3-setup-field-error"><Icon name="alert-triangle" size={13} /> {profileErrorMessage}</div>
+          )}
         </section>
 
         {/* Storage */}
         <section className="v3-form-card v3-setup-section">
           <div className="v3-card-heading">
-            <div>
-              <strong>Storage</strong>
-              <span>Choose one destination. Add more later from project settings.</span>
-            </div>
-            <span className={`v3-setup-state ${stateBadge(storageSection?.state).className}`}>
-              {stateBadge(storageSection?.state).label}
-            </span>
+            <div><strong>Storage</strong></div>
+            {sectionBadge(storageSection)}
           </div>
-          {storageSection?.message && storageSection.state === "blocked" && (
-            <div className="v3-callout error"><Icon name="alert-triangle" size={15} /> {storageSection.message}</div>
-          )}
           <div className="v3-profile-select-row">
             <select
               value={draft.storage?.kind === "existing" ? draft.storage.storage_id : draft.storage?.kind === "pending" ? "__pending" : ""}
@@ -512,9 +549,9 @@ export default function ProjectSetupWorkspace({
                 }));
               }}
             >
-              <option value="">No storage yet (finish locally)</option>
+              <option value="">Local only</option>
               {storageIsPending && selectedStorage && (
-                <option value="__pending">{selectedStorage.name} (new local folder)</option>
+                <option value="__pending">{selectedStorage.name} (new)</option>
               )}
               {storages.map((storage) => (
                 <option key={storage.id} value={storage.id}>
@@ -522,138 +559,142 @@ export default function ProjectSetupWorkspace({
                 </option>
               ))}
             </select>
-            <button type="button" className="btn" onClick={() => void addLocalStorageInline()} disabled={working}>
-              <Icon name="plus" size={13} /> Local folder…
+            <button
+              type="button"
+              className="btn"
+              onClick={onAddStorage}
+              disabled={working || saveState === "saving" || saveState === "error"}
+            >
+              <Icon name="plus" size={13} /> Add storage
             </button>
           </div>
-          <small className="v3-setup-hint">
-            {storageIsPending && selectedStorage
-              ? `${selectedStorage.local_dir} · added when setup finishes`
-              : "S3 storage is added from Storage settings, then selected here."}
-          </small>
+          {storageSection?.message && storageSection.state === "blocked" && (
+            <div className="v3-setup-field-error"><Icon name="alert-triangle" size={13} /> {storageSection.message}</div>
+          )}
+          {storageIsPending && selectedStorage && (
+            <small className="v3-setup-hint">{selectedStorage.local_dir}</small>
+          )}
+          {bundlesLoading && (
+            <small className="v3-setup-inline-status"><span className="status-loader" /> Checking repositories…</small>
+          )}
         </section>
 
         {/* Repository */}
-        <section className="v3-form-card v3-setup-section">
-          <div className="v3-card-heading">
-            <div>
-              <strong>Repository</strong>
-              <span>
-                {usesExistingRepo
-                  ? "Continue an existing remote repo; Pull review runs after setup."
-                  : "A new remote repo is published on first push."}
-              </span>
+        {showRepositoryChoice && (
+          <section className="v3-form-card v3-setup-section">
+            <div className="v3-card-heading">
+              <div><strong>Repository</strong></div>
+              {sectionBadge(repositorySection)}
             </div>
-            <span className={`v3-setup-state ${stateBadge(repositorySection?.state).className}`}>
-              {stateBadge(repositorySection?.state).label}
-            </span>
-          </div>
-          {repositorySection?.message && repositorySection.state === "blocked" && (
-            <div className="v3-callout error"><Icon name="alert-triangle" size={15} /> {repositorySection.message}</div>
-          )}
-          {!listableStorageId ? (
-            <div className="v3-inline-empty">
-              {storageIsPending
-                ? "New storage has no repos yet; this project starts a new repo."
-                : "Link a storage to look for existing repos."}
-            </div>
-          ) : bundlesLoading ? (
-            <div className="v3-storage-repository-state"><span className="status-loader" /> Looking for existing repos…</div>
-          ) : bundlesError ? (
-            <div className="v3-callout error"><Icon name="alert-triangle" size={15} /> {bundlesError}</div>
-          ) : (
-            <div className="v3-bundle-match-options" role="radiogroup" aria-label="Repo identity for this project">
-              <button
-                type="button"
-                role="radio"
-                aria-checked={!usesExistingRepo}
-                className={`v3-bundle-match-option separate${!usesExistingRepo ? " active" : ""}`}
-                onClick={() => edit((current) => ({ ...current, repository: { kind: "new" } }))}
-                disabled={working}
-              >
-                <span className="v3-bundle-radio"><span /></span>
-                <span className="v3-bundle-match-copy">
-                  <strong>Create a new repo</strong>
-                  <span>{remoteBundles.length === 0 ? "No repos exist in this storage yet." : "Keep this checkout separate from the repos below."}</span>
+            {repositorySection?.message && repositorySection.state === "blocked" && (
+              <div className="v3-setup-field-error"><Icon name="alert-triangle" size={13} /> {repositorySection.message}</div>
+            )}
+            {bundlesError ? (
+              <div className="v3-setup-field-error"><Icon name="alert-triangle" size={13} /> {bundlesError}</div>
+            ) : !listableStorageId ? null : (
+              <div className="v3-bundle-match-options" role="radiogroup" aria-label="Repo identity for this project">
+                <button
+                  type="button"
+                  role="radio"
+                  aria-checked={!usesExistingRepo}
+                  className={`v3-bundle-match-option separate${!usesExistingRepo ? " active" : ""}`}
+                  onClick={() => edit((current) => ({ ...current, repository: { kind: "new" } }))}
+                  disabled={working}
+                >
+                  <span className="v3-bundle-radio"><span /></span>
+                  <span className="v3-bundle-match-copy">
+                    <strong>New repository</strong>
+                    <span>Keep this project separate</span>
+                  </span>
+                </button>
+                {remoteBundles.map((bundle) => {
+                  const active = usesExistingRepo
+                    && draft.repository.kind === "existing"
+                    && draft.repository.bundle_id === bundle.bundle_id;
+                  const recommended = !!draft.repository_fingerprint
+                    && bundle.repository_fingerprint === draft.repository_fingerprint
+                    && exactMatches.length === 1;
+                  return (
+                    <button
+                      key={bundle.bundle_id}
+                      type="button"
+                      role="radio"
+                      aria-checked={active}
+                      className={`v3-bundle-match-option${active ? " active" : ""}`}
+                      onClick={() => edit((current) => ({
+                        ...current,
+                        repository: {
+                          kind: "existing",
+                          storage_id: bundle.storage_id,
+                          bundle_id: bundle.bundle_id,
+                          display_name: bundle.display_name,
+                          repository_fingerprint: bundle.repository_fingerprint ?? null,
+                          mismatch_acknowledged: false,
+                        },
+                      }))}
+                      disabled={working}
+                    >
+                      <span className="v3-bundle-radio"><span /></span>
+                      <span className="v3-bundle-match-copy">
+                        <strong>{bundle.display_name}{recommended && <small className="v3-bundle-recommended">Git match</small>}</strong>
+                        <span>{bundle.bundle_id}</span>
+                      </span>
+                      <span className="v3-bundle-match-meta">{formatRelativeTime(bundle.updated_at)}</span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+            {usesExistingRepo && draft.repository.kind === "existing"
+              && !(draft.repository.repository_fingerprint
+                && draft.repository_fingerprint
+                && draft.repository.repository_fingerprint === draft.repository_fingerprint) && (
+              <label className="v3-setup-acknowledge">
+                <input
+                  type="checkbox"
+                  checked={draft.repository.mismatch_acknowledged}
+                  disabled={working}
+                  onChange={(event) => edit((current) => current.repository.kind === "existing"
+                    ? { ...current, repository: { ...current.repository, mismatch_acknowledged: event.target.checked } }
+                    : current)}
+                />
+                <span>
+                  This repository could not be verified for this project. Connect it anyway and review the pull.
                 </span>
-              </button>
-              {remoteBundles.map((bundle) => {
-                const active = usesExistingRepo
-                  && draft.repository.kind === "existing"
-                  && draft.repository.bundle_id === bundle.bundle_id;
-                const recommended = !!draft.repository_fingerprint
-                  && bundle.repository_fingerprint === draft.repository_fingerprint
-                  && exactMatches.length === 1;
-                return (
-                  <button
-                    key={bundle.bundle_id}
-                    type="button"
-                    role="radio"
-                    aria-checked={active}
-                    className={`v3-bundle-match-option${active ? " active" : ""}`}
-                    onClick={() => edit((current) => ({
-                      ...current,
-                      repository: {
-                        kind: "existing",
-                        storage_id: bundle.storage_id,
-                        bundle_id: bundle.bundle_id,
-                        display_name: bundle.display_name,
-                        repository_fingerprint: bundle.repository_fingerprint ?? null,
-                        mismatch_acknowledged: false,
-                      },
-                    }))}
-                    disabled={working}
-                  >
-                    <span className="v3-bundle-radio"><span /></span>
-                    <span className="v3-bundle-match-copy">
-                      <strong>{bundle.display_name}{recommended && <small className="v3-bundle-recommended">Git match</small>}</strong>
-                      <span>{bundle.bundle_id}</span>
-                    </span>
-                    <span className="v3-bundle-match-meta">gen {bundle.generation ?? "—"}<small>{bundle.resource_count ?? 0} resources · {formatRelativeTime(bundle.updated_at)}</small></span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-          {usesExistingRepo && draft.repository.kind === "existing"
-            && !(draft.repository.repository_fingerprint
-              && draft.repository_fingerprint
-              && draft.repository.repository_fingerprint === draft.repository_fingerprint) && (
-            <label className="v3-setup-acknowledge">
-              <input
-                type="checkbox"
-                checked={draft.repository.mismatch_acknowledged}
-                disabled={working}
-                onChange={(event) => edit((current) => current.repository.kind === "existing"
-                  ? { ...current, repository: { ...current.repository, mismatch_acknowledged: event.target.checked } }
-                  : current)}
-              />
-              <span>
-                This repo is not verified to belong to this checkout
-                {draft.repository.repository_fingerprint ? " (different Git remote)" : " (no Git fingerprint)"}.
-                Connect it anyway and review the Pull carefully.
-              </span>
-            </label>
-          )}
-        </section>
+              </label>
+            )}
+          </section>
+        )}
 
         {/* Sync contents */}
         <section className="v3-form-card v3-setup-section">
           <div className="v3-card-heading">
-            <div>
-              <strong>Sync contents</strong>
+            <div className="v3-setup-sync-copy">
+              <div className="v3-setup-sync-title">
+                <strong>Sync contents</strong>
+                {(inspection?.warnings?.length ?? 0) > 0 && (
+                  <details className="v3-setup-warning-disclosure">
+                    <summary aria-label="Show sync warning details" title="Sync warning details">
+                      <Icon name="alert-triangle" size={14} />
+                    </summary>
+                    <ul className="v3-setup-warning-list">
+                      {inspection?.warnings?.map((warning) => <li key={warning}>{warning}</li>)}
+                    </ul>
+                  </details>
+                )}
+              </div>
               <span>
-                {usesExistingRepo
-                  ? "The connected repo's recipe is adopted; adjust it after the first Pull."
-                  : `${selectedResources.size} of ${resources.length} discovered resources selected`}
+                {resourcesWaitingForProfile
+                  ? (profileNeedsSelection ? "Select a profile first" : "Resolve the profile first")
+                  : usesExistingRepo
+                  ? "Uses repository defaults"
+                  : `${selectedResources.size} of ${resources.length} selected`}
               </span>
             </div>
             <div className="v3-setup-heading-actions">
-              <span className={`v3-setup-state ${stateBadge(resourcesSection?.state).className}`}>
-                {stateBadge(resourcesSection?.state).label}
-              </span>
-              {!usesExistingRepo && (
-                <button type="button" className="btn btn-ghost v3-setup-resource-toggle" onClick={() => setResourcesOpen((current) => !current)} disabled={resources.length === 0}>
+              {!resourcesWaitingForProfile && sectionBadge(resourcesSection)}
+              {!usesExistingRepo && resources.length > 0 && (
+                <button type="button" className="btn btn-ghost v3-setup-resource-toggle" onClick={() => setResourcesOpen((current) => !current)}>
                   {resourcesOpen ? "Collapse" : "Customize"}
                 </button>
               )}
@@ -662,7 +703,7 @@ export default function ProjectSetupWorkspace({
           {inspection?.selection_stale && (
             <div className="v3-callout warning">
               <Icon name="alert-triangle" size={15} />
-              <span>Discovered resources changed since this selection was saved. Review the list, then save by editing it.</span>
+              <span>Resources changed. Review or accept the current list.</span>
               <button
                 type="button"
                 className="btn"
@@ -676,8 +717,8 @@ export default function ProjectSetupWorkspace({
               </button>
             </div>
           )}
-          {resourcesSection?.message && resourcesSection.state === "blocked" && (
-            <div className="v3-callout error"><Icon name="alert-triangle" size={15} /> {resourcesSection.message}</div>
+          {!resourcesWaitingForProfile && resourcesSection?.message && resourcesSection.state === "blocked" && (
+            <div className="v3-setup-field-error"><Icon name="alert-triangle" size={13} /> {resourcesSection.message}</div>
           )}
           {inspecting && !inspection?.inventory && (
             <div className="v3-storage-repository-state"><span className="status-loader" /> Discovering resources…</div>
@@ -701,35 +742,34 @@ export default function ProjectSetupWorkspace({
             />
           )}
         </section>
-
-        {(inspection?.warnings?.length ?? 0) > 0 && (
-          <div className="v3-callout warning">
-            <Icon name="alert-triangle" size={15} />
-            <span>{inspection?.warnings?.join(" ")}</span>
+        {error && (
+          <div className="v3-setup-field-error v3-setup-system-error" role="alert">
+            <Icon name="alert-triangle" size={13} /> {error}
           </div>
         )}
-        {error && <div className="v3-callout error"><Icon name="alert-triangle" size={15} /> {error}</div>}
       </div>
 
       <footer className="v3-modal-footer v3-setup-footer">
-        <span className="v3-setup-save-state">
-          {saveState === "saving" ? "Saving…" : saveState === "error" ? "Draft not saved" : "Draft saved"}
-        </span>
+        {(saveState === "saving" || saveState === "error") && (
+          <span className="v3-setup-save-state" aria-live="polite">
+            {saveState === "saving" ? "Saving…" : "Not saved"}
+          </span>
+        )}
         <div>
           <button type="button" className="btn btn-ghost" onClick={() => onDiscard(draftId)} disabled={finalizing}>
-            Discard draft
+            Discard
           </button>
           {usesExistingRepo ? (
             <button type="button" className="btn btn-primary" disabled={!canFinalize} onClick={() => void finalize("pull")}>
-              {finalizing ? "Finishing…" : "Finish and review Pull"}
+              {finalizing ? "Finishing…" : "Finish & review"}
             </button>
           ) : selectedStorage ? (
             <>
               <button type="button" className="btn" disabled={!canFinalize} onClick={() => void finalize("open")}>
-                {finalizing ? "Finishing…" : "Finish setup"}
+                {finalizing ? "Finishing…" : "Finish"}
               </button>
               <button type="button" className="btn btn-primary" disabled={!canFinalize} onClick={() => void finalize("push")}>
-                Finish and push
+                Finish & push
               </button>
             </>
           ) : (

@@ -9,8 +9,10 @@ import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import type {
   AppTheme,
+  BundleRecipe,
   BundleReadiness,
   BundleSnapshotSummary,
+  CodexConversationPathAudit,
   DependencyPlan,
   DependencyResult,
   LocalProjectRegistration,
@@ -23,10 +25,10 @@ import type {
   ProviderProfile,
   ProviderProfileSummary,
   ResourceInventory as ResourceInventoryModel,
-  ResourceStatusReport,
   RestorePlan,
   RestoreResult,
   SetupDraftSummary,
+  StorageConfigV3,
   SyncConfigV3,
 } from "../../types";
 import Icon from "../Icons";
@@ -34,6 +36,7 @@ import LogPanel from "../LogPanel";
 import BundleConnectionDialog from "./BundleConnectionDialog";
 import ProjectBindingEditor, { type ProjectBindingDraft } from "./ProjectBindingEditor";
 import ProjectLinksWorkspace from "./ProjectLinksWorkspace";
+import PushResourceWorkspace from "./PushResourceWorkspace";
 import ProjectSetupWorkspace, { type SetupCompletion } from "./ProjectSetupWorkspace";
 import ProjectSidebar from "./ProjectSidebar";
 import RestorePlanView from "./RestorePlanView";
@@ -41,6 +44,7 @@ import { projectSyncApi } from "./api";
 import {
   applyPullReview,
   beginPullReview,
+  loadPullReviewSupport,
   type PullApplyPhase,
   type PullReviewSelection,
 } from "./pullReviewFlow";
@@ -50,7 +54,6 @@ import {
   projectLabel,
   recipeSelection,
   recipeWithSelection,
-  statusMap,
 } from "./model";
 
 interface Props {
@@ -101,6 +104,16 @@ interface PendingBundleConnection {
   reason: "link" | "missing";
 }
 
+interface PendingPush {
+  projectId: string;
+  storageId: string;
+  projectName: string;
+  storage: StorageConfigV3;
+  inventory: ResourceInventoryModel;
+  savedRecipe: BundleRecipe | null;
+  projectDefaults: Set<string>;
+}
+
 function upsertProject(
   projects: LocalProjectRegistration[],
   project: LocalProjectRegistration,
@@ -128,14 +141,15 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const [repositoryKinds, setRepositoryKinds] = useState<Record<string, boolean>>({});
   const [bindings, setBindings] = useState<ProjectBinding[]>([]);
   const [profiles, setProfiles] = useState<ProviderProfileSummary[]>([]);
+  const [conversationPathAudits, setConversationPathAudits] = useState<Record<string, CodexConversationPathAudit>>({});
+  const [conversationPathAuditErrors, setConversationPathAuditErrors] = useState<Record<string, string>>({});
+  const [conversationPathAuditLoading, setConversationPathAuditLoading] = useState(true);
   const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [inventory, setInventory] = useState<ResourceInventoryModel | null>(null);
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [savedSelection, setSavedSelection] = useState("");
-  const [status, setStatus] = useState<ResourceStatusReport | null>(null);
   const [readiness, setReadiness] = useState<BundleReadiness | null>(null);
   const [activeStorageByProject, setActiveStorageByProject] = useState<Record<string, string>>({});
+  const [activeStorageSettingsId, setActiveStorageSettingsId] = useState<string | null>(null);
   const [storageEditorRequest, setStorageEditorRequest] = useState<
     | { mode: "toggle"; storageId: string; requestId: number }
     | { mode: "create"; storageKind: "local" | "s3"; requestId: number }
@@ -152,6 +166,9 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const [backendError, setBackendError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [pendingBundleConnection, setPendingBundleConnection] = useState<PendingBundleConnection | null>(null);
+  const [pendingPush, setPendingPush] = useState<PendingPush | null>(null);
+  const [pushSelected, setPushSelected] = useState<Set<string>>(new Set());
+  const [pushError, setPushError] = useState<string | null>(null);
   const [logLines, setLogLines] = useState<LogLine[]>([]);
   const [activityOpen, setActivityOpen] = useState(false);
   const [logHeight, setLogHeight] = useState(240);
@@ -299,7 +316,11 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       revision: registration.revision,
       repository_fingerprint: registration.repository_fingerprint,
       project_root: localBinding?.project_root ?? null,
+      canonical_project_root: localBinding?.canonical_project_root ?? null,
       profile_ids: localBinding?.profile_ids ?? {},
+      profile_names: [...new Set(Object.values(localBinding?.profile_ids ?? {})
+        .map((profileId) => profiles.find((profile) => profile.profile_id === profileId)?.display_name)
+        .filter((name): name is string => Boolean(name)))],
       providers: active
         ? [...new Set(activeResources.flatMap((resource) => resource.provider ? [resource.provider] : []))]
         : undefined,
@@ -309,16 +330,14 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       readiness_state: active ? readiness?.state : undefined,
       is_git_repository: repositoryKinds[registration.local_project_id],
     };
-  }), [activeProjectId, bindings, config.links, readiness?.state, registrations, repositoryKinds, resources]);
+  }), [activeProjectId, bindings, config.links, profiles, readiness?.state, registrations, repositoryKinds, resources]);
 
   const activeSummary = projects.find((candidate) => candidate.local_project_id === activeProjectId) ?? null;
   const activeDraftSummary = setupDraftId
     ? setupDrafts.find((candidate) => candidate.draft_id === setupDraftId) ?? null
     : null;
-  const workspaceTitle = restorePlan
-    ? `${restoreProjectName} · Pull review`
-    : activeDraftSummary?.display_name
-      ?? (activeSummary ? projectLabel(activeSummary) : "Projects");
+  const workspaceTitle = activeDraftSummary?.display_name
+    ?? (activeSummary ? projectLabel(activeSummary) : "Projects");
   const restoreProfileLabel = restoreBinding
     ? [...new Set(Object.values(restoreBinding.profile_ids)
       .map((profileId) => profiles.find((profile) => profile.profile_id === profileId)?.display_name)
@@ -337,10 +356,31 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const activeStorageId = activeProjectId
     ? activeStorageByProject[activeProjectId] ?? projectLinks[0]?.storage_id ?? null
     : null;
-  const statuses = useMemo(() => statusMap(status), [status]);
-  const selectionKey = [...selected].sort().join("\n");
-  const selectionDirty = selectionKey !== savedSelection;
-
+  const loadConversationPathAudits = async (nextBindings: ProjectBinding[]) => {
+    setConversationPathAuditLoading(true);
+    const activeBindings = nextBindings.filter((candidate) => candidate.state === "active");
+    const results = await Promise.all(activeBindings.map(async (candidate) => {
+      try {
+        const audit = await projectSyncApi.auditCodexConversationPaths(candidate.local_project_id);
+        return { projectId: candidate.local_project_id, audit, error: null };
+      } catch (reason) {
+        return {
+          projectId: candidate.local_project_id,
+          audit: null,
+          error: errorMessage(reason),
+        };
+      }
+    }));
+    const nextAudits: Record<string, CodexConversationPathAudit> = {};
+    const nextErrors: Record<string, string> = {};
+    for (const result of results) {
+      if (result.audit) nextAudits[result.projectId] = result.audit;
+      if (result.error) nextErrors[result.projectId] = result.error;
+    }
+    setConversationPathAudits(nextAudits);
+    setConversationPathAuditErrors(nextErrors);
+    setConversationPathAuditLoading(false);
+  };
   const loadShell = async (): Promise<{
     nextProjects: LocalProjectRegistration[];
     nextConfig: SyncConfigV3;
@@ -393,6 +433,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       failures.push(`Bindings: ${errorMessage(reason)}`);
       setBindings([]);
     }
+    await loadConversationPathAudits(nextBindings);
     setBackendError(failures.length > 0 ? failures.join(" · ") : null);
     setLoading(false);
     return { nextProjects, nextConfig, nextBindings, nextProfiles };
@@ -423,9 +464,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         }
       }
       setInventory(nextInventory);
-      const included = recipeSelection(nextInventory?.recipe ?? nextDetail.project.recipe);
-      setSelected(included);
-      setSavedSelection([...included].sort().join("\n"));
 
       const links = nextDetail.links.length > 0
         ? nextDetail.links
@@ -439,16 +477,11 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       if (storageId && nextDetail.binding) {
         setActiveStorageByProject((current) => ({ ...current, [projectId]: storageId }));
         try {
-          setStatus(await projectSyncApi.getStatus(projectId, storageId));
-        } catch {
-          setStatus(null);
-        }
-      } else {
-        setStatus(null);
-      }
-      if (nextDetail.binding) {
-        try {
-          setReadiness(await projectSyncApi.getReadiness(nextDetail.project.bundle_id, nextDetail.binding));
+          setReadiness(await projectSyncApi.getReadiness(
+            storageId,
+            nextDetail.project.bundle_id,
+            nextDetail.binding,
+          ));
         } catch {
           setReadiness(null);
         }
@@ -458,7 +491,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     } catch (reason) {
       setDetail(null);
       setInventory(null);
-      setStatus(null);
       setReadiness(null);
       setError(errorMessage(reason));
     } finally {
@@ -535,6 +567,9 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   };
 
   const closeWorkspaceSettings = () => {
+    setPendingPush(null);
+    setPushError(null);
+    if (restorePlan) closePullReview();
     setStorageEditorRequest((current) => ({
       mode: "close",
       requestId: (current?.requestId ?? 0) + 1,
@@ -613,28 +648,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     if (completion === "pull" && storageId && detail.binding) {
       await planRestore(storageId, detail.project.bundle_id, detail.binding, projectLabel(detail.project));
     } else if (completion === "push" && storageId) {
-      await pushProject(projectId, storageId);
-    }
-  };
-
-  const saveRecipe = async () => {
-    if (!activeProjectId || !inventory) return;
-    setBusy(true);
-    setError(null);
-    const nextRecipe = recipeWithSelection(inventory.recipe, resources, selected);
-    try {
-      const savedProject = await projectSyncApi.saveRecipe(activeProjectId, nextRecipe);
-      setRegistrations((current) => upsertProject(current, savedProject));
-      setDetail((current) => current ? { ...current, project: savedProject } : current);
-      setInventory({ ...inventory, recipe: savedProject.recipe });
-      const saved = recipeSelection(savedProject.recipe);
-      setSelected(saved);
-      setSavedSelection([...saved].sort().join("\n"));
-      setNotice("Project recipe saved. Pushes now use this exact resource selection.");
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(false);
+      await publishProject(projectId, storageId, detail.project.recipe);
     }
   };
 
@@ -678,16 +692,77 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     }
   };
 
-  const pushProject = async (projectId: string, storageId: string) => {
-    openActivity();
+  const repairConversationPaths = async (projectId: string) => {
+    const audit = conversationPathAudits[projectId];
+    if (!audit?.can_repair) return;
+    const registration = registrations.find((candidate) => candidate.local_project_id === projectId);
+    const projectName = registration ? projectLabel(registration) : "this project";
+    const approved = await confirm(
+      `Repair ${audit.issues.length} Codex conversation path${audit.issues.length === 1 ? "" : "s"} for “${projectName}”?\n\nOnly conversations explicitly assigned to this project by Codex Desktop will be changed. Mallard will back up every affected rollout first, then update structural cwd fields without changing messages or history.\n\nClose the affected Codex tasks before continuing so they are not written at the same time.`,
+      { title: "Repair conversation paths" },
+    );
+    if (!approved) return;
+
     setBusy(true);
     setError(null);
     try {
-      const result = await projectSyncApi.pushBundle(projectId, storageId);
-      setNotice(result.message);
+      const result = await projectSyncApi.repairCodexConversationPaths(projectId);
+      setConversationPathAudits((current) => ({
+        ...current,
+        [projectId]: result.audit,
+      }));
+      setConversationPathAuditErrors((current) => {
+        const next = { ...current };
+        delete next[projectId];
+        return next;
+      });
+      setActiveProjectId(projectId);
+      await loadProjectData(projectId, config, activeStorageByProject[projectId]);
+      setNotice(
+        `Repaired ${result.repaired_thread_ids.length} Codex conversation path${result.repaired_thread_ids.length === 1 ? "" : "s"}. Original rollouts were backed up.`,
+      );
+    } catch (reason) {
+      setError(errorMessage(reason));
+      try {
+        const refreshed = await projectSyncApi.auditCodexConversationPaths(projectId);
+        setConversationPathAudits((current) => ({ ...current, [projectId]: refreshed }));
+      } catch {
+        // Keep the prior gate visible when the follow-up audit also fails.
+      }
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const openPushChooser = async (projectId: string, storageId: string) => {
+    if (restorePlan) closePullReview();
+    setBusy(true);
+    setError(null);
+    setPushError(null);
+    try {
+      const [nextInventory, nextDetail] = await Promise.all([
+        projectSyncApi.getInventory(projectId),
+        projectSyncApi.getProject(projectId),
+      ]);
+      if (!nextDetail) throw new Error("The selected local project no longer exists.");
+      const storage = config.storages.find((candidate) => candidate.id === storageId);
+      if (!storage) throw new Error("The selected storage no longer exists.");
+      const link = nextDetail.links.find((candidate) => candidate.storage_id === storageId);
+      if (!link) throw new Error("This project is no longer linked to the selected storage.");
+
+      const savedRecipe = link.recipe ?? null;
+      setPendingPush({
+        projectId,
+        storageId,
+        projectName: projectLabel(nextDetail.project),
+        storage,
+        inventory: nextInventory,
+        savedRecipe,
+        projectDefaults: recipeSelection(nextInventory.recipe),
+      });
+      setPushSelected(savedRecipe ? recipeSelection(savedRecipe) : new Set());
       setActiveProjectId(projectId);
       setActiveStorageByProject((current) => ({ ...current, [projectId]: storageId }));
-      await loadProjectData(projectId, config, storageId);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -703,6 +778,44 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     }
   };
 
+  const publishProject = async (
+    projectId: string,
+    storageId: string,
+    recipe: BundleRecipe,
+  ) => {
+    openActivity();
+    setBusy(true);
+    setError(null);
+    setPushError(null);
+    try {
+      const result = await projectSyncApi.pushBundle(projectId, storageId, recipe);
+      setNotice(result.message);
+      setPendingPush(null);
+      setActiveProjectId(projectId);
+      setActiveStorageByProject((current) => ({ ...current, [projectId]: storageId }));
+      const { nextConfig } = await loadShell();
+      await loadProjectData(projectId, nextConfig, storageId);
+    } catch (reason) {
+      const message = errorMessage(reason);
+      if (pendingPush) setPushError(message);
+      else setError(message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const publishPendingPush = async () => {
+    if (!pendingPush) return;
+    const resources = inventoryResources(pendingPush.inventory);
+    const baseRecipe = pendingPush.savedRecipe ?? {
+      ...pendingPush.inventory.recipe,
+      revision: 0,
+      entries: {},
+    };
+    const recipe = recipeWithSelection(baseRecipe, resources, pushSelected);
+    await publishProject(pendingPush.projectId, pendingPush.storageId, recipe);
+  };
+
   const saveRemap = async (nextBinding: ProjectBindingDraft) => {
     if (!activeProjectId) return;
     setBusy(true);
@@ -715,10 +828,12 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         expected_revision: nextBinding.expected_revision ?? binding?.revision ?? null,
       });
       setEditingBinding(null);
-      setBindings((current) => upsertBinding(current, saved));
+      const nextBindings = upsertBinding(bindings, saved);
+      setBindings(nextBindings);
       setDetail((current) => current ? { ...current, binding: saved } : current);
       await refreshRepositoryKinds();
       setNotice("Machine binding updated. Cloud identity and logical paths were unchanged.");
+      await loadConversationPathAudits(nextBindings);
       await loadProjectData(activeProjectId, config, activeStorageId);
     } catch (reason) {
       setError(errorMessage(reason));
@@ -750,12 +865,8 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         return;
       }
 
-      const profileIds = { ...nextDetail.binding.profile_ids };
-      if (profileId) profileIds[provider] = profileId;
-      else delete profileIds[provider];
-      if (Object.keys(profileIds).length === 0) {
-        throw new Error("A project must use at least one provider profile.");
-      }
+      if (!profileId) throw new Error("Choose a Codex or Claude profile for this project.");
+      const profileIds: Partial<Record<ProjectProvider, string>> = { [provider]: profileId };
 
       const saved = await projectSyncApi.saveBinding({
         local_project_id: projectId,
@@ -763,17 +874,17 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         profile_ids: profileIds,
         expected_revision: nextDetail.binding.revision,
       });
-      setBindings((current) => upsertBinding(current, saved));
+      const nextBindings = upsertBinding(bindings, saved);
+      setBindings(nextBindings);
       await refreshRepositoryKinds();
       setProfiles(await projectSyncApi.listProviderProfiles());
+      await loadConversationPathAudits(nextBindings);
       if (activeProjectId === projectId) {
         setDetail((current) => current ? { ...current, binding: saved } : current);
         await loadProjectData(projectId, config, activeStorageByProject[projectId]);
       }
       const assigned = profiles.find((profile) => profile.profile_id === profileId);
-      setNotice(profileId
-        ? `${provider === "codex" ? "Codex" : "Claude"} now uses ${assigned?.display_name ?? "the selected profile"}.`
-        : `${provider === "codex" ? "Codex" : "Claude"} removed from this project.`);
+      setNotice(`${provider === "codex" ? "Codex" : "Claude"} is now this project's agent using ${assigned?.display_name ?? "the selected profile"}.`);
     } catch (reason) {
       setError(errorMessage(reason));
     } finally {
@@ -786,33 +897,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     if (profile) await assignProjectProfile(projectId, provider, profile.profile_id);
   };
 
-  const saveProjectPath = async (projectId: string, projectRoot: string) => {
-    setBusy(true);
-    setError(null);
-    try {
-      const nextDetail = await projectSyncApi.getProject(projectId);
-      if (!nextDetail?.binding) throw new Error("Choose a provider profile before setting the project path.");
-      const saved = await projectSyncApi.saveBinding({
-        local_project_id: projectId,
-        project_root: projectRoot.trim(),
-        profile_ids: nextDetail.binding.profile_ids,
-        expected_revision: nextDetail.binding.revision,
-      });
-      setBindings((current) => upsertBinding(current, saved));
-      await refreshRepositoryKinds();
-      if (activeProjectId === projectId) {
-        setDetail((current) => current ? { ...current, binding: saved } : current);
-        await loadProjectData(projectId, config, activeStorageByProject[projectId]);
-      }
-      setNotice("Project path updated for this machine.");
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const renameProject = async (projectId: string, alias: string | null) => {
+  const renameProject = async (projectId: string, alias: string | null): Promise<boolean> => {
     setBusy(true);
     setError(null);
     try {
@@ -828,8 +913,10 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       setNotice(alias
         ? `Project shown as “${alias}” on this machine. The shared repo name is unchanged.`
         : "Custom name cleared; showing the shared repo name again.");
+      return true;
     } catch (reason) {
       setError(errorMessage(reason));
+      return false;
     } finally {
       setBusy(false);
     }
@@ -902,6 +989,8 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   };
 
   const beginProjectRestore = async (projectId: string, storageId: string) => {
+    setPendingPush(null);
+    setPushError(null);
     setError(null);
     try {
       const nextDetail = await projectSyncApi.getProject(projectId);
@@ -1031,7 +1120,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const removeProject = async (projectId: string) => {
     const summary = projects.find((candidate) => candidate.local_project_id === projectId);
     const approved = await confirm(
-      `Remove “${summary ? projectLabel(summary) : "this project"}” from Agent Sync?\n\nThe checkout and provider files stay on disk. Only this app's project registration, links, and active binding are removed.`,
+      `Remove “${summary ? projectLabel(summary) : "this project"}” from Mallard?\n\nThe checkout and provider files stay on disk. Only this app's project registration, links, and active binding are removed.`,
       { title: "Remove project" },
     );
     if (!approved) return;
@@ -1039,7 +1128,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     setError(null);
     try {
       await projectSyncApi.removeProject(projectId);
-      setNotice(`${summary ? projectLabel(summary) : "Project"} removed from Agent Sync. Files were not deleted.`);
+      setNotice(`${summary ? projectLabel(summary) : "Project"} removed from Mallard. Files were not deleted.`);
       await refresh();
     } catch (reason) {
       setError(errorMessage(reason));
@@ -1063,6 +1152,62 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     setFailedPullResourceIds(new Set());
   };
 
+  const unlinkStorage = async (projectId: string, storageId: string) => {
+    const project = projects.find((candidate) => candidate.local_project_id === projectId);
+    const storage = config.storages.find((candidate) => candidate.id === storageId);
+    if (!project || !storage) return;
+
+    const projectName = projectLabel(project);
+    const storageName = storage.name || "Storage";
+    const approved = await confirm(
+      `Unlink “${storageName}” from “${projectName}”?\n\nPush and Pull will stop for this pairing. Files and repositories already stored there will not be deleted, and you can link the storage again later.`,
+      { title: "Unlink storage" },
+    );
+    if (!approved) return;
+
+    setBusy(true);
+    setError(null);
+    try {
+      const removed = await projectSyncApi.removeLink(projectId, storageId);
+
+      if (pendingPush?.projectId === projectId && pendingPush.storageId === storageId) {
+        setPendingPush(null);
+        setPushError(null);
+      }
+      if (restoreBinding?.local_project_id === projectId && restorePlan?.storage_id === storageId) {
+        closePullReview();
+      }
+      if (pendingBundleConnection?.projectId === projectId && pendingBundleConnection.storageId === storageId) {
+        setPendingBundleConnection(null);
+      }
+
+      const { nextConfig } = await loadShell();
+      const remainingLinks = nextConfig.links.filter((link) => link.local_project_id === projectId);
+      const rememberedStorageId = activeStorageByProject[projectId];
+      const nextStorageId = rememberedStorageId
+        && rememberedStorageId !== storageId
+        && remainingLinks.some((link) => link.storage_id === rememberedStorageId)
+        ? rememberedStorageId
+        : remainingLinks[0]?.storage_id ?? null;
+
+      setActiveStorageByProject((current) => {
+        const next = { ...current };
+        if (nextStorageId) next[projectId] = nextStorageId;
+        else delete next[projectId];
+        return next;
+      });
+      setActiveProjectId(projectId);
+      await loadProjectData(projectId, nextConfig, nextStorageId);
+      setNotice(removed
+        ? `${storageName} unlinked from ${projectName}. Stored files were not deleted.`
+        : `${storageName} was already unlinked from ${projectName}.`);
+    } catch (reason) {
+      setError(errorMessage(reason));
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const applyReview = async (selection: PullReviewSelection) => {
     if (!restorePlan || !restoreBinding) return;
     const currentRestorePlan = restorePlan;
@@ -1082,7 +1227,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         projectSyncApi,
         currentRestorePlan,
         currentDependencyPlan,
-        restoreBinding,
         selection,
         setPullApplyPhase,
       );
@@ -1158,21 +1302,17 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         !completedPullActionIds.has(actionId) && !approvedThisPass.has(actionId)
       ));
       if (!result.success || hasSkippedActions) {
-        const [nextRestore, nextDependencies] = await Promise.allSettled([
-          projectSyncApi.planRestore(
-            currentRestorePlan.storage_id,
-            currentRestorePlan.bundle_id,
-            restoreBinding,
-          ),
-          projectSyncApi.planDependencies(currentRestorePlan.bundle_id, restoreBinding),
-        ]);
-        if (nextRestore.status === "fulfilled") setRestorePlan(nextRestore.value);
-        if (nextDependencies.status === "fulfilled") setDependencyPlan(nextDependencies.value);
-        const replanErrors = [nextRestore, nextDependencies]
-          .filter((entry) => entry.status === "rejected")
-          .map((entry) => errorMessage(entry.reason));
-        if (replanErrors.length > 0) {
-          setRestoreError(`Changes were applied, but remaining setup could not be prepared: ${replanErrors.join(" ")}`);
+        const nextRestore = await projectSyncApi.planRestore(
+          currentRestorePlan.storage_id,
+          currentRestorePlan.bundle_id,
+          restoreBinding,
+        );
+        setRestorePlan(nextRestore);
+        const support = await loadPullReviewSupport(projectSyncApi, nextRestore);
+        setDependencyPlan(support.dependencyPlan);
+        setReadiness(support.readiness);
+        if (support.errors.length > 0) {
+          setRestoreError(`Changes were applied, but remaining setup could not be prepared: ${support.errors.join(" ")}`);
         }
       }
       if (activeProjectId) await loadProjectData(activeProjectId, config, activeStorageId);
@@ -1190,11 +1330,12 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     setBusy(true);
     setRestoreError(null);
     try {
-      const [nextRestore, nextDependencies, nextReadiness] = await Promise.all([
-        projectSyncApi.planRestore(currentPlan.storage_id, currentPlan.bundle_id, restoreBinding),
-        projectSyncApi.planDependencies(currentPlan.bundle_id, restoreBinding),
-        projectSyncApi.getReadiness(currentPlan.bundle_id, restoreBinding),
-      ]);
+      const nextRestore = await projectSyncApi.planRestore(
+        currentPlan.storage_id,
+        currentPlan.bundle_id,
+        restoreBinding,
+      );
+      const support = await loadPullReviewSupport(projectSyncApi, nextRestore);
       if (nextRestore.generation !== currentPlan.generation || nextRestore.manifest_sha256 !== currentPlan.manifest_sha256) {
         setRestoreResult(null);
         setDependencyResult(null);
@@ -1204,8 +1345,9 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         setFailedPullResourceIds(new Set());
       }
       setRestorePlan(nextRestore);
-      setDependencyPlan(nextDependencies);
-      setReadiness(nextReadiness);
+      setDependencyPlan(support.dependencyPlan);
+      setReadiness(support.readiness);
+      if (support.errors.length > 0) setRestoreError(support.errors.join(" "));
     } catch (reason) {
       setRestoreError(errorMessage(reason));
     } finally {
@@ -1275,7 +1417,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       return;
     }
     const approved = await confirm(
-      `Remove “${storageName}” from Agent Sync?\n\nFiles already written to the storage location will not be deleted.`,
+      `Remove “${storageName}” from Mallard?\n\nFiles already written to the storage location will not be deleted.`,
       { title: "Remove storage" },
     );
     if (!approved) return;
@@ -1296,6 +1438,80 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     }
   };
 
+  const openNewStorageConfiguration = () => {
+    setSetupDraftId(null);
+    setPendingPush(null);
+    setPushError(null);
+    if (restorePlan) closePullReview();
+    setStorageEditorRequest((current) => ({
+      mode: "create",
+      storageKind: "local",
+      requestId: (current?.requestId ?? 0) + 1,
+    }));
+  };
+
+  const inlineStorageReview = pendingPush ? {
+    kind: "push" as const,
+    projectId: pendingPush.projectId,
+    storageId: pendingPush.storageId,
+    onClose: () => {
+      if (busy) return;
+      setPendingPush(null);
+      setPushError(null);
+    },
+    content: (
+      <PushResourceWorkspace
+        resources={inventoryResources(pendingPush.inventory)}
+        selected={pushSelected}
+        projectDefaults={pendingPush.projectDefaults}
+        busy={busy}
+        error={pushError}
+        onToggle={(resourceId) => setPushSelected((current) => {
+          const next = new Set(current);
+          if (next.has(resourceId)) next.delete(resourceId);
+          else next.add(resourceId);
+          return next;
+        })}
+        onUseProjectDefaults={() => setPushSelected(new Set(pendingPush.projectDefaults))}
+        onClear={() => setPushSelected(new Set())}
+        onClose={() => {
+          if (busy) return;
+          setPendingPush(null);
+          setPushError(null);
+        }}
+        onPush={() => void publishPendingPush()}
+      />
+    ),
+  } : restorePlan && restoreBinding ? {
+    kind: "pull" as const,
+    projectId: restoreBinding.local_project_id,
+    storageId: restorePlan.storage_id,
+    onClose: closePullReview,
+    content: (
+      <RestorePlanView
+        embedded
+        projectName={restoreProjectName}
+        profileLabel={restoreProfileLabel}
+        plan={restorePlan}
+        binding={restoreBinding}
+        dependencyPlan={dependencyPlan}
+        readiness={readiness}
+        restoreResult={restoreResult}
+        dependencyResult={dependencyResult}
+        phase={pullApplyPhase}
+        supportLoading={reviewSupportLoading}
+        completedActionIds={completedPullActionIds}
+        completedResourceIds={completedPullResourceIds}
+        failedResourceIds={failedPullResourceIds}
+        busy={busy}
+        error={restoreError}
+        onApply={(selection) => void applyReview(selection)}
+        onRefresh={() => void refreshRestore()}
+        onBack={closePullReview}
+      />
+    ),
+  } : null;
+
   return (
     <div
       className={`v3-app${resizingSidebar ? " resizing-sidebar" : ""}`}
@@ -1313,6 +1529,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
           config.links.filter((link) => link.storage_id === storage.id).length,
         ]))}
         activeProjectId={activeProjectId}
+        activeStorageId={activeStorageSettingsId}
         loading={loading}
         busy={busy}
         activityOpen={activityOpen}
@@ -1325,6 +1542,9 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         }}
         onConfigureProject={(projectId) => {
           setSetupDraftId(null);
+          setPendingPush(null);
+          setPushError(null);
+          if (restorePlan) closePullReview();
           setProjectEditorRequest((current) => ({
             mode: "toggle",
             projectId,
@@ -1342,6 +1562,9 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         onRefresh={() => void refresh()}
         onOpenStorage={(storageId) => {
           setSetupDraftId(null);
+          setPendingPush(null);
+          setPushError(null);
+          if (restorePlan) closePullReview();
           setStorageEditorRequest((current) => ({
             mode: "toggle",
             storageId,
@@ -1349,14 +1572,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
           }));
         }}
         onRemoveStorage={(storageId) => void removeStorage(storageId)}
-        onAddStorage={() => {
-          setSetupDraftId(null);
-          setStorageEditorRequest((current) => ({
-            mode: "create",
-            storageKind: "local",
-            requestId: (current?.requestId ?? 0) + 1,
-          }));
-        }}
+        onAddStorage={openNewStorageConfiguration}
         onOpenLegacy={onOpenLegacy}
       />
 
@@ -1407,90 +1623,54 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
           </button>
         )}
 
-        {restorePlan && restoreBinding ? (
-          <RestorePlanView
-            projectName={restoreProjectName}
-            profileLabel={restoreProfileLabel}
-            plan={restorePlan}
-            binding={restoreBinding}
-            dependencyPlan={dependencyPlan}
-            readiness={readiness}
-            restoreResult={restoreResult}
-            dependencyResult={dependencyResult}
-            phase={pullApplyPhase}
-            supportLoading={reviewSupportLoading}
-            completedActionIds={completedPullActionIds}
-            completedResourceIds={completedPullResourceIds}
-            failedResourceIds={failedPullResourceIds}
-            busy={busy}
-            error={restoreError}
-            onApply={(selection) => void applyReview(selection)}
-            onRefresh={() => void refreshRestore()}
-            onBack={closePullReview}
-          />
-        ) : (
-          <ProjectLinksWorkspace
+        <ProjectLinksWorkspace
             projects={projects}
+            activeProjectId={activeProjectId}
             bindings={bindings}
             profiles={profiles}
-            activeProjectId={activeProjectId}
-            resources={resources}
-            selected={selected}
-            statuses={statuses}
             storages={config.storages}
             links={config.links}
-            readiness={readiness}
             loading={loading}
             busy={busy}
-            selectionDirty={selectionDirty}
             error={error}
+            conversationPathAudits={conversationPathAudits}
+            conversationPathAuditErrors={conversationPathAuditErrors}
+            conversationPathAuditLoading={conversationPathAuditLoading}
             onSelectProject={(projectId, storageId) => selectProject(projectId, storageId)}
-            onToggleResource={(resourceId) => setSelected((current) => {
-              const next = new Set(current);
-              if (next.has(resourceId)) next.delete(resourceId);
-              else next.add(resourceId);
-              return next;
-            })}
-            onSaveRecipe={() => void saveRecipe()}
             onLinkStorage={(projectId, storageId) => linkStorage(projectId, storageId)}
-            onPush={(projectId, storageId) => pushProject(projectId, storageId)}
+            onUnlinkStorage={(projectId, storageId) => unlinkStorage(projectId, storageId)}
+            onPush={(projectId, storageId) => openPushChooser(projectId, storageId)}
             onPull={(projectId, storageId) => beginProjectRestore(projectId, storageId)}
-            onRepair={(projectId, storageId) => beginProjectRestore(projectId, storageId)}
-            onSaveProjectPath={(projectId, path) => saveProjectPath(projectId, path)}
+            onRepairConversationPaths={(projectId) => repairConversationPaths(projectId)}
             onRenameProject={(projectId, alias) => renameProject(projectId, alias)}
             onAssignProfile={(projectId, provider, profileId) => assignProjectProfile(projectId, provider, profileId)}
             onAddProfilePath={(projectId, provider, path) => addProfilePathToProject(projectId, provider, path)}
-            onRemoveProject={(projectId) => removeProject(projectId)}
             onRefresh={() => void refresh()}
             onAddProject={() => void beginAddProject()}
-            onOpenStorageSettings={() => {
-              setSetupDraftId(null);
-              setStorageEditorRequest((current) => ({
-                mode: "create",
-                storageKind: "local",
-                requestId: (current?.requestId ?? 0) + 1,
-              }));
-            }}
+            onOpenStorageSettings={openNewStorageConfiguration}
             onSaveStorage={saveInlineStorage}
             storageEditorRequest={storageEditorRequest}
             onStorageEditorRequestHandled={() => setStorageEditorRequest(null)}
+            onStorageEditorChange={setActiveStorageSettingsId}
             projectEditorRequest={projectEditorRequest}
             onProjectEditorRequestHandled={() => setProjectEditorRequest(null)}
             historyRefreshEpoch={historyRefreshEpoch}
+            inlineStorageReview={inlineStorageReview}
             newProjectSetup={setupDraftId ? (
               <ProjectSetupWorkspace
                 key={setupDraftId}
                 draftId={setupDraftId}
                 profiles={profiles}
+                projects={projects}
                 storages={config.storages}
                 busy={busy}
                 onClose={() => void closeSetupDraft()}
                 onDiscard={(draftId) => void discardSetupDraft(draftId)}
+                onAddStorage={openNewStorageConfiguration}
                 onFinalized={(detail, completion) => void completeSetup(detail, completion)}
               />
             ) : null}
           />
-        )}
 
         <div
           className={`log-drawer v3-log-drawer${activityOpen ? " open" : ""}`}
@@ -1539,7 +1719,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       {editingBinding && (
         <ProjectBindingEditor
           title={`Project setup for ${activeSummary ? projectLabel(activeSummary) : "project"}`}
-          description="Choose this machine's checkout and provider profiles. Existing files and provider state are never moved or deleted."
+          description="Choose this machine's checkout and one agent profile: Codex or Claude. Existing files and provider state are never moved or deleted."
           binding={editingBinding}
           profiles={profiles}
           busy={busy}

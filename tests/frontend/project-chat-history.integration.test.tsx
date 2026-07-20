@@ -174,7 +174,7 @@ test("an invalid persisted Codex profile offers Project Settings recovery", () =
   assert.match(html, /Open Project Settings/);
 });
 
-test("completed projects use their main row for history and show a non-interactive repository type", () => {
+test("completed projects use their main row for history and only mark Git repositories", () => {
   const html = renderToStaticMarkup(
     <ProjectSidebar
       projects={[
@@ -211,10 +211,13 @@ test("completed projects use their main row for history and show a non-interacti
       onOpenLegacy={() => undefined}
     />,
   );
+  assert.match(html, /src="\/mallard-logo\.svg"/);
+  assert.doesNotMatch(html, /mallard-logo\.png/);
   assert.doesNotMatch(html, /aria-label="View history for Mallard local"/);
-  assert.match(html, /Git Based/);
-  assert.match(html, /title="Git based project"/);
-  assert.match(html, /Non-Git Based/);
+  assert.equal(html.match(/v3-repository-kind/g)?.length, 1);
+  assert.match(html, /title="Git repository"/);
+  assert.match(html, /git<\/span>/);
+  assert.doesNotMatch(html, /Git Based|Non-Git Based/);
   assert.match(html, /Project settings for Mallard local/);
   assert.doesNotMatch(html, /View history for draft repo/);
 });

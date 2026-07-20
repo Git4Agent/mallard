@@ -1,0 +1,88 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { renderToStaticMarkup } from "react-dom/server";
+import {
+  parseR2S3ApiUrl,
+  r2EndpointForAccount,
+  r2S3ApiUrl,
+  storageConfigReady,
+  StorageEditor,
+} from "../../src/components/project-sync/StorageSettingsV3";
+import type { StorageConfigV3 } from "../../src/types";
+
+function r2Storage(patch: Partial<StorageConfigV3> = {}): StorageConfigV3 {
+  return {
+    id: "storage-r2",
+    name: "R2 storage",
+    kind: "s3",
+    bucket: "",
+    access_key_id: "",
+    secret_access_key: "",
+    account_id: "",
+    s3_endpoint: "",
+    region: "auto",
+    local_dir: "",
+    included_default_exclusions: [],
+    ...patch,
+  };
+}
+
+test("R2 configuration derives the endpoint and requires the four user-provided values", () => {
+  assert.equal(
+    r2EndpointForAccount(" 0123456789abcdef "),
+    "https://0123456789abcdef.r2.cloudflarestorage.com",
+  );
+  assert.equal(storageConfigReady(r2Storage()), false);
+  assert.equal(storageConfigReady(r2Storage({
+    bucket: "agent-sync",
+    account_id: "0123456789abcdef",
+    access_key_id: "access-key",
+    secret_access_key: "secret-key",
+  })), true);
+});
+
+test("R2 S3 API URLs map to and from an Account ID and bucket", () => {
+  const accountId = "0123456789abcdef0123456789abcdef";
+  const fullUrl = `https://${accountId}.r2.cloudflarestorage.com/agent`;
+  assert.deepEqual(parseR2S3ApiUrl(fullUrl), {
+    accountId,
+    bucket: "agent",
+  });
+  assert.deepEqual(parseR2S3ApiUrl(`${fullUrl}/`), {
+    accountId,
+    bucket: "agent",
+  });
+  assert.equal(
+    r2S3ApiUrl(accountId, "agent"),
+    fullUrl,
+  );
+  assert.equal(parseR2S3ApiUrl("https://example.com/agent"), null);
+  assert.equal(parseR2S3ApiUrl(`${fullUrl}/nested`), null);
+});
+
+test("cloud storage editor exposes the guided R2 form instead of generic S3 fields", () => {
+  const html = renderToStaticMarkup(
+    <StorageEditor
+      storage={r2Storage()}
+      disabled={false}
+      onChange={() => undefined}
+    />,
+  );
+
+  assert.match(html, /Cloudflare R2/);
+  assert.match(html, /Connect a Cloudflare R2 bucket/);
+  assert.match(html, /Create an R2 bucket/);
+  assert.match(html, /Create R2 credentials/);
+  assert.match(html, /Find your Account ID/);
+  assert.match(html, /Bucket name/);
+  assert.match(html, /Access Key ID/);
+  assert.match(html, /Secret Access Key/);
+  assert.match(html, /S3 API URL/);
+  assert.match(html, /9cc0c910ec\*\*\*41511aca1\.r2\.cloudflarestorage\.com\/agent/);
+  assert.match(html, /codex-sync-backups/);
+  assert.match(html, /023e…c353/);
+  assert.match(html, /4a2b…91ef/);
+  assert.match(html, /a1B2…x9Y0/);
+  assert.doesNotMatch(html, />S3 \/ R2</);
+  assert.doesNotMatch(html, />Region</);
+});

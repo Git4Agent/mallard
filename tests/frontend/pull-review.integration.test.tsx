@@ -90,11 +90,13 @@ test("a valid Pull plan renders an enabled non-modal Apply workspace while suppo
       calls.push("plan-restore");
       return restorePlan;
     },
-    planDependencies: () => {
+    planDependencies: (restorePlanId) => {
+      assert.equal(restorePlanId, restorePlan.plan_id);
       calls.push("plan-dependencies");
       return dependencies.promise;
     },
-    getReadiness: () => {
+    getRestoreReadiness: (restorePlanId) => {
+      assert.equal(restorePlanId, restorePlan.plan_id);
       calls.push("readiness");
       return readiness.promise;
     },
@@ -137,11 +139,11 @@ test("a valid Pull plan renders an enabled non-modal Apply workspace while suppo
     />,
   );
   assert.match(html, /v3-pull-review-workspace/);
-  assert.match(html, /Global tools/);
-  assert.match(html, /installs into myconf2/);
+  assert.match(html, /Project files/);
+  assert.doesNotMatch(html, />Tools</, "an empty tools group is omitted");
   assert.doesNotMatch(html, /aria-modal/);
   assert.doesNotMatch(html, /v3-modal-backdrop/);
-  const applyText = html.lastIndexOf("Apply 1 selected change");
+  const applyText = html.lastIndexOf("Apply 1 change");
   assert.notEqual(applyText, -1);
   const applyTagStart = html.lastIndexOf("<button", applyText);
   const applyTagEnd = html.indexOf(">", applyTagStart);
@@ -334,14 +336,14 @@ test("the composite Apply coordinator restores, installs, then verifies one alig
         calls.push("install");
         return dependencyResult;
       },
-      getReadiness: async () => {
+      getRestoreReadiness: async (restorePlanId) => {
+        assert.equal(restorePlanId, restorePlan.plan_id);
         calls.push("verify");
         return ready;
       },
     },
     restorePlan,
     dependencies,
-    binding,
     {
       resourceIds: ["codex:session:thread-a", "codex:plugin:computer-use"],
       restoreActionIds: ["action-session"],
@@ -360,11 +362,10 @@ test("the composite Apply coordinator restores, installs, then verifies one alig
       applyDependencies: async () => {
         throw new Error("native runner unavailable");
       },
-      getReadiness: async () => ({ ...ready, state: "needs_setup" }),
+      getRestoreReadiness: async () => ({ ...ready, state: "needs_setup" }),
     },
     restorePlan,
     dependencies,
-    binding,
     {
       resourceIds: ["codex:session:thread-a", "codex:plugin:computer-use"],
       restoreActionIds: ["action-session"],
@@ -386,11 +387,10 @@ test("the composite Apply coordinator restores, installs, then verifies one alig
           return restoreResult;
         },
         applyDependencies: async () => dependencyResult,
-        getReadiness: async () => ready,
+        getRestoreReadiness: async () => ready,
       },
       restorePlan,
       { ...dependencies, generation: dependencies.generation + 1 },
-      binding,
       {
         resourceIds: ["codex:plugin:computer-use"],
         restoreActionIds: [],
@@ -407,11 +407,10 @@ test("the composite Apply coordinator restores, installs, then verifies one alig
       {
         applyRestore: async () => restoreResult,
         applyDependencies: async () => dependencyResult,
-        getReadiness: async () => ready,
+        getRestoreReadiness: async () => ready,
       },
       restorePlan,
       { ...dependencies, generation: dependencies.generation + 1 },
-      binding,
       {
         resourceIds: ["codex:session:thread-a"],
         restoreActionIds: ["action-session"],
@@ -433,7 +432,7 @@ test("a primary restore-plan failure still rejects the Pull review", async () =>
     planDependencies: async () => {
       throw new Error("must not run");
     },
-    getReadiness: async () => {
+    getRestoreReadiness: async () => {
       throw new Error("must not run");
     },
   };

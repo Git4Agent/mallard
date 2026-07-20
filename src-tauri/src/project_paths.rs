@@ -323,7 +323,7 @@ impl ClaudeAliasState {
 
 fn permission_error(path: &Path, error: &std::io::Error) -> String {
     format!(
-        "macOS denied access to '{}' ({}). Grant Agent Sync access to this folder (or Full Disk Access when required), then use Repair mapping.",
+        "macOS denied access to '{}' ({}). Grant Mallard access to this folder (or Full Disk Access when required), then use Repair mapping.",
         path.display(),
         error
     )

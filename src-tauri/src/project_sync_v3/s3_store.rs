@@ -335,7 +335,8 @@ impl S3BundleObjectStore {
                     last_raw_key = Some(raw_key.to_string());
                 }
                 // S3's byte-prefix match can also return lexical neighbors
-                // (for example `v3/bundles-old` for `v3/bundles`).  Ignore
+                // (for example `.mallard/v1/repositories-old` for the
+                // repository namespace). Ignore
                 // those before applying the stricter ObjectKey validator;
                 // malformed keys inside the requested namespace still fail.
                 if !raw_key_is_under_prefix(raw_key, prefix) {
@@ -510,6 +511,8 @@ fn ambiguous_sdk_error<E>(error: &SdkError<E>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::project_sync_v3::bundle_engine::BundleEngine;
+    use crate::project_sync_v3::domain::StorageId;
     use aws_sdk_s3::config::{Credentials, Region};
     use aws_sdk_s3::Config as S3Config;
     use aws_smithy_http_client::{tls, Builder as HttpClientBuilder};
@@ -602,12 +605,52 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn engine_initializes_the_mallard_storage_marker_once() {
+        let server = TestS3::start().await;
+        let store = server.store();
+        blocking(move || BundleEngine::open(store, StorageId::parse("storage-r2").unwrap()))
+            .await
+            .unwrap();
+
+        let marker = server
+            .objects
+            .lock()
+            .expect("test S3 lock")
+            .get(".mallard/_storage.json")
+            .cloned()
+            .expect("Mallard storage marker");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&marker).unwrap(),
+            serde_json::json!({
+                "format": "mallard-storage",
+                "layout_version": 1,
+            })
+        );
+
+        let store = server.store();
+        blocking(move || BundleEngine::open(store, StorageId::parse("storage-r2").unwrap()))
+            .await
+            .unwrap();
+        assert_eq!(
+            server
+                .objects
+                .lock()
+                .expect("test S3 lock")
+                .get(".mallard/_storage.json")
+                .cloned()
+                .unwrap(),
+            marker
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn immutable_get_and_cas_preserve_service_etags() {
         let server = TestS3::start().await;
         let store = server.store();
-        let immutable =
-            ObjectKey::parse("v3/bundles/0123456789abcdef0123456789abcdef/_uploads/a/file")
-                .unwrap();
+        let immutable = ObjectKey::parse(
+            ".mallard/v1/repositories/0123456789abcdef0123456789abcdef/_uploads/a/file",
+        )
+        .unwrap();
         let store_for_write = store.clone();
         let immutable_for_write = immutable.clone();
         assert_eq!(
@@ -641,8 +684,10 @@ mod tests {
         assert_eq!(found.bytes, b"one");
         assert_eq!(found.etag, crate::sha256_bytes(b"one"));
 
-        let head =
-            ObjectKey::parse("v3/bundles/0123456789abcdef0123456789abcdef/_head.json").unwrap();
+        let head = ObjectKey::parse(
+            ".mallard/v1/repositories/0123456789abcdef0123456789abcdef/_head.json",
+        )
+        .unwrap();
         let store_for_create = store.clone();
         let head_for_create = head.clone();
         let created = blocking(move || {
@@ -701,14 +746,17 @@ mod tests {
         let server = TestS3::start().await;
         for index in 0..1_005 {
             server.seed(
-                format!("v3/bundles/{:032x}/_tag.json", index),
+                format!(".mallard/v1/repositories/{:032x}/_tag.json", index),
                 index.to_string().into_bytes(),
             );
         }
         // A neighboring key must not leak from the exact prefix.
-        server.seed("v3/bundles-neighbor/value".to_string(), b"no".to_vec());
+        server.seed(
+            ".mallard/v1/repositories-neighbor/value".to_string(),
+            b"no".to_vec(),
+        );
         let store = server.store();
-        let prefix = ObjectPrefix::parse("v3/bundles").unwrap();
+        let prefix = ObjectPrefix::parse(".mallard/v1/repositories").unwrap();
         let store_for_first = store.clone();
         let prefix_for_first = prefix.clone();
         let first = blocking(move || store_for_first.list(&prefix_for_first, None, 1_001))
@@ -736,9 +784,12 @@ mod tests {
         assert!(validate_expected_etag("").is_err());
         assert!(validate_expected_etag("bad\"etag").is_err());
         assert!(validate_expected_etag("good-etag").is_ok());
-        let prefix = ObjectPrefix::parse("v3/bundles/0123456789abcdef0123456789abcdef").unwrap();
+        let prefix =
+            ObjectPrefix::parse(".mallard/v1/repositories/0123456789abcdef0123456789abcdef")
+                .unwrap();
         let foreign =
-            ObjectKey::parse("v3/bundles/ffffffffffffffffffffffffffffffff/_tag.json").unwrap();
+            ObjectKey::parse(".mallard/v1/repositories/ffffffffffffffffffffffffffffffff/_tag.json")
+                .unwrap();
         assert!(!key_is_under_prefix(&foreign, &prefix));
     }
 

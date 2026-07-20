@@ -16,6 +16,7 @@ type IconName =
   | "folder"
   | "external-link"
   | "git-branch"
+  | "help-circle"
   | "link"
   | "more"
   | "pause"
@@ -137,6 +138,13 @@ export default function Icon({ name, size = 14, ...props }: IconProps) {
           <circle cx="6" cy="19" r="2" />
           <path d="M6 7v10" />
           <path d="M8 13h4a6 6 0 0 0 6-5" />
+        </>
+      )}
+      {name === "help-circle" && (
+        <>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M9.8 9a2.3 2.3 0 0 1 4.4 1c0 1.7-2.2 2-2.2 3.7" />
+          <path d="M12 17h.01" />
         </>
       )}
       {name === "more" && (

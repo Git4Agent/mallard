@@ -2,7 +2,13 @@ import { useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import type { ProjectProvider, ProviderProfile, ProviderProfileSummary } from "../../types";
 import Icon from "../Icons";
-import { compactProjectPath } from "./model";
+import {
+  compactProjectPath,
+  configuredProjectProvider,
+  PROJECT_PROVIDERS,
+  providerLabel,
+  singleProviderSelection,
+} from "./model";
 
 export interface ProjectBindingDraft {
   local_project_id?: string;
@@ -39,8 +45,12 @@ export default function ProjectBindingEditor({
   onCancel,
   onSubmit,
 }: Props) {
+  const initialProvider = configuredProjectProvider(binding.profile_ids) ?? requiredProviders[0] ?? "codex";
   const [projectRoot, setProjectRoot] = useState(binding.project_root);
-  const [profileIds, setProfileIds] = useState<Partial<Record<ProjectProvider, string>>>(binding.profile_ids ?? {});
+  const [selectedProvider, setSelectedProvider] = useState<ProjectProvider>(initialProvider);
+  const [profileIds, setProfileIds] = useState<Partial<Record<ProjectProvider, string>>>(() => (
+    singleProviderSelection(binding.profile_ids ?? {}, initialProvider)
+  ));
 
   const chooseFolder = async () => {
     const picked = await open({ directory: true, multiple: false });
@@ -52,12 +62,17 @@ export default function ProjectBindingEditor({
     project_root: projectRoot,
     profile_ids: profileIds,
   };
-  const profilesComplete = Object.keys(profileIds).length > 0
-    && requiredProviders.every((provider) => !!profileIds[provider]);
+  const profilesComplete = !!profileIds[selectedProvider]
+    && (requiredProviders.length === 0 || requiredProviders.includes(selectedProvider));
 
   const addProfile = async (provider: ProjectProvider) => {
     const profile = await onAddProfile(provider);
-    if (profile) setProfileIds((current) => ({ ...current, [provider]: profile.profile_id }));
+    if (profile) setProfileIds({ [provider]: profile.profile_id });
+  };
+
+  const selectProvider = (provider: ProjectProvider) => {
+    setSelectedProvider(provider);
+    setProfileIds((current) => singleProviderSelection(current, provider));
   };
 
   const profileField = (provider: ProjectProvider, label: string) => {
@@ -71,14 +86,12 @@ export default function ProjectBindingEditor({
           <select
             value={selected}
             disabled={busy}
-            onChange={(event) => setProfileIds((current) => {
-              const nextIds = { ...current };
-              if (event.target.value) nextIds[provider] = event.target.value;
-              else delete nextIds[provider];
-              return nextIds;
-            })}
+            aria-label={`${label} profile`}
+            onChange={(event) => setProfileIds(
+              event.target.value ? { [provider]: event.target.value } : {},
+            )}
           >
-            <option value="">Not used</option>
+            <option value="">Choose a profile</option>
             {options.map((profile) => (
               <option key={profile.profile_id} value={profile.profile_id} disabled={!profile.available || !profile.readable}>
                 {profile.display_name}{!profile.available || !profile.readable ? " (unavailable)" : ""}
@@ -124,9 +137,26 @@ export default function ProjectBindingEditor({
             </div>
             <small>{compactProjectPath(projectRoot)} becomes the root for every project-relative task and setting.</small>
           </label>
-          <div className="v3-provider-home-grid">
-            {profileField("codex", "Codex")}
-            {profileField("claude", "Claude")}
+          <div className="v3-single-provider-binding">
+            <div className="v3-agent-choice" role="radiogroup" aria-label="Agent used by this project">
+              {PROJECT_PROVIDERS.map((provider) => (
+                <button
+                  key={provider}
+                  type="button"
+                  role="radio"
+                  aria-checked={selectedProvider === provider}
+                  className={selectedProvider === provider ? "active" : undefined}
+                  disabled={busy}
+                  onClick={() => selectProvider(provider)}
+                >
+                  <strong>{providerLabel(provider)}</strong>
+                  <span>{provider === "codex" ? ".codex profile" : ".claude profile"}</span>
+                </button>
+              ))}
+            </div>
+            <div className="v3-provider-home-grid single">
+              {profileField(selectedProvider, providerLabel(selectedProvider))}
+            </div>
           </div>
           <dl className="v3-fact-grid compact">
             <div><dt>Local project</dt><dd><code>{binding.local_project_id ?? "created after confirmation"}</code></dd></div>
