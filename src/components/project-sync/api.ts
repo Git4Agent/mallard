@@ -1,5 +1,11 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
+  ActivityLogCleanupRequest,
+  ActivityLogCleanupResult,
+  ActivityLogPage,
+  ActivityLogPolicy,
+  ActivityLogQuery,
+  ActivityLogStats,
   BundlePage,
   BundleReadiness,
   BundleRecipe,
@@ -40,6 +46,21 @@ import type {
  * JavaScript names, matching the existing command surface in App.tsx.
  */
 export const projectSyncApi = {
+  queryActivityLogs: (query: ActivityLogQuery) =>
+    invoke<ActivityLogPage>("query_activity_logs", { query }),
+
+  getActivityLogStats: () =>
+    invoke<ActivityLogStats>("get_activity_log_stats"),
+
+  updateActivityLogPolicy: (policy: ActivityLogPolicy) =>
+    invoke<ActivityLogStats>("update_activity_log_policy", { policy }),
+
+  cleanupActivityLogs: (request: ActivityLogCleanupRequest) =>
+    invoke<ActivityLogCleanupResult>("cleanup_activity_logs", { request }),
+
+  getActivityLogFolder: () =>
+    invoke<string>("get_activity_log_folder"),
+
   discoverProject: (path: string, profileIds: Partial<Record<ProjectProvider, string>>) =>
     invoke<ProjectDiscovery>("discover_project", { path, profileIds }),
 

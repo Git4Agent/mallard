@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type {
   CSSProperties,
   KeyboardEvent as ReactKeyboardEvent,
@@ -8,6 +8,8 @@ import type {
 import { confirm, open } from "@tauri-apps/plugin-dialog";
 import { listen } from "@tauri-apps/api/event";
 import type {
+  ActivityLogLevel,
+  ActivityLogType,
   AppTheme,
   BundleRecipe,
   BundleReadiness,
@@ -32,8 +34,9 @@ import type {
   SyncConfigV3,
 } from "../../types";
 import Icon from "../Icons";
-import LogPanel from "../LogPanel";
+import LogPanel, { ACTIVITY_LOG_TYPES } from "../LogPanel";
 import BundleConnectionDialog from "./BundleConnectionDialog";
+import LogManagerDialog from "./LogManagerDialog";
 import ProjectBindingEditor, { type ProjectBindingDraft } from "./ProjectBindingEditor";
 import ProjectLinksWorkspace from "./ProjectLinksWorkspace";
 import PushResourceWorkspace from "./PushResourceWorkspace";
@@ -135,6 +138,31 @@ function defaultProfileIds(): Partial<Record<ProjectProvider, string>> {
   return {};
 }
 
+function logMatchesFilters(
+  line: LogLine,
+  types: readonly ActivityLogType[],
+  level: ActivityLogLevel | "all",
+  search = "",
+): boolean {
+  const needle = search.trim().toLocaleLowerCase();
+  return types.includes(line.type ?? "system")
+    && (level === "all" || line.level === level)
+    && (!needle
+      || line.message.toLocaleLowerCase().includes(needle)
+      || !!line.event?.toLocaleLowerCase().includes(needle));
+}
+
+function mergeLogLines(...groups: LogLine[][]): LogLine[] {
+  const entries = new Map<string, LogLine>();
+  for (const line of groups.flat()) {
+    const key = line.id ?? `${line.ts}:${line.level}:${line.type ?? "system"}:${line.message}`;
+    entries.set(key, line);
+  }
+  return [...entries.values()].sort((left, right) => (
+    left.ts - right.ts || (left.id ?? "").localeCompare(right.id ?? "")
+  ));
+}
+
 export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Props) {
   const [config, setConfig] = useState<SyncConfigV3>(EMPTY_CONFIG);
   const [registrations, setRegistrations] = useState<LocalProjectRegistration[]>([]);
@@ -170,6 +198,15 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const [pushSelected, setPushSelected] = useState<Set<string>>(new Set());
   const [pushError, setPushError] = useState<string | null>(null);
   const [logLines, setLogLines] = useState<LogLine[]>([]);
+  const [logTypeFilters, setLogTypeFilters] = useState<ActivityLogType[]>(() => [...ACTIVITY_LOG_TYPES]);
+  const [logLevelFilter, setLogLevelFilter] = useState<ActivityLogLevel | "all">("all");
+  const [logSearchInput, setLogSearchInput] = useState("");
+  const [logSearch, setLogSearch] = useState("");
+  const [logCursor, setLogCursor] = useState<string | null>(null);
+  const [logLoading, setLogLoading] = useState(true);
+  const [logLoadingOlder, setLogLoadingOlder] = useState(false);
+  const [logLoadError, setLogLoadError] = useState<string | null>(null);
+  const [logManagerOpen, setLogManagerOpen] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
   const [logHeight, setLogHeight] = useState(240);
   const [resizingLog, setResizingLog] = useState(false);
@@ -177,6 +214,8 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const [resizingSidebar, setResizingSidebar] = useState(false);
   const [unreadLogs, setUnreadLogs] = useState(0);
   const activityOpenRef = useRef(false);
+  const logFiltersRef = useRef({ types: logTypeFilters, level: logLevelFilter, search: logSearch });
+  const logRequestRef = useRef(0);
   const sidebarResizeRef = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
 
   const [setupDrafts, setSetupDrafts] = useState<SetupDraftSummary[]>([]);
@@ -203,6 +242,15 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   }, [activityOpen]);
 
   useEffect(() => {
+    logFiltersRef.current = { types: logTypeFilters, level: logLevelFilter, search: logSearch };
+  }, [logLevelFilter, logSearch, logTypeFilters]);
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => setLogSearch(logSearchInput), 180);
+    return () => window.clearTimeout(timer);
+  }, [logSearchInput]);
+
+  useEffect(() => {
     try {
       window.localStorage.setItem(PROJECT_SIDEBAR_WIDTH_KEY, String(sidebarWidth));
     } catch {
@@ -219,9 +267,64 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     return () => window.removeEventListener("resize", fitSidebarToWindow);
   }, []);
 
+  const loadActivityLogs = useCallback(async (cursor: string | null = null) => {
+    const requestId = ++logRequestRef.current;
+    const startedAt = Date.now();
+    const loadingOlder = cursor !== null;
+    if (loadingOlder) {
+      setLogLoadingOlder(true);
+    } else {
+      setLogLoading(true);
+      setLogLines([]);
+    }
+    setLogLoadError(null);
+    if (logTypeFilters.length === 0) {
+      setLogCursor(null);
+      setLogLines([]);
+      setLogLoading(false);
+      setLogLoadingOlder(false);
+      return;
+    }
+    try {
+      const page = await projectSyncApi.queryActivityLogs({
+        types: logTypeFilters,
+        levels: logLevelFilter === "all" ? [] : [logLevelFilter],
+        search: logSearch.trim() || null,
+        cursor,
+        limit: 500,
+      });
+      if (requestId !== logRequestRef.current) return;
+      setLogCursor(page.next_cursor ?? null);
+      setLogLines((current) => {
+        const next = loadingOlder
+          ? mergeLogLines(page.entries, current)
+          : mergeLogLines(
+            page.entries,
+            current.filter((line) => line.ts >= startedAt
+              && logMatchesFilters(line, logTypeFilters, logLevelFilter, logSearch)),
+          );
+        return next.slice(-2_000);
+      });
+    } catch (reason) {
+      if (requestId === logRequestRef.current) setLogLoadError(errorMessage(reason));
+    } finally {
+      if (requestId === logRequestRef.current) {
+        setLogLoading(false);
+        setLogLoadingOlder(false);
+      }
+    }
+  }, [logLevelFilter, logSearch, logTypeFilters]);
+
+  useEffect(() => {
+    void loadActivityLogs();
+  }, [loadActivityLogs]);
+
   useEffect(() => {
     const unlisten = listen<LogLine>("sync-log", (event) => {
-      setLogLines((current) => [...current.slice(-1999), event.payload]);
+      const filters = logFiltersRef.current;
+      if (logMatchesFilters(event.payload, filters.types, filters.level, filters.search)) {
+        setLogLines((current) => mergeLogLines(current, [event.payload]).slice(-2_000));
+      }
       if (!activityOpenRef.current) setUnreadLogs((current) => Math.min(99, current + 1));
     });
     return () => {
@@ -233,6 +336,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     activityOpenRef.current = true;
     setActivityOpen(true);
     setUnreadLogs(0);
+    void loadActivityLogs();
   };
 
   const startLogResize = (event: ReactMouseEvent<HTMLDivElement>) => {
@@ -840,61 +944,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     } finally {
       setBusy(false);
     }
-  };
-
-  const assignProjectProfile = async (
-    projectId: string,
-    provider: ProjectProvider,
-    profileId: string | null,
-  ) => {
-    setBusy(true);
-    setError(null);
-    try {
-      const nextDetail = await projectSyncApi.getProject(projectId);
-      if (!nextDetail) throw new Error("The selected local project no longer exists.");
-      if (!nextDetail.binding) {
-        setActiveProjectId(projectId);
-        setEditingBinding({
-          local_project_id: projectId,
-          bundle_id: nextDetail.project.bundle_id,
-          project_root: "",
-          profile_ids: profileId ? { [provider]: profileId } : defaultProfileIds(),
-          expected_revision: null,
-        });
-        setNotice("Choose the project folder to finish this machine's setup.");
-        return;
-      }
-
-      if (!profileId) throw new Error("Choose a Codex or Claude profile for this project.");
-      const profileIds: Partial<Record<ProjectProvider, string>> = { [provider]: profileId };
-
-      const saved = await projectSyncApi.saveBinding({
-        local_project_id: projectId,
-        project_root: nextDetail.binding.project_root,
-        profile_ids: profileIds,
-        expected_revision: nextDetail.binding.revision,
-      });
-      const nextBindings = upsertBinding(bindings, saved);
-      setBindings(nextBindings);
-      await refreshRepositoryKinds();
-      setProfiles(await projectSyncApi.listProviderProfiles());
-      await loadConversationPathAudits(nextBindings);
-      if (activeProjectId === projectId) {
-        setDetail((current) => current ? { ...current, binding: saved } : current);
-        await loadProjectData(projectId, config, activeStorageByProject[projectId]);
-      }
-      const assigned = profiles.find((profile) => profile.profile_id === profileId);
-      setNotice(`${provider === "codex" ? "Codex" : "Claude"} is now this project's agent using ${assigned?.display_name ?? "the selected profile"}.`);
-    } catch (reason) {
-      setError(errorMessage(reason));
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const addProfilePathToProject = async (projectId: string, provider: ProjectProvider, path: string) => {
-    const profile = await createProfileAtPath(provider, path);
-    if (profile) await assignProjectProfile(projectId, provider, profile.profile_id);
   };
 
   const renameProject = async (projectId: string, alias: string | null): Promise<boolean> => {
@@ -1643,8 +1692,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
             onPull={(projectId, storageId) => beginProjectRestore(projectId, storageId)}
             onRepairConversationPaths={(projectId) => repairConversationPaths(projectId)}
             onRenameProject={(projectId, alias) => renameProject(projectId, alias)}
-            onAssignProfile={(projectId, provider, profileId) => assignProjectProfile(projectId, provider, profileId)}
-            onAddProfilePath={(projectId, provider, path) => addProfilePathToProject(projectId, provider, path)}
             onRefresh={() => void refresh()}
             onAddProject={() => void beginAddProject()}
             onOpenStorageSettings={openNewStorageConfiguration}
@@ -1688,10 +1735,18 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
           )}
           <LogPanel
             lines={logLines}
-            onClear={() => {
-              setLogLines([]);
-              setUnreadLogs(0);
-            }}
+            typeFilters={logTypeFilters}
+            levelFilter={logLevelFilter}
+            search={logSearchInput}
+            loading={logLoading}
+            loadingOlder={logLoadingOlder}
+            hasOlder={!!logCursor}
+            error={logLoadError}
+            onTypeFiltersChange={setLogTypeFilters}
+            onLevelFilterChange={setLogLevelFilter}
+            onSearchChange={setLogSearchInput}
+            onLoadOlder={() => logCursor && void loadActivityLogs(logCursor)}
+            onManage={() => setLogManagerOpen(true)}
             onClose={() => {
               activityOpenRef.current = false;
               setActivityOpen(false);
@@ -1728,6 +1783,13 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
           onCancel={() => setEditingBinding(null)}
           onAddProfile={chooseAndCreateProfile}
           onSubmit={(next) => void saveRemap(next)}
+        />
+      )}
+
+      {logManagerOpen && (
+        <LogManagerDialog
+          onClose={() => setLogManagerOpen(false)}
+          onLogsChanged={() => void loadActivityLogs()}
         />
       )}
 

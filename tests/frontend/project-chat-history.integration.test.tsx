@@ -13,7 +13,9 @@ const project = {
   local_alias: "Mallard local",
   repository_fingerprint: "fingerprint",
   project_root: "/Users/test/projects/mallard",
+  canonical_project_root: "/Users/test/projects/mallard",
   profile_ids: { codex: "profile-codex" },
+  profile_names: ["Default Codex"],
   created_at: 1,
   updated_at: 2,
   revision: 1,
@@ -179,7 +181,13 @@ test("completed projects use their main row for history and only mark Git reposi
     <ProjectSidebar
       projects={[
         { ...project, is_git_repository: true },
-        { ...project, local_project_id: "project-folder", local_alias: "Plain folder", is_git_repository: false },
+        {
+          ...project,
+          local_project_id: "project-folder",
+          local_alias: "Plain folder",
+          profile_names: ["myconf3 · Codex"],
+          is_git_repository: false,
+        },
       ]}
       drafts={[{
         draft_id: "draft-1",
@@ -217,6 +225,9 @@ test("completed projects use their main row for history and only mark Git reposi
   assert.equal(html.match(/v3-repository-kind/g)?.length, 1);
   assert.match(html, /title="Git repository"/);
   assert.match(html, /git<\/span>/);
+  assert.doesNotMatch(html, /Default Codex|myconf3 · Codex/);
+  assert.match(html, /role="separator" aria-label="Resize Projects and Storage sections" aria-orientation="horizontal"/);
+  assert.match(html, /aria-valuenow="56"/);
   assert.doesNotMatch(html, /Git Based|Non-Git Based/);
   assert.match(html, /Project settings for Mallard local/);
   assert.doesNotMatch(html, /View history for draft repo/);

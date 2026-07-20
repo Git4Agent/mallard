@@ -1,7 +1,7 @@
 # Managed Cloud Architecture: Cloudflare R2, CDN, and a Worker Reverse Proxy
 
-Status: Proposal  
-Project: Agent Sync  
+Status: Proposal
+Project: Agent Sync
 Last updated: 2026-07-19
 
 ## English

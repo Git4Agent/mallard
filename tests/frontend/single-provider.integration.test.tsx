@@ -178,8 +178,6 @@ test("the configured profile groups its warning above simple storage rows", () =
       onPull={() => undefined}
       onRepairConversationPaths={() => undefined}
       onRenameProject={() => true}
-      onAssignProfile={() => undefined}
-      onAddProfilePath={() => undefined}
       onRefresh={() => undefined}
       onAddProject={() => undefined}
       onOpenStorageSettings={() => undefined}
@@ -210,6 +208,8 @@ test("the configured profile groups its warning above simple storage rows", () =
   assert.equal(html.match(/Default Codex/g)?.length, 1);
   assert.match(html, /Codex · ~\/\.codex/);
   assert.match(html, /project-profile-group-icon/);
+  assert.match(html, /Agent home is fixed after project setup/);
+  assert.doesNotMatch(html, /Configure project profile/);
   assert.doesNotMatch(html, />CLAUDE</);
   assert.doesNotMatch(html, /Not used/);
 });

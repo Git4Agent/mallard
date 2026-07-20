@@ -1,13 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
 import type {
   BundlePage,
   CodexConversationPathAudit,
   LocalProjectSummary,
   ProjectBinding,
-  ProjectProvider,
   ProjectStorageLink,
   ProviderProfileSummary,
+  RemoteBundleSummary,
   StorageConfigV3,
 } from "../../types";
 import Icon from "../Icons";
@@ -59,8 +58,6 @@ interface Props {
   onPull: (projectId: string, storageId: string) => Promise<void> | void;
   onRepairConversationPaths: (projectId: string) => Promise<void> | void;
   onRenameProject: (projectId: string, alias: string | null) => Promise<boolean> | boolean;
-  onAssignProfile: (projectId: string, provider: ProjectProvider, profileId: string | null) => Promise<void> | void;
-  onAddProfilePath: (projectId: string, provider: ProjectProvider, path: string) => Promise<void> | void;
   onRefresh: () => void;
   onAddProject: () => void;
   onOpenStorageSettings: (storageId?: string) => void;
@@ -78,6 +75,39 @@ interface Props {
 function storageSubtitle(storage: StorageConfigV3): string {
   if (storage.kind === "local") return compactProjectPath(storage.local_dir || "Folder not configured");
   return storage.bucket || storage.s3_endpoint || "S3 storage not configured";
+}
+
+export function StorageRepositoryRow({ bundle }: { bundle: RemoteBundleSummary }) {
+  const name = bundle.display_name || "Unnamed repository";
+  return (
+    <details className="v3-storage-repository-row" name="storage-repository-details">
+      <summary aria-label={`Show details for ${name}`}>
+        <span className="v3-storage-repository-icon"><Icon name="folder" size={16} /></span>
+        <strong className="v3-storage-repository-name">{name}</strong>
+        <span className="v3-storage-repository-details-icon" title="Repository details">
+          <Icon name="info" size={15} />
+        </span>
+      </summary>
+      <dl className="v3-storage-repository-details">
+        <div>
+          <dt>Repository ID</dt>
+          <dd><code>{bundle.bundle_id}</code></dd>
+        </div>
+        <div>
+          <dt>Generation</dt>
+          <dd>{bundle.generation ?? "—"}</dd>
+        </div>
+        <div>
+          <dt>Resources</dt>
+          <dd>{bundle.resource_count ?? 0}</dd>
+        </div>
+        <div>
+          <dt>Updated</dt>
+          <dd>{formatRelativeTime(bundle.updated_at)}</dd>
+        </div>
+      </dl>
+    </details>
+  );
 }
 
 export function conversationPathsBlockSync(
@@ -109,8 +139,6 @@ export default function ProjectLinksWorkspace({
   onPull,
   onRepairConversationPaths,
   onRenameProject,
-  onAssignProfile,
-  onAddProfilePath,
   onRefresh,
   onAddProject,
   onOpenStorageSettings,
@@ -124,8 +152,6 @@ export default function ProjectLinksWorkspace({
   historyRefreshEpoch = 0,
   inlineStorageReview,
 }: Props) {
-  const [expandedProfileProjectId, setExpandedProfileProjectId] = useState<string | null>(null);
-  const [expandedProvider, setExpandedProvider] = useState<ProjectProvider | null>(null);
   const [linkingProjectId, setLinkingProjectId] = useState<string | null>(null);
   const [runningAction, setRunningAction] = useState<string | null>(null);
   const [editingStorage, setEditingStorage] = useState<LinkKey | null>(null);
@@ -133,7 +159,6 @@ export default function ProjectLinksWorkspace({
   const [bundlePage, setBundlePage] = useState<BundlePage | null>(null);
   const [bundleLoading, setBundleLoading] = useState(false);
   const [bundleError, setBundleError] = useState<string | null>(null);
-  const [providerPathDraft, setProviderPathDraft] = useState("");
   const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
   const [projectAliasDraft, setProjectAliasDraft] = useState("");
@@ -160,13 +185,6 @@ export default function ProjectLinksWorkspace({
     .filter((candidate) => candidate.state === "active")
     .map((candidate) => [candidate.local_project_id, candidate])), [bindings]);
 
-  useEffect(() => {
-    if (!expandedProfileProjectId || !expandedProvider) return;
-    const projectBinding = bindingByProject.get(expandedProfileProjectId);
-    const profileId = projectBinding?.profile_ids?.[expandedProvider];
-    const profile = profiles.find((candidate) => candidate.profile_id === profileId);
-    setProviderPathDraft(profile?.path ?? "");
-  }, [expandedProfileProjectId, expandedProvider, bindingByProject, profiles]);
   const savedEditedStorage = editingStorage
     ? storages.find((storage) => storage.id === editingStorage.storageId) ?? null
     : null;
@@ -184,22 +202,6 @@ export default function ProjectLinksWorkspace({
     } finally {
       setRunningAction(null);
     }
-  };
-
-  const toggleProfileDetails = async (projectId: string, provider: ProjectProvider) => {
-    if (expandedProfileProjectId === projectId) {
-      setExpandedProfileProjectId(null);
-      setExpandedProvider(null);
-      return;
-    }
-
-    bundleRequestRef.current += 1;
-    setEditingStorage(null);
-    setStorageDraft(null);
-    setBundleLoading(false);
-    setExpandedProfileProjectId(projectId);
-    setExpandedProvider(provider);
-    await onSelectProject(projectId, null);
   };
 
   const loadStorageBundles = async (storageId: string) => {
@@ -234,8 +236,6 @@ export default function ProjectLinksWorkspace({
     if (storageEditorRequest.mode === "create") {
       const storage = newStorage(storageEditorRequest.storageKind, storages.length + 1);
       bundleRequestRef.current += 1;
-      setExpandedProfileProjectId(null);
-      setExpandedProvider(null);
       setEditingProjectId(null);
       setEditingStorage({ projectId: "", storageId: storage.id });
       setStorageDraft(storage);
@@ -258,8 +258,6 @@ export default function ProjectLinksWorkspace({
       return;
     }
 
-    setExpandedProfileProjectId(null);
-    setExpandedProvider(null);
     setEditingProjectId(null);
     setEditingStorage({ projectId: "", storageId: storage.id });
     setStorageDraft({ ...storage });
@@ -284,8 +282,6 @@ export default function ProjectLinksWorkspace({
       return;
     }
     bundleRequestRef.current += 1;
-    setExpandedProfileProjectId(null);
-    setExpandedProvider(null);
     setEditingStorage(null);
     setStorageDraft(null);
     setRenamingProjectId(null);
@@ -302,8 +298,6 @@ export default function ProjectLinksWorkspace({
       return;
     }
 
-    setExpandedProfileProjectId(null);
-    setExpandedProvider(null);
     setEditingStorage({ projectId: "", storageId: storage.id });
     setStorageDraft({ ...storage });
     await loadStorageBundles(storage.id);
@@ -313,8 +307,6 @@ export default function ProjectLinksWorkspace({
     const project = projects.find((candidate) => candidate.local_project_id === projectId);
     if (!project) return;
     bundleRequestRef.current += 1;
-    setExpandedProfileProjectId(null);
-    setExpandedProvider(null);
     setEditingStorage(null);
     setStorageDraft(null);
     setRenamingProjectId(null);
@@ -434,17 +426,7 @@ export default function ProjectLinksWorkspace({
                 ) : (
                   <div className="v3-storage-repository-list">
                     {orderedRemoteBundles.map((bundle) => (
-                      <div key={bundle.bundle_id} className="v3-storage-repository-row">
-                        <span className="v3-storage-repository-icon"><Icon name="folder" size={17} /></span>
-                        <div className="v3-storage-repository-copy">
-                          <strong>{bundle.display_name || "Unnamed repository"}</strong>
-                          <code>{bundle.bundle_id}</code>
-                        </div>
-                        <div className="v3-storage-repository-meta">
-                          <strong>Generation {bundle.generation ?? "—"}</strong>
-                          <span>{bundle.resource_count ?? 0} resources · {formatRelativeTime(bundle.updated_at)}</span>
-                        </div>
-                      </div>
+                      <StorageRepositoryRow key={bundle.bundle_id} bundle={bundle} />
                     ))}
                   </div>
                 )}
@@ -666,7 +648,6 @@ export default function ProjectLinksWorkspace({
                 : !profilesReadable && projectBinding
                   ? "The selected agent profile is unavailable"
                   : null;
-              const profileDetailsOpen = expandedProfileProjectId === project.local_project_id;
 
               return (
                 <article
@@ -676,7 +657,7 @@ export default function ProjectLinksWorkspace({
                   <div className="profile-link-connections">
                     <section
                       className={`project-profile-group storage-link-provider-${displayedProvider}`}
-                      aria-label={`${providerLabel(displayedProvider)} configuration`}
+                      aria-label={`${providerLabel(displayedProvider)} agent home`}
                     >
                       <header className="project-profile-group-header">
                         <span className="project-profile-group-icon">
@@ -696,127 +677,32 @@ export default function ProjectLinksWorkspace({
                                 : "Choose a Codex or Claude profile"}
                           </span>
                         </span>
-                        <button
-                          type="button"
-                          className={`project-profile-group-settings${profileDetailsOpen ? " active" : ""}`}
-                          onClick={() => void toggleProfileDetails(project.local_project_id, displayedProvider)}
-                          title={profileDetailsOpen ? "Hide configuration settings" : "Configure this project profile"}
-                          aria-label="Configure project profile"
-                          aria-expanded={profileDetailsOpen}
-                        >
-                          <Icon name="settings" size={16} />
-                        </button>
+                        {projectBinding && (
+                          <span
+                            className="project-profile-group-lock"
+                            title="Agent home is fixed after project setup"
+                            aria-label="Agent home is fixed after project setup"
+                          >
+                            <Icon name="lock" size={15} />
+                          </span>
+                        )}
                       </header>
 
-                    {codexConfigured && !conversationPathAuditLoading && (
-                      <ConversationPathRepairNotice
-                        audit={conversationPathAudit}
-                        auditError={conversationPathAuditError}
-                        projectName={projectLabel(project)}
-                        profileName={projectProfile?.display_name ?? "Codex"}
-                        profilePath={projectProfile?.path ?? conversationPathAudit?.profile_path}
-                        showScope={false}
-                        busy={busy || runningAction === `repair-paths:${project.local_project_id}`}
-                        onRepair={() => run(
-                          `repair-paths:${project.local_project_id}`,
-                          () => onRepairConversationPaths(project.local_project_id),
-                        )}
-                      />
-                    )}
-
-                    {profileDetailsOpen && (
-                      <div className="storage-link-detail v3-project-link-detail project-profile-group-detail">
-                        {([expandedProvider ?? displayedProvider] as const).map((provider) => {
-                          const label = providerLabel(provider);
-                          const options = profiles.filter((profile) => profile.provider === provider);
-                          const selectedId = projectBinding?.profile_ids?.[provider] ?? "";
-                          return (
-                            <div key={provider} className="v3-simple-settings">
-                              <div className="v3-simple-settings-heading v3-agent-settings-heading">
-                                <div>
-                                  <strong>{label} profile</strong>
-                                  <span>Each project uses one agent profile on this machine.</span>
-                                </div>
-                                <div className="v3-agent-choice compact" role="radiogroup" aria-label="Agent used by this project">
-                                  {PROJECT_PROVIDERS.map((candidate) => (
-                                    <button
-                                      key={candidate}
-                                      type="button"
-                                      role="radio"
-                                      aria-checked={provider === candidate}
-                                      className={provider === candidate ? "active" : undefined}
-                                      disabled={busy}
-                                      onClick={() => {
-                                        setExpandedProvider(candidate);
-                                        const existingProfileId = projectBinding?.profile_ids?.[candidate];
-                                        if (existingProfileId && (hasMultipleProviders || projectProvider !== candidate)) {
-                                          void onAssignProfile(project.local_project_id, candidate, existingProfileId);
-                                        }
-                                      }}
-                                    >
-                                      <strong>{providerLabel(candidate)}</strong>
-                                    </button>
-                                  ))}
-                                </div>
-                              </div>
-                              <div className="v3-simple-settings-grid">
-                                <label>
-                                  <span>Saved profile</span>
-                                  <select
-                                    value={selectedId}
-                                    disabled={busy}
-                                    onChange={(event) => {
-                                      if (event.target.value) {
-                                        void onAssignProfile(project.local_project_id, provider, event.target.value);
-                                      }
-                                    }}
-                                  >
-                                    <option value="">Choose a {label} profile</option>
-                                    {options.map((profile) => (
-                                      <option key={profile.profile_id} value={profile.profile_id} disabled={!profile.available || !profile.readable}>
-                                        {profile.display_name}{!profile.available || !profile.readable ? " (unavailable)" : ""}
-                                      </option>
-                                    ))}
-                                  </select>
-                                </label>
-                                <label>
-                                  <span>Profile path</span>
-                                  <div className="v3-simple-path-row">
-                                    <input
-                                      value={providerPathDraft}
-                                      onChange={(event) => setProviderPathDraft(event.target.value)}
-                                      placeholder={provider === "codex" ? "/Users/name/.codex" : "/Users/name/.claude"}
-                                      disabled={busy}
-                                    />
-                                    <button
-                                      type="button"
-                                      className="btn"
-                                      disabled={busy}
-                                      onClick={() => void (async () => {
-                                        const picked = await open({ directory: true, multiple: false });
-                                        if (typeof picked === "string") setProviderPathDraft(picked);
-                                      })()}
-                                    >
-                                      Browse
-                                    </button>
-                                    <button
-                                      type="button"
-                                      className="btn btn-primary"
-                                      disabled={busy || !providerPathDraft.trim()}
-                                      onClick={() => void onAddProfilePath(project.local_project_id, provider, providerPathDraft)}
-                                    >
-                                      Use path
-                                    </button>
-                                  </div>
-                                </label>
-                              </div>
-                            </div>
-                          );
-                        })}
-
-                        {error && <div className="v3-callout error"><Icon name="alert-triangle" size={15} /> {error}</div>}
-                      </div>
-                    )}
+                      {codexConfigured && !conversationPathAuditLoading && (
+                        <ConversationPathRepairNotice
+                          audit={conversationPathAudit}
+                          auditError={conversationPathAuditError}
+                          projectName={projectLabel(project)}
+                          profileName={projectProfile?.display_name ?? "Codex"}
+                          profilePath={projectProfile?.path ?? conversationPathAudit?.profile_path}
+                          showScope={false}
+                          busy={busy || runningAction === `repair-paths:${project.local_project_id}`}
+                          onRepair={() => run(
+                            `repair-paths:${project.local_project_id}`,
+                            () => onRepairConversationPaths(project.local_project_id),
+                          )}
+                        />
+                      )}
 
                     <div className="project-profile-storage-heading">
                       <span>Linked storage</span>

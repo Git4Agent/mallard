@@ -1,7 +1,7 @@
 # Desktop Distribution Design
 
-Status: Proposed  
-Date: 2026-07-19  
+Status: Proposed
+Date: 2026-07-19
 Application: Agent Sync (Tauri 2)
 
 ## 1. Objective

@@ -29,6 +29,7 @@ sha2 = "0.10"
 rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 tempfile = "3"
 getrandom = "0.3"
+chrono = "0.4"
 
 [dev-dependencies]
 # `test` enables tauri::test::{mock_builder, MockRuntime} for the headless

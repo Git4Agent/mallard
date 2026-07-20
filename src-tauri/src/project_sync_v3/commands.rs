@@ -31,7 +31,7 @@ use super::provider_capture::{
     ResourceCandidate,
 };
 use super::s3_store::S3BundleObjectStore;
-use crate::emit_log;
+use crate::activity_log::{emit_typed_log, ActivityLogScope, ActivityLogType};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,6 +48,8 @@ const PLAN_LIFETIME_SECS: u64 = 24 * 60 * 60;
 const MAX_CODEX_GLOBAL_STATE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CONVERSATION_REPAIR_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CODEX_SESSION_FILES: usize = 20_000;
+const AGENT_HOME_LOCKED_MESSAGE: &str =
+    "agent home is fixed after project setup; remove and set up the project again to use a different agent home";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RegisterLocalProjectRequest {
@@ -391,6 +393,77 @@ fn storage_log_label(repository: &V3Repository, storage_id: &StorageId) -> Strin
         .unwrap_or_else(|| storage_id.to_string())
 }
 
+fn storage_change_summary(
+    previous: &[StorageConfigV3],
+    next: &[StorageConfigV3],
+) -> Option<(&'static str, String, StorageId, String)> {
+    let added = next
+        .iter()
+        .filter(|storage| !previous.iter().any(|candidate| candidate.id == storage.id))
+        .collect::<Vec<_>>();
+    let updated = next
+        .iter()
+        .filter(|storage| {
+            previous
+                .iter()
+                .find(|candidate| candidate.id == storage.id)
+                .is_some_and(|candidate| candidate != *storage)
+        })
+        .collect::<Vec<_>>();
+    let removed = previous
+        .iter()
+        .filter(|storage| !next.iter().any(|candidate| candidate.id == storage.id))
+        .collect::<Vec<_>>();
+    let total = added.len() + updated.len() + removed.len();
+    if total == 0 {
+        return None;
+    }
+
+    let (event, message, primary) = if total == 1 && added.len() == 1 {
+        let storage = added[0];
+        (
+            "storage.added",
+            format!("Storage added — {}", storage.name),
+            storage,
+        )
+    } else if total == 1 && updated.len() == 1 {
+        let storage = updated[0];
+        (
+            "storage.settings_updated",
+            format!("Storage settings updated — {}", storage.name),
+            storage,
+        )
+    } else if total == 1 {
+        let storage = removed[0];
+        (
+            "storage.removed",
+            format!("Storage removed — {}", storage.name),
+            storage,
+        )
+    } else {
+        let primary = added
+            .first()
+            .or_else(|| updated.first())
+            .or_else(|| removed.first())?;
+        (
+            "storage.settings_updated",
+            format!(
+                "Storage settings updated — {} added, {} changed, {} removed",
+                added.len(),
+                updated.len(),
+                removed.len()
+            ),
+            *primary,
+        )
+    };
+    let name = if primary.name.trim().is_empty() {
+        primary.id.to_string()
+    } else {
+        primary.name.clone()
+    };
+    Some((event, message, primary.id.clone(), name))
+}
+
 async fn run_blocking<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
@@ -409,7 +482,26 @@ pub async fn save_project_sync_config(
     app: tauri::AppHandle,
     config: SyncConfigV3,
 ) -> Result<SyncConfigV3, String> {
-    save_project_sync_config_with_repository(&repository(&app)?, config)
+    let repository = repository(&app)?;
+    let storage_change = repository
+        .load_config()
+        .ok()
+        .and_then(|previous| storage_change_summary(&previous.storages, &config.storages));
+    let result = save_project_sync_config_with_repository(&repository, config);
+    if let Some((event, message, storage_id, storage_name)) = storage_change {
+        let log = ActivityLogScope::new(ActivityLogType::Storage)
+            .storage(&storage_id, Some(&storage_name));
+        match &result {
+            Ok(_) => log.emit(&app, "ok", event, &message),
+            Err(error) => log.emit(
+                &app,
+                "error",
+                "storage.settings_update_failed",
+                &format!("Storage settings could not be saved: {error}"),
+            ),
+        }
+    }
+    result
 }
 
 fn save_project_sync_config_with_repository(
@@ -430,7 +522,7 @@ pub async fn list_local_projects(
     // The shell lists projects first on every launch, so an interrupted
     // finalization heals here before any project data is rendered.
     for warning in recover_setup_state(&repository) {
-        emit_log(&app, "warn", &warning);
+        emit_typed_log(&app, ActivityLogType::Configuration, "warning", &warning);
     }
     Ok(repository.load_config()?.projects)
 }
@@ -473,9 +565,11 @@ pub async fn get_project_chat_history(
     force_revalidate: Option<bool>,
 ) -> Result<ProjectChatHistory, String> {
     let repository = repository(&app)?;
-    emit_log(
+    let log = ActivityLogScope::new(ActivityLogType::History).project(&local_project_id, None);
+    log.emit(
         &app,
         "info",
+        "history.scan_started",
         &format!("Scanning Codex session history for project {local_project_id}…"),
     );
     let result = run_blocking(move || {
@@ -492,11 +586,12 @@ pub async fn get_project_chat_history(
     match &result {
         Ok(history) => {
             for warning in &history.warnings {
-                emit_log(&app, "warn", warning);
+                log.emit(&app, "warning", "history.scan_warning", warning);
             }
-            emit_log(
+            log.emit(
                 &app,
                 "ok",
+                "history.scan_completed",
                 &format!(
                     "Session history scan complete: {} sessions in this {}-day window",
                     history.threads.len(),
@@ -504,7 +599,12 @@ pub async fn get_project_chat_history(
                 ),
             );
         }
-        Err(error) => emit_log(&app, "error", &format!("Session history scan failed: {error}")),
+        Err(error) => log.emit(
+            &app,
+            "error",
+            "history.scan_failed",
+            &format!("Session history scan failed: {error}"),
+        ),
     }
     result
 }
@@ -538,12 +638,21 @@ pub async fn open_codex_thread_in_terminal(
 ) -> Result<(), String> {
     let repository = repository(&app)?;
     let worker_app = app.clone();
+    let worker_log =
+        ActivityLogScope::new(ActivityLogType::History).project(&local_project_id, None);
     run_blocking(move || {
         chat_history::open_codex_thread_in_terminal(
             &repository,
             &local_project_id,
             &thread_id,
-            |command| emit_log(&worker_app, "info", &format!("$ {command}")),
+            |command| {
+                worker_log.emit(
+                    &worker_app,
+                    "info",
+                    "history.opened_in_terminal",
+                    &format!("$ {command}"),
+                )
+            },
         )
     })
     .await
@@ -557,12 +666,21 @@ pub async fn open_codex_thread_in_app(
 ) -> Result<(), String> {
     let repository = repository(&app)?;
     let worker_app = app.clone();
+    let worker_log =
+        ActivityLogScope::new(ActivityLogType::History).project(&local_project_id, None);
     run_blocking(move || {
         chat_history::open_codex_thread_in_app(
             &repository,
             &local_project_id,
             &thread_id,
-            |command| emit_log(&worker_app, "info", &format!("$ {command}")),
+            |command| {
+                worker_log.emit(
+                    &worker_app,
+                    "info",
+                    "history.opened_in_app",
+                    &format!("$ {command}"),
+                )
+            },
         )
     })
     .await
@@ -640,9 +758,13 @@ pub async fn connect_project_to_remote_bundle(
 ) -> Result<ProjectDetail, String> {
     let repository = repository(&app)?;
     let storage = storage_log_label(&repository, &request.storage_id);
-    emit_log(
+    let log = ActivityLogScope::new(ActivityLogType::Configuration)
+        .project(&request.local_project_id, None)
+        .storage(&request.storage_id, Some(&storage));
+    log.emit(
         &app,
         "info",
+        "configuration.remote_connected_started",
         &format!(
             "Connecting project to bundle {} in {}…",
             request.bundle_id, storage
@@ -653,17 +775,19 @@ pub async fn connect_project_to_remote_bundle(
     })
     .await;
     match &result {
-        Ok(detail) => emit_log(
+        Ok(detail) => log.emit(
             &app,
             "ok",
+            "configuration.remote_connected",
             &format!(
                 "Connected {} to remote bundle {}",
                 detail.project.display_name, detail.project.bundle_id
             ),
         ),
-        Err(error) => emit_log(
+        Err(error) => log.emit(
             &app,
             "error",
+            "configuration.remote_connect_failed",
             &format!("Failed to connect remote bundle: {}", error),
         ),
     }
@@ -797,10 +921,40 @@ pub async fn repair_codex_conversation_paths(
     local_project_id: LocalProjectId,
 ) -> Result<CodexConversationPathRepairResult, String> {
     let repository = repository(&app)?;
-    run_blocking(move || {
+    let log = ActivityLogScope::new(ActivityLogType::Repair).project(&local_project_id, None);
+    log.emit(
+        &app,
+        "info",
+        "repair.conversation_paths_started",
+        "Repairing Codex conversation paths…",
+    );
+    let result = run_blocking(move || {
         repair_codex_conversation_paths_with_repository(&repository, &local_project_id)
     })
-    .await
+    .await;
+    match &result {
+        Ok(report) => log.emit(
+            &app,
+            "ok",
+            "repair.conversation_paths_completed",
+            &format!(
+                "Repaired {} conversation path{}",
+                report.repaired_thread_ids.len(),
+                if report.repaired_thread_ids.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+        ),
+        Err(error) => log.emit(
+            &app,
+            "error",
+            "repair.conversation_paths_failed",
+            &format!("Conversation path repair failed: {error}"),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -916,9 +1070,11 @@ pub async fn fetch_bundle(
 ) -> Result<BundleSnapshotSummary, String> {
     let repository = repository(&app)?;
     let storage = storage_log_label(&repository, &storage_id);
-    emit_log(
+    let log = ActivityLogScope::new(ActivityLogType::Pull).storage(&storage_id, Some(&storage));
+    log.emit(
         &app,
         "info",
+        "pull.fetch_started",
         &format!("↓  Fetching bundle {} from {}", bundle_id, storage),
     );
     let result = run_blocking(move || {
@@ -927,15 +1083,21 @@ pub async fn fetch_bundle(
     })
     .await;
     match &result {
-        Ok(snapshot) => emit_log(
+        Ok(snapshot) => log.emit(
             &app,
             "ok",
+            "pull.fetch_completed",
             &format!(
                 "↓  Fetched {} generation {} ({} resources)",
                 snapshot.display_name, snapshot.generation, snapshot.resource_count
             ),
         ),
-        Err(error) => emit_log(&app, "error", &format!("✗  Pull fetch failed: {}", error)),
+        Err(error) => log.emit(
+            &app,
+            "error",
+            "pull.fetch_failed",
+            &format!("✗  Pull fetch failed: {}", error),
+        ),
     }
     result
 }
@@ -963,17 +1125,23 @@ pub async fn push_bundle(
     let repository = repository(&app)?;
     let (project, storage) =
         project_storage_log_labels(&repository, &local_project_id, &storage_id);
-    emit_log(
+    let log = ActivityLogScope::new(ActivityLogType::Push)
+        .project(&local_project_id, Some(&project))
+        .storage(&storage_id, Some(&storage));
+    log.emit(
         &app,
         "info",
+        "push.started",
         &format!("↑  Push started — {} → {}", project, storage),
     );
     let worker_app = app.clone();
+    let worker_log = log.clone();
     let selected_count = recipe.as_ref().map(|recipe| recipe.entries.len());
     let result = run_blocking(move || {
-        emit_log(
+        worker_log.emit(
             &worker_app,
             "info",
+            "push.scan_started",
             &selected_count
                 .map(|count| format!("   Scanning {} resources selected for this storage…", count))
                 .unwrap_or_else(|| "   Scanning selected project resources…".to_string()),
@@ -984,23 +1152,34 @@ pub async fn push_bundle(
     match &result {
         Ok(operation) => {
             for resource in &operation.results {
-                emit_log(
+                log.emit(
                     &app,
                     if resource.state == "synced" {
                         "ok"
                     } else {
                         "info"
                     },
+                    if resource.state == "synced" {
+                        "push.resource_synced"
+                    } else {
+                        "push.resource_checked"
+                    },
                     &format!("↑  {} ({})", resource.resource_id, resource.state),
                 );
             }
-            emit_log(
+            log.emit(
                 &app,
                 "ok",
+                "push.completed",
                 &format!("✓  Push complete — {}", operation.message),
             );
         }
-        Err(error) => emit_log(&app, "error", &format!("✗  Push failed: {}", error)),
+        Err(error) => log.emit(
+            &app,
+            "error",
+            "push.failed",
+            &format!("✗  Push failed: {}", error),
+        ),
     }
     result
 }
@@ -1015,9 +1194,13 @@ pub async fn plan_bundle_restore(
     let repository = repository(&app)?;
     let (project, storage) =
         project_storage_log_labels(&repository, &binding.local_project_id, &storage_id);
-    emit_log(
+    let log = ActivityLogScope::new(ActivityLogType::Pull)
+        .project(&binding.local_project_id, Some(&project))
+        .storage(&storage_id, Some(&storage));
+    log.emit(
         &app,
         "info",
+        "pull.review_started",
         &format!("↓  Preparing Pull review — {} ← {}", project, storage),
     );
     let result = run_blocking(move || {
@@ -1027,26 +1210,34 @@ pub async fn plan_bundle_restore(
     match &result {
         Ok(plan) => {
             for action in &plan.actions {
-                emit_log(&app, "info", &format!("↓  Review {}", action.resource_id));
+                log.emit(
+                    &app,
+                    "info",
+                    "pull.resource_review",
+                    &format!("↓  Review {}", action.resource_id),
+                );
             }
-            emit_log(
+            log.emit(
                 &app,
                 "ok",
+                "pull.plan_ready",
                 &format!(
                     "✓  Pull plan ready — generation {}, {} actions",
                     plan.generation,
                     plan.actions.len()
                 ),
             );
-            emit_log(
+            log.emit(
                 &app,
                 "info",
+                "pull.awaiting_approval",
                 "   Nothing has been applied yet — use “Apply approved changes” in the Pull review.",
             );
         }
-        Err(error) => emit_log(
+        Err(error) => log.emit(
             &app,
             "error",
+            "pull.planning_failed",
             &format!("✗  Pull planning failed: {}", error),
         ),
     }
@@ -1062,9 +1253,11 @@ pub async fn apply_bundle_restore(
     let repository = repository(&app)?;
     let log_repository = repository.clone();
     let plan_for_log = repository.load_restore_plan(&plan_id).ok();
-    emit_log(
+    let log = ActivityLogScope::new(ActivityLogType::Pull);
+    log.emit(
         &app,
         "info",
+        "pull.apply_started",
         &format!(
             "↓  Applying {} approved Pull actions…",
             approved_action_ids.len()
@@ -1086,18 +1279,29 @@ pub async fn apply_bundle_restore(
                     })
                     .map(|action| action.resource_id.to_string())
                     .unwrap_or_else(|| action_id.to_string());
-                emit_log(&app, "ok", &format!("↓  {}", resource));
+                log.emit(
+                    &app,
+                    "ok",
+                    "pull.resource_applied",
+                    &format!("↓  {}", resource),
+                );
             }
             for failure in &operation.failed_actions {
-                emit_log(
+                log.emit(
                     &app,
                     "error",
+                    "pull.resource_failed",
                     &format!("✗  {}: {}", failure.action_id, failure.message),
                 );
             }
-            emit_log(
+            log.emit(
                 &app,
                 if operation.success { "ok" } else { "error" },
+                if operation.success {
+                    "pull.completed"
+                } else {
+                    "pull.completed_with_errors"
+                },
                 &format!(
                     "{}  Pull finished — {}",
                     if operation.success { "✓" } else { "✗" },
@@ -1111,20 +1315,36 @@ pub async fn apply_bundle_restore(
                     .and_then(|plan| current_binding_for_restore_plan(&log_repository, plan))
                 {
                     Ok(binding) => {
-                        emit_log(&app, "info", "   Open this project after Pull:");
+                        log.emit(
+                            &app,
+                            "info",
+                            "pull.open_project_hint",
+                            "   Open this project after Pull:",
+                        );
                         for (label, command) in project_open_commands(&binding) {
-                            emit_log(&app, "info", &format!("   {}: {}", label, command));
+                            log.emit(
+                                &app,
+                                "info",
+                                "pull.open_project_command",
+                                &format!("   {}: {}", label, command),
+                            );
                         }
                     }
-                    Err(error) => emit_log(
+                    Err(error) => log.emit(
                         &app,
                         "info",
+                        "pull.open_project_unavailable",
                         &format!("   Open command unavailable: {}", error),
                     ),
                 }
             }
         }
-        Err(error) => emit_log(&app, "error", &format!("✗  Pull failed: {}", error)),
+        Err(error) => log.emit(
+            &app,
+            "error",
+            "pull.failed",
+            &format!("✗  Pull failed: {}", error),
+        ),
     }
     result
 }
@@ -3871,6 +4091,14 @@ fn save_project_binding_with_repository(
                         expected, current.revision
                     ));
                 }
+                // Profile paths are immutable in the catalog, so pinning the
+                // profile IDs pins each agent home while still allowing a
+                // checkout path remap.
+                if current.state == BindingState::Active
+                    && current.profile_ids != request.profile_ids
+                {
+                    return Err(AGENT_HOME_LOCKED_MESSAGE.to_string());
+                }
                 (
                     current.replica_id.clone(),
                     current.revision.saturating_add(1),
@@ -4270,18 +4498,30 @@ pub async fn finalize_project_setup(
     expected_revision: u64,
 ) -> Result<ProjectDetail, String> {
     let repository = repository(&app)?;
-    emit_log(&app, "info", "Finalizing project setup…");
+    let log = ActivityLogScope::new(ActivityLogType::Configuration);
+    log.emit(
+        &app,
+        "info",
+        "configuration.project_setup_started",
+        "Finalizing project setup…",
+    );
     let result = run_blocking(move || {
         finalize_project_setup_with_repository(&repository, &draft_id, expected_revision)
     })
     .await;
     match &result {
-        Ok(detail) => emit_log(
+        Ok(detail) => log.emit(
             &app,
             "ok",
+            "configuration.project_setup_completed",
             &format!("Project {} is set up", detail.project.display_name),
         ),
-        Err(error) => emit_log(&app, "error", &format!("Project setup failed: {}", error)),
+        Err(error) => log.emit(
+            &app,
+            "error",
+            "configuration.project_setup_failed",
+            &format!("Project setup failed: {}", error),
+        ),
     }
     result
 }
@@ -7756,6 +7996,53 @@ mod tests {
         assert_eq!(first.replica_id, second.replica_id);
         assert_eq!(second.revision, first.revision + 1);
         assert_eq!(second.project_root, second_root.to_string_lossy());
+    }
+
+    #[test]
+    fn configured_agent_home_cannot_change_without_re_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let repo = V3Repository::from_home_dir(temp.path().join("home")).unwrap();
+        let project = register(&repo);
+        let first_profile = add_profile(&repo, Provider::Codex, &temp.path().join("codex-one"));
+        let second_profile = add_profile(&repo, Provider::Codex, &temp.path().join("codex-two"));
+        let first = save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: project.local_project_id.clone(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, first_profile.clone())]),
+                expected_revision: None,
+            },
+        )
+        .unwrap();
+
+        let error = save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: project.local_project_id.clone(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, second_profile)]),
+                expected_revision: Some(first.revision),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("agent home is fixed after project setup"),
+            "{error}"
+        );
+        let current = repo
+            .load_bindings()
+            .unwrap()
+            .active_for(&project.local_project_id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            current.profile_ids.get(&Provider::Codex),
+            Some(&first_profile)
+        );
     }
 
     #[test]

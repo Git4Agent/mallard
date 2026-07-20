@@ -30,6 +30,7 @@ type TauriRuntime = tauri::Wry;
 type TauriRuntime = tauri::test::MockRuntime;
 type AppHandle = tauri::AppHandle<TauriRuntime>;
 
+mod activity_log;
 mod codex_config;
 mod codex_plugins;
 mod codex_sidebar;
@@ -8007,13 +8008,11 @@ fn emit_progress(app: &AppHandle, done: usize, total: usize) {
 }
 
 pub(crate) fn emit_log<R: tauri::Runtime>(app: &tauri::AppHandle<R>, level: &str, message: &str) {
-    let ts = std::time::SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let _ = app.emit(
-        "sync-log",
-        serde_json::json!({ "level": level, "message": message, "ts": ts }),
+    activity_log::emit_typed_log(
+        app,
+        activity_log::ActivityLogType::System,
+        level,
+        message,
     );
 }
 
@@ -10594,6 +10593,11 @@ fn commands_used_by_run() {
         dismiss_setup_issue,
         resolve_conflict_copy,
         setup_link,
+        activity_log::query_activity_logs,
+        activity_log::get_activity_log_stats,
+        activity_log::update_activity_log_policy,
+        activity_log::cleanup_activity_logs,
+        activity_log::get_activity_log_folder,
         project_sync_v3::commands::get_project_sync_config,
         project_sync_v3::commands::save_project_sync_config,
         project_sync_v3::commands::list_local_projects,
@@ -10689,6 +10693,11 @@ pub fn run() {
             dismiss_setup_issue,
             resolve_conflict_copy,
             setup_link,
+            activity_log::query_activity_logs,
+            activity_log::get_activity_log_stats,
+            activity_log::update_activity_log_policy,
+            activity_log::cleanup_activity_logs,
+            activity_log::get_activity_log_folder,
             project_sync_v3::commands::get_project_sync_config,
             project_sync_v3::commands::save_project_sync_config,
             project_sync_v3::commands::list_local_projects,

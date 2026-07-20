@@ -8,7 +8,8 @@ import {
   storageConfigReady,
   StorageEditor,
 } from "../../src/components/project-sync/StorageSettingsV3";
-import type { StorageConfigV3 } from "../../src/types";
+import { StorageRepositoryRow } from "../../src/components/project-sync/ProjectLinksWorkspace";
+import type { RemoteBundleSummary, StorageConfigV3 } from "../../src/types";
 
 function r2Storage(patch: Partial<StorageConfigV3> = {}): StorageConfigV3 {
   return {
@@ -85,4 +86,24 @@ test("cloud storage editor exposes the guided R2 form instead of generic S3 fiel
   assert.match(html, /a1B2…x9Y0/);
   assert.doesNotMatch(html, />S3 \/ R2</);
   assert.doesNotMatch(html, />Region</);
+});
+
+test("repository rows keep metadata behind an icon disclosure", () => {
+  const bundle: RemoteBundleSummary = {
+    bundle_id: "440ed684dbb6034cf32c3bdf04a8f0ea",
+    display_name: "mallardInternal",
+    generation: 3,
+    resource_count: 9,
+    updated_at: Date.now() - 29 * 60 * 1000,
+  };
+  const html = renderToStaticMarkup(<StorageRepositoryRow bundle={bundle} />);
+
+  assert.match(html, /<details[^>]*v3-storage-repository-row/);
+  assert.match(html, /Show details for mallardInternal/);
+  assert.match(html, /v3-storage-repository-details-icon/);
+  assert.match(html, />Repository ID</);
+  assert.match(html, />Generation</);
+  assert.match(html, />Resources</);
+  assert.match(html, />Updated</);
+  assert.doesNotMatch(html, /Generation 3/);
 });

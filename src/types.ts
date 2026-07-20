@@ -250,10 +250,75 @@ export interface SyncProgress {
   total: number;
 }
 
+export type ActivityLogLevel = "info" | "success" | "warning" | "error";
+
+export type ActivityLogType =
+  | "push"
+  | "pull"
+  | "repair"
+  | "storage"
+  | "configuration"
+  | "history"
+  | "system";
+
+export interface ActivityLogContext {
+  project_id?: string;
+  project_name?: string;
+  profile_id?: string;
+  storage_id?: string;
+  storage_name?: string;
+  resource_id?: string;
+  generation?: number;
+}
+
 export interface LogLine {
-  level: "info" | "ok" | "error";
+  schema?: number;
+  id?: string;
+  level: ActivityLogLevel;
+  type?: ActivityLogType;
+  event?: string;
   message: string;
   ts: number; // epoch ms
+  run_id?: string;
+  context?: ActivityLogContext;
+}
+
+export interface ActivityLogPolicy {
+  schema: number;
+  retention_days: number;
+  max_total_bytes: number;
+}
+
+export interface ActivityLogStats {
+  total_bytes: number;
+  file_count: number;
+  oldest_ts?: number | null;
+  newest_ts?: number | null;
+  policy: ActivityLogPolicy;
+}
+
+export interface ActivityLogQuery {
+  types: ActivityLogType[];
+  levels: ActivityLogLevel[];
+  search?: string | null;
+  cursor?: string | null;
+  limit?: number;
+}
+
+export interface ActivityLogPage {
+  entries: LogLine[];
+  next_cursor?: string | null;
+}
+
+export interface ActivityLogCleanupRequest {
+  delete_all?: boolean;
+  older_than_days?: number | null;
+}
+
+export interface ActivityLogCleanupResult {
+  removed_files: number;
+  reclaimed_bytes: number;
+  stats: ActivityLogStats;
 }
 
 export interface SyncResult {
