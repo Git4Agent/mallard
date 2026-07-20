@@ -13,7 +13,8 @@ use super::bundle_engine::{
 use super::chat_history::{self, CodexThreadDetailsPage, ProjectChatHistory};
 use super::domain::{
     generated_named_id, validate_absolute_clean_path, ActionId, ActionStatus, ApplyPolicy,
-    BindingState, BundleId, BundleIdentity, BundleKind, BundleRecipe, BundleSnapshot, CapturedWith,
+    BindingState, BundleId, BundleIdentity, BundleKind, BundleManifest, BundleRecipe,
+    BundleSnapshot, CapturedWith,
     DependencyAction, DependencyActionKind, DependencyApplicationRecord, DependencyApplyReceipt,
     DependencyPlan, DraftProfileSelection, DraftRepositoryChoice, DraftStorageSelection,
     LocalProjectId, LocalProjectRegistration, LocalProviderProfileId, MachineProjectState,
@@ -48,8 +49,37 @@ const PLAN_LIFETIME_SECS: u64 = 24 * 60 * 60;
 const MAX_CODEX_GLOBAL_STATE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CONVERSATION_REPAIR_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CODEX_SESSION_FILES: usize = 20_000;
+const HISTORY_SCAN_LOG_THROTTLE_SECS: u64 = 5 * 60;
+static HISTORY_SCAN_LOGGED_AT: std::sync::Mutex<BTreeMap<String, u64>> =
+    std::sync::Mutex::new(BTreeMap::new());
 const AGENT_HOME_LOCKED_MESSAGE: &str =
     "agent home is fixed after project setup; remove and set up the project again to use a different agent home";
+
+fn claim_history_scan_log_at(
+    logged_at: &mut BTreeMap<String, u64>,
+    local_project_id: &str,
+    force: bool,
+    now: u64,
+) -> bool {
+    let allowed = force
+        || logged_at
+            .get(local_project_id)
+            .is_none_or(|previous| now.saturating_sub(*previous) >= HISTORY_SCAN_LOG_THROTTLE_SECS);
+    if allowed {
+        logged_at.insert(local_project_id.to_string(), now);
+    }
+    allowed
+}
+
+fn should_log_history_scan(local_project_id: &LocalProjectId, force: bool) -> bool {
+    HISTORY_SCAN_LOGGED_AT
+        .lock()
+        .map(|mut logged_at| {
+            claim_history_scan_log_at(&mut logged_at, local_project_id.as_str(), force, now_secs())
+        })
+        // A poisoned throttle must not hide operational diagnostics.
+        .unwrap_or(true)
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RegisterLocalProjectRequest {
@@ -235,6 +265,57 @@ pub struct ResourceStatusReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
     pub statuses: Vec<BundleResourceStatus>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadSyncState {
+    Synced,
+    LocalOnly,
+    LocalAhead,
+    StorageOnly,
+    StorageAhead,
+    Diverged,
+    Unknown,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ThreadSyncEntry {
+    pub thread_id: String,
+    pub resource_id: ResourceId,
+    pub display_name: String,
+    pub state: ThreadSyncState,
+    pub local_present: bool,
+    pub storage_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_updated_at: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_updated_at: Option<u64>,
+}
+
+#[derive(Serialize, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ThreadSyncCounts {
+    pub synced: usize,
+    pub local: usize,
+    pub storage: usize,
+    pub diverged: usize,
+    pub unknown: usize,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct ThreadSyncComparison {
+    pub project_id: LocalProjectId,
+    pub storage_id: StorageId,
+    pub storage_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_generation: Option<u64>,
+    pub compared_at: u64,
+    pub entries: Vec<ThreadSyncEntry>,
+    pub counts: ThreadSyncCounts,
     #[serde(default)]
     pub warnings: Vec<String>,
 }
@@ -566,12 +647,16 @@ pub async fn get_project_chat_history(
 ) -> Result<ProjectChatHistory, String> {
     let repository = repository(&app)?;
     let log = ActivityLogScope::new(ActivityLogType::History).project(&local_project_id, None);
-    log.emit(
-        &app,
-        "info",
-        "history.scan_started",
-        &format!("Scanning Codex session history for project {local_project_id}…"),
-    );
+    let force_revalidate = force_revalidate.unwrap_or(false);
+    let log_routine_scan = should_log_history_scan(&local_project_id, force_revalidate);
+    if log_routine_scan {
+        log.emit(
+            &app,
+            "info",
+            "history.scan_started",
+            &format!("Scanning Codex session history for project {local_project_id}…"),
+        );
+    }
     let result = run_blocking(move || {
         chat_history::get_project_chat_history(
             &repository,
@@ -579,7 +664,7 @@ pub async fn get_project_chat_history(
             branch.as_deref(),
             before_time,
             window_days,
-            force_revalidate.unwrap_or(false),
+            force_revalidate,
         )
     })
     .await;
@@ -588,16 +673,18 @@ pub async fn get_project_chat_history(
             for warning in &history.warnings {
                 log.emit(&app, "warning", "history.scan_warning", warning);
             }
-            log.emit(
-                &app,
-                "ok",
-                "history.scan_completed",
-                &format!(
-                    "Session history scan complete: {} sessions in this {}-day window",
-                    history.threads.len(),
-                    history.window_end.saturating_sub(history.window_start) / (24 * 60 * 60)
-                ),
-            );
+            if log_routine_scan {
+                log.emit(
+                    &app,
+                    "info",
+                    "history.scan_completed",
+                    &format!(
+                        "Session history scan complete: {} sessions in this {}-day window",
+                        history.threads.len(),
+                        history.window_end.saturating_sub(history.window_start) / (24 * 60 * 60)
+                    ),
+                );
+            }
         }
         Err(error) => log.emit(
             &app,
@@ -1111,6 +1198,23 @@ pub async fn get_bundle_status(
     let repository = repository(&app)?;
     run_blocking(move || {
         get_bundle_status_with_repository(&repository, &local_project_id, &storage_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_project_thread_sync_comparison(
+    app: tauri::AppHandle,
+    local_project_id: LocalProjectId,
+    storage_id: StorageId,
+) -> Result<ThreadSyncComparison, String> {
+    let repository = repository(&app)?;
+    run_blocking(move || {
+        get_project_thread_sync_comparison_with_repository(
+            &repository,
+            &local_project_id,
+            &storage_id,
+        )
     })
     .await
 }
@@ -2339,6 +2443,301 @@ fn bundle_snapshot_summary_from_snapshot(
     })
 }
 
+#[derive(Clone, Debug)]
+struct ThreadVersion {
+    thread_id: String,
+    display_name: String,
+    digest: Option<String>,
+    updated_at: Option<u64>,
+}
+
+fn is_codex_thread_resource(resource_id: &ResourceId, kind: ResourceKind) -> bool {
+    kind == ResourceKind::CodexConversation
+        && resource_id.as_str().starts_with("codex:session:")
+}
+
+fn manifest_thread_versions(manifest: &BundleManifest) -> BTreeMap<ResourceId, ThreadVersion> {
+    manifest
+        .resources
+        .iter()
+        .filter(|(resource_id, descriptor)| {
+            is_codex_thread_resource(resource_id, descriptor.kind)
+        })
+        .map(|(resource_id, descriptor)| {
+            let updated_at = manifest
+                .files
+                .values()
+                .filter(|file| &file.resource_id == resource_id)
+                .map(|file| file.source_mtime)
+                .max();
+            (
+                resource_id.clone(),
+                ThreadVersion {
+                    thread_id: descriptor.display_name.clone(),
+                    display_name: descriptor.display_name.clone(),
+                    digest: descriptor.metadata.get("content_sha256").cloned(),
+                    updated_at,
+                },
+            )
+        })
+        .collect()
+}
+
+fn classify_thread_sync_state(
+    local_digest: Option<&str>,
+    storage_digest: Option<&str>,
+    base_known: bool,
+    base_digest: Option<&str>,
+) -> ThreadSyncState {
+    if local_digest == storage_digest {
+        return ThreadSyncState::Synced;
+    }
+    if base_known {
+        let local_changed = local_digest != base_digest;
+        let storage_changed = storage_digest != base_digest;
+        return match (local_changed, storage_changed) {
+            (true, false) => ThreadSyncState::LocalAhead,
+            (false, true) => ThreadSyncState::StorageAhead,
+            (true, true) => ThreadSyncState::Diverged,
+            (false, false) => ThreadSyncState::Synced,
+        };
+    }
+    match (local_digest, storage_digest) {
+        (Some(_), None) => ThreadSyncState::LocalOnly,
+        (None, Some(_)) => ThreadSyncState::StorageOnly,
+        _ => ThreadSyncState::Unknown,
+    }
+}
+
+fn count_thread_sync_state(counts: &mut ThreadSyncCounts, state: ThreadSyncState) {
+    match state {
+        ThreadSyncState::Synced => counts.synced += 1,
+        ThreadSyncState::LocalOnly | ThreadSyncState::LocalAhead => counts.local += 1,
+        ThreadSyncState::StorageOnly | ThreadSyncState::StorageAhead => counts.storage += 1,
+        ThreadSyncState::Diverged => counts.diverged += 1,
+        ThreadSyncState::Unknown => counts.unknown += 1,
+    }
+}
+
+fn get_project_thread_sync_comparison_with_repository(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    storage_id: &StorageId,
+) -> Result<ThreadSyncComparison, String> {
+    let config = repository.load_config()?;
+    let project = config
+        .project(local_project_id)
+        .cloned()
+        .ok_or_else(|| format!("unknown local project '{}'", local_project_id))?;
+    require_project_link(&config, &project, storage_id)?;
+    let storage_name = config
+        .storages
+        .iter()
+        .find(|storage| storage.id == *storage_id)
+        .map(|storage| storage.name.clone())
+        .ok_or_else(|| format!("unknown storage '{}'", storage_id))?;
+    let binding = repository
+        .load_bindings()?
+        .active_for(local_project_id)
+        .cloned()
+        .ok_or_else(|| format!("project '{}' is not mapped on this machine", local_project_id))?;
+
+    let capture_request = capture_request_for_binding(repository, &binding)?;
+    let discovered = provider_capture::discover_project(&capture_request)?;
+    let mut warnings = discovered.warnings.clone();
+    let local_descriptors = discovered
+        .resources
+        .iter()
+        .filter(|candidate| {
+            candidate.kind == CaptureResourceKind::Conversation
+                && candidate.provider == Some(CaptureProvider::Codex)
+                && candidate.resource_id.starts_with("codex:session:")
+        })
+        .map(|candidate| {
+            Ok((
+                ResourceId::parse(candidate.resource_id.clone())?,
+                (candidate.display_name.clone(), candidate.display_name.clone()),
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+    let selected_resource_ids = local_descriptors
+        .keys()
+        .map(|resource_id| resource_id.as_str().to_string())
+        .collect::<BTreeSet<_>>();
+    let captured = provider_capture::capture_selected(&capture_request, &selected_resource_ids)?;
+    warnings.extend(captured.warnings.clone());
+    let unavailable = captured
+        .unavailable_resource_ids
+        .iter()
+        .map(|resource_id| ResourceId::parse(resource_id.clone()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+    let local_versions = captured
+        .resources
+        .iter()
+        .filter(|(resource_id, resource)| {
+            resource_id.starts_with("codex:session:")
+                && resource.descriptor.kind == CaptureResourceKind::Conversation
+                && resource.descriptor.provider == Some(CaptureProvider::Codex)
+        })
+        .map(|(resource_id, resource)| {
+            let parsed_id = ResourceId::parse(resource_id.clone())?;
+            let updated_at = captured
+                .files
+                .values()
+                .filter(|file| file.resource_id == *resource_id)
+                .map(|file| file.source_mtime)
+                .max();
+            Ok((
+                parsed_id,
+                ThreadVersion {
+                    thread_id: resource.descriptor.display_name.clone(),
+                    display_name: resource.descriptor.display_name.clone(),
+                    digest: Some(resource.content_sha256.clone()),
+                    updated_at,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, String>>()?;
+
+    let (_, engine) = storage_engine(repository, storage_id)?;
+    let current = engine.inspect_optional(&project.bundle_id)?;
+    let generation = current.as_ref().map(|snapshot| snapshot.head.generation);
+    let remote_versions = current
+        .as_ref()
+        .map(|snapshot| manifest_thread_versions(&snapshot.manifest))
+        .unwrap_or_default();
+
+    let base = project.recipe_bases.get(storage_id);
+    let base_manifest = if let Some(base) = base {
+        if base.binding_revision != Some(binding.revision) {
+            warnings.push(
+                "The project folder or agent profile changed after the last reviewed sync; thread direction is unavailable until the next Pull or Push."
+                    .to_string(),
+            );
+            None
+        } else if current.as_ref().is_some_and(|snapshot| {
+            snapshot.head.generation == base.generation
+                && snapshot.head.manifest_sha256 == base.manifest_sha256
+        }) {
+            current.as_ref().map(|snapshot| snapshot.manifest.clone())
+        } else if let Some(commit_id) = base.commit_id.as_deref() {
+            match engine.inspect_manifest_version(
+                &project.bundle_id,
+                base.generation,
+                commit_id,
+                &base.manifest_sha256,
+            ) {
+                Ok(manifest) => Some(manifest),
+                Err(error) => {
+                    warnings.push(format!(
+                        "The reviewed thread base could not be loaded: {error}"
+                    ));
+                    None
+                }
+            }
+        } else {
+            warnings.push(
+                "The reviewed thread base predates directional comparison; Pull or Push once to establish it."
+                    .to_string(),
+            );
+            None
+        }
+    } else {
+        None
+    };
+    let base_versions = base_manifest
+        .as_ref()
+        .map(manifest_thread_versions)
+        .unwrap_or_default();
+
+    let resource_ids = local_descriptors
+        .keys()
+        .chain(remote_versions.keys())
+        .chain(base_versions.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut entries = Vec::new();
+    let mut counts = ThreadSyncCounts::default();
+    for resource_id in resource_ids {
+        let local = local_versions.get(&resource_id);
+        let remote = remote_versions.get(&resource_id);
+        let base_version = base_versions.get(&resource_id);
+        let local_present = local_descriptors.contains_key(&resource_id);
+        let storage_present = remote.is_some();
+        if !local_present && !storage_present {
+            continue;
+        }
+        let local_digest = local.and_then(|version| version.digest.as_deref());
+        let storage_digest = remote.and_then(|version| version.digest.as_deref());
+        let base_resource_known = base_manifest.is_some()
+            && (base_version.is_none() || base_version.and_then(|version| version.digest.as_deref()).is_some());
+        let incomplete = unavailable.contains(&resource_id)
+            || (local_present && local_digest.is_none())
+            || (storage_present && storage_digest.is_none());
+        let state = if incomplete {
+            ThreadSyncState::Unknown
+        } else {
+            classify_thread_sync_state(
+                local_digest,
+                storage_digest,
+                base_resource_known,
+                base_version.and_then(|version| version.digest.as_deref()),
+            )
+        };
+        let descriptor = local
+            .or(remote)
+            .or(base_version);
+        let local_descriptor = local_descriptors.get(&resource_id);
+        let thread_id = descriptor
+            .map(|version| version.thread_id.clone())
+            .or_else(|| local_descriptor.map(|(thread_id, _)| thread_id.clone()))
+            .unwrap_or_else(|| resource_id.as_str().to_string());
+        let display_name = descriptor
+            .map(|version| version.display_name.clone())
+            .or_else(|| local_descriptor.map(|(_, display_name)| display_name.clone()))
+            .unwrap_or_else(|| thread_id.clone());
+        count_thread_sync_state(&mut counts, state);
+        entries.push(ThreadSyncEntry {
+            thread_id,
+            resource_id,
+            display_name,
+            state,
+            local_present,
+            storage_present,
+            local_updated_at: local.and_then(|version| version.updated_at),
+            storage_updated_at: remote.and_then(|version| version.updated_at),
+        });
+    }
+    entries.sort_by(|left, right| {
+        right
+            .local_updated_at
+            .into_iter()
+            .chain(right.storage_updated_at)
+            .max()
+            .cmp(
+                &left
+                    .local_updated_at
+                    .into_iter()
+                    .chain(left.storage_updated_at)
+                    .max(),
+            )
+            .then_with(|| left.thread_id.cmp(&right.thread_id))
+    });
+    warnings.sort();
+    warnings.dedup();
+    Ok(ThreadSyncComparison {
+        project_id: local_project_id.clone(),
+        storage_id: storage_id.clone(),
+        storage_name,
+        generation,
+        base_generation: base.map(|base| base.generation),
+        compared_at: now_secs(),
+        entries,
+        counts,
+        warnings,
+    })
+}
+
 fn get_bundle_status_with_repository(
     repository: &V3Repository,
     local_project_id: &LocalProjectId,
@@ -2580,6 +2979,7 @@ fn push_bundle_with_recipe_with_repository(
             RecipeBase {
                 generation,
                 manifest_sha256: manifest_sha256.clone(),
+                commit_id: Some(commit_id.clone()),
                 recipe_revision,
                 binding_revision: Some(binding.revision),
                 last_pull_at,
@@ -2741,6 +3141,7 @@ fn apply_bundle_restore_with_repository(
                 RecipeBase {
                     generation: plan.generation,
                     manifest_sha256: plan.manifest_sha256.clone(),
+                    commit_id: Some(plan.commit_id.clone()),
                     recipe_revision: restored_recipe.revision,
                     binding_revision: Some(binding.revision),
                     last_pull_at: successful_pull_timestamp(
@@ -6445,10 +6846,92 @@ mod tests {
     use crate::project_sync_v3::domain::{RestoreActionKind, StorageConfigV3, StorageKind};
 
     #[test]
+    fn routine_history_scan_logs_are_throttled_per_project() {
+        let mut logged_at = BTreeMap::new();
+        assert!(claim_history_scan_log_at(
+            &mut logged_at,
+            "project-one",
+            false,
+            100,
+        ));
+        assert!(!claim_history_scan_log_at(
+            &mut logged_at,
+            "project-one",
+            false,
+            100 + HISTORY_SCAN_LOG_THROTTLE_SECS - 1,
+        ));
+        assert!(claim_history_scan_log_at(
+            &mut logged_at,
+            "project-one",
+            false,
+            100 + HISTORY_SCAN_LOG_THROTTLE_SECS,
+        ));
+        assert!(claim_history_scan_log_at(
+            &mut logged_at,
+            "project-two",
+            false,
+            101,
+        ));
+
+        assert!(claim_history_scan_log_at(
+            &mut logged_at,
+            "project-one",
+            true,
+            100 + HISTORY_SCAN_LOG_THROTTLE_SECS + 1,
+        ));
+        assert!(!claim_history_scan_log_at(
+            &mut logged_at,
+            "project-one",
+            false,
+            100 + HISTORY_SCAN_LOG_THROTTLE_SECS + 2,
+        ));
+    }
+
+    #[test]
     fn failed_pull_preserves_the_previous_success_timestamp() {
         assert_eq!(successful_pull_timestamp(Some(100), 200, false), Some(100));
         assert_eq!(successful_pull_timestamp(None, 200, false), None);
         assert_eq!(successful_pull_timestamp(Some(100), 200, true), Some(200));
+    }
+
+    #[test]
+    fn thread_sync_direction_uses_the_reviewed_base() {
+        assert_eq!(
+            classify_thread_sync_state(Some("same"), Some("same"), true, Some("base")),
+            ThreadSyncState::Synced
+        );
+        assert_eq!(
+            classify_thread_sync_state(Some("local"), Some("base"), true, Some("base")),
+            ThreadSyncState::LocalAhead
+        );
+        assert_eq!(
+            classify_thread_sync_state(Some("base"), Some("storage"), true, Some("base")),
+            ThreadSyncState::StorageAhead
+        );
+        assert_eq!(
+            classify_thread_sync_state(Some("local"), Some("storage"), true, Some("base")),
+            ThreadSyncState::Diverged
+        );
+        assert_eq!(
+            classify_thread_sync_state(Some("new"), None, true, None),
+            ThreadSyncState::LocalAhead
+        );
+        assert_eq!(
+            classify_thread_sync_state(None, Some("new"), true, None),
+            ThreadSyncState::StorageAhead
+        );
+        assert_eq!(
+            classify_thread_sync_state(Some("local"), Some("storage"), false, None),
+            ThreadSyncState::Unknown
+        );
+        assert_eq!(
+            classify_thread_sync_state(Some("local"), None, false, None),
+            ThreadSyncState::LocalOnly
+        );
+        assert_eq!(
+            classify_thread_sync_state(None, Some("storage"), false, None),
+            ThreadSyncState::StorageOnly
+        );
     }
 
     fn repository(temp: &tempfile::TempDir) -> V3Repository {
@@ -6820,6 +7303,20 @@ mod tests {
             .unwrap();
         assert!(base.last_push_at.is_some());
         assert_eq!(base.last_pull_at, None);
+        assert!(base.commit_id.is_some());
+        let comparison = get_project_thread_sync_comparison_with_repository(
+            &repo,
+            &project.local_project_id,
+            &storage_id,
+        )
+        .unwrap();
+        assert_eq!(comparison.counts.local, 3);
+        assert_eq!(comparison.counts.storage, 0);
+        assert_eq!(comparison.counts.diverged, 0);
+        assert!(comparison
+            .entries
+            .iter()
+            .all(|entry| entry.state == ThreadSyncState::LocalAhead));
     }
 
     #[test]
@@ -7048,6 +7545,7 @@ mod tests {
                     RecipeBase {
                         generation: 1,
                         manifest_sha256: "a".repeat(64),
+                        commit_id: None,
                         recipe_revision: 1,
                         binding_revision: Some(1),
                         last_pull_at: Some(1),

@@ -39,7 +39,27 @@ import type {
   SetupDraftInspection,
   SetupDraftList,
   SyncConfigV3,
+  ThreadSyncComparison,
 } from "../../types";
+
+export function createSingleFlight() {
+  const requests = new Map<string, Promise<unknown>>();
+
+  return function singleFlight<T>(key: string, start: () => Promise<T>): Promise<T> {
+    const existing = requests.get(key);
+    if (existing) return existing as Promise<T>;
+
+    const request = start();
+    requests.set(key, request);
+    const clear = () => {
+      if (requests.get(key) === request) requests.delete(key);
+    };
+    void request.then(clear, clear);
+    return request;
+  };
+}
+
+const projectSyncSingleFlight = createSingleFlight();
 
 /**
  * Schema-3 Tauri contract. Multi-word Rust parameters use Tauri's camel-case
@@ -133,6 +153,9 @@ export const projectSyncApi = {
   getStatus: (localProjectId: string, storageId: string) =>
     invoke<ResourceStatusReport>("get_bundle_status", { localProjectId, storageId }),
 
+  getThreadSyncComparison: (localProjectId: string, storageId: string) =>
+    invoke<ThreadSyncComparison>("get_project_thread_sync_comparison", { localProjectId, storageId }),
+
   pushBundle: (localProjectId: string, storageId: string, recipe: BundleRecipe) =>
     invoke<ProjectOperationResult>("push_bundle", { localProjectId, storageId, recipe }),
 
@@ -196,19 +219,25 @@ export const projectSyncApi = {
     beforeTime?: number | null,
     windowDays = 30,
     forceRevalidate = false,
-  ) => invoke<ProjectChatHistory>("get_project_chat_history", {
-    localProjectId,
-    branch: branch ?? null,
-    beforeTime: beforeTime ?? null,
-    windowDays,
-    forceRevalidate,
-  }),
+  ) => {
+    const request = {
+      localProjectId,
+      branch: branch ?? null,
+      beforeTime: beforeTime ?? null,
+      windowDays,
+      forceRevalidate,
+    };
+    return projectSyncSingleFlight(
+      JSON.stringify(["get_project_chat_history", request]),
+      () => invoke<ProjectChatHistory>("get_project_chat_history", request),
+    );
+  },
 
   getProjectChatThreadDetails: (
     localProjectId: string,
     threadId: string,
     cursor?: number | null,
-    limit = 50,
+    limit = 10,
   ) => invoke<CodexThreadDetailsPage>("get_project_chat_thread_details", {
     localProjectId,
     threadId,

@@ -5,6 +5,9 @@ import type {
   LocalProjectSummary,
   ProjectBinding,
   ProjectChatHistory,
+  ThreadSyncComparison,
+  ThreadSyncEntry,
+  ThreadSyncState,
 } from "../../types";
 import Icon from "../Icons";
 import { projectSyncApi } from "./api";
@@ -16,6 +19,8 @@ interface PageProps {
   refreshEpoch: number;
   onOpenProjectSettings: () => void;
   embedded?: boolean;
+  activeStorageId?: string | null;
+  activeStorageName?: string | null;
 }
 
 interface ThreadDetailsState {
@@ -43,9 +48,14 @@ interface ContentProps {
   onToggleDetails?: (threadId: string, occurrenceKey: string) => void;
   onLoadMoreDetails?: (threadId: string) => void;
   embedded?: boolean;
+  comparison?: ThreadSyncComparison | null;
+  comparisonLoading?: boolean;
+  comparisonError?: string | null;
+  activeStorageName?: string | null;
 }
 
 const THREAD_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const CHAT_HISTORY_PAGE_SIZE = 10;
 
 function formatDate(value?: number | null): string {
   if (!value) return "Not recorded";
@@ -57,6 +67,39 @@ function formatDate(value?: number | null): string {
 function formatCount(value?: number | null): string {
   if (value == null) return "Not reported";
   return new Intl.NumberFormat(undefined, { notation: value >= 1_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value);
+}
+
+function threadSyncPresentation(state: ThreadSyncState, storageName: string) {
+  switch (state) {
+    case "synced":
+      return { icon: "check-circle" as const, className: "synced", label: `Up to date here and in ${storageName}.` };
+    case "local_only":
+      return { icon: "upload" as const, className: "local", label: `Only on this computer. Push to save it in ${storageName}.` };
+    case "local_ahead":
+      return { icon: "upload" as const, className: "local", label: `Newer on this computer. Push to update ${storageName}.` };
+    case "storage_only":
+      return { icon: "download" as const, className: "storage", label: `Only in ${storageName}. Pull to download it here.` };
+    case "storage_ahead":
+      return { icon: "download" as const, className: "storage", label: `Newer in ${storageName}. Pull to update this computer.` };
+    case "diverged":
+      return { icon: "alert-triangle" as const, className: "diverged", label: `Changed here and in ${storageName}. Review before syncing.` };
+    default:
+      return { icon: "help-circle" as const, className: "unknown", label: `Mallard can’t tell which copy is newer in ${storageName}.` };
+  }
+}
+
+function ThreadSyncIndicator({ entry, storageName }: { entry: ThreadSyncEntry; storageName: string }) {
+  const presentation = threadSyncPresentation(entry.state, storageName);
+  return (
+    <span
+      className={`v3-thread-sync-indicator ${presentation.className}`}
+      data-tooltip={presentation.label}
+      aria-label={presentation.label}
+      tabIndex={0}
+    >
+      <Icon name={presentation.icon} size={13} />
+    </span>
+  );
 }
 
 export function ThreadMetrics({ thread, id }: { thread: CodexThreadSummary; id?: string }) {
@@ -87,23 +130,37 @@ interface ThreadCardProps {
   onOpenTerminal: (threadId: string) => void;
   onToggleDetails?: (threadId: string, occurrenceKey: string) => void;
   onLoadMoreDetails?: (threadId: string) => void;
+  syncEntry?: ThreadSyncEntry;
+  storageName?: string | null;
 }
 
 function ThreadCard({
   thread, occurrenceKey, busy = false, details, detailsOpen = false, onOpenCodex, onOpenTerminal, onToggleDetails, onLoadMoreDetails,
+  syncEntry, storageName,
 }: ThreadCardProps) {
-  const [metadataOpen, setMetadataOpen] = useState(false);
+  const [localDetailsOpen, setLocalDetailsOpen] = useState(false);
   const launchable = THREAD_UUID.test(thread.thread_id);
   const detailsId = `thread-details-${occurrenceKey.replace(/[^a-z0-9_-]/gi, "-")}`;
-  const metadataId = `thread-metadata-${occurrenceKey.replace(/[^a-z0-9_-]/gi, "-")}`;
+  const chatDetailsId = `thread-chat-${occurrenceKey.replace(/[^a-z0-9_-]/gi, "-")}`;
   const updatedLabel = `Updated ${formatDate(thread.ended_at)}`;
-  const detailsLabel = detailsOpen ? "Hide conversation details" : "Show conversation details";
-  const metadataLabel = metadataOpen ? "Hide session details" : "Show session details";
+  const sessionDetailsOpen = localDetailsOpen || detailsOpen;
+  const sessionDetailsLabel = sessionDetailsOpen ? "Hide session details" : "Show session details";
+  const chatDetailsLabel = detailsOpen
+    ? "Hide chat history"
+    : details?.page
+      ? "Show chat history"
+      : "Load chat history";
+  const toggleSessionDetails = () => {
+    const nextOpen = !sessionDetailsOpen;
+    setLocalDetailsOpen(nextOpen);
+    if (!nextOpen && detailsOpen) onToggleDetails?.(thread.thread_id, occurrenceKey);
+  };
   return (
     <article className="v3-history-thread-card">
       <div className="v3-history-thread-topline">
         <div className="v3-history-thread-title">
           <strong>{thread.title || "Untitled Codex session"}</strong>
+          {syncEntry && storageName && <ThreadSyncIndicator entry={syncEntry} storageName={storageName} />}
           <time
             className="v3-history-thread-updated"
             dateTime={new Date(thread.ended_at * 1_000).toISOString()}
@@ -114,18 +171,11 @@ function ThreadCard({
           </time>
         </div>
         <div className="v3-history-thread-actions">
-          <button type="button" className={`v3-history-icon-action${metadataOpen ? " active" : ""}`}
-            aria-label={metadataLabel} title={metadataLabel} aria-expanded={metadataOpen} aria-controls={metadataId}
-            onClick={() => setMetadataOpen((current) => !current)}>
+          <button type="button" className={`v3-history-icon-action${sessionDetailsOpen ? " active" : ""}`}
+            aria-label={sessionDetailsLabel} title={sessionDetailsLabel} aria-expanded={sessionDetailsOpen} aria-controls={detailsId}
+            onClick={toggleSessionDetails}>
             <Icon name="info" size={14} />
           </button>
-          {onToggleDetails && (
-            <button type="button" className={`v3-history-icon-action${detailsOpen ? " active" : ""}`}
-              aria-label={detailsLabel} title={detailsLabel} aria-expanded={detailsOpen} aria-controls={detailsId}
-              onClick={() => onToggleDetails(thread.thread_id, occurrenceKey)}>
-              <Icon name="message" size={14} />
-            </button>
-          )}
           <button type="button" className="btn btn-ghost v3-history-launch-action" disabled={!launchable || busy}
             onClick={() => onOpenCodex(thread.thread_id)} title={busy ? "Opening in Codex…" : "Open in Codex"}
             aria-label={busy ? "Opening in Codex" : "Open in Codex"}>
@@ -139,23 +189,36 @@ function ThreadCard({
         </div>
       </div>
 
-      {metadataOpen && <ThreadMetrics id={metadataId} thread={thread} />}
-      {detailsOpen && (
-        <div id={detailsId} className="v3-history-chat-details" aria-live="polite">
-          {details?.loading && !details.page ? <div className="v3-history-detail-state"><span className="status-loader" /> Loading messages…</div> : null}
-          {details?.error && <div className="v3-history-detail-state error" role="alert">{details.error}</div>}
-          {details?.page?.turns.map((turn) => (
-            <div key={`${thread.thread_id}:${turn.ordinal}`} className="v3-history-turn">
-              <span>{turn.role === "user" ? "User" : "Codex"}</span>
-              <time>{formatDate(turn.timestamp)}</time>
-              <p title={turn.preview}>{turn.preview}</p>
+      {sessionDetailsOpen && (
+        <div id={detailsId} className="v3-history-session-details">
+          <div className="v3-history-session-summary">
+            <ThreadMetrics thread={thread} />
+            {onToggleDetails && (
+              <button type="button" className={`btn btn-ghost v3-history-chat-toggle${detailsOpen ? " active" : ""}`}
+                aria-label={chatDetailsLabel} title={chatDetailsLabel} aria-expanded={detailsOpen} aria-controls={chatDetailsId}
+                onClick={() => onToggleDetails(thread.thread_id, occurrenceKey)}>
+                <Icon name="message" size={13} />{chatDetailsLabel}
+              </button>
+            )}
+          </div>
+          {onToggleDetails && detailsOpen && (
+            <div id={chatDetailsId} className="v3-history-chat-details" aria-live="polite">
+              {details?.loading && !details.page ? <div className="v3-history-detail-state"><span className="status-loader" /> Loading chat history…</div> : null}
+              {details?.error && <div className="v3-history-detail-state error" role="alert">{details.error}</div>}
+              {details?.page?.next_cursor != null && (
+                <button type="button" className="btn btn-ghost v3-history-load-older" disabled={details.loading}
+                  onClick={() => onLoadMoreDetails?.(thread.thread_id)}>
+                  {details.loading ? "Loading older messages…" : `Load ${CHAT_HISTORY_PAGE_SIZE} older messages`}
+                </button>
+              )}
+              {details?.page?.turns.map((turn) => (
+                <div key={`${thread.thread_id}:${turn.ordinal}`} className="v3-history-turn">
+                  <span>{turn.role === "user" ? "User" : "Codex"}</span>
+                  <time>{formatDate(turn.timestamp)}</time>
+                  <p title={turn.preview}>{turn.preview}</p>
+                </div>
+              ))}
             </div>
-          ))}
-          {details?.page?.next_cursor != null && (
-            <button type="button" className="btn btn-ghost" disabled={details.loading}
-              onClick={() => onLoadMoreDetails?.(thread.thread_id)}>
-              {details.loading ? "Loading…" : "Load more messages"}
-            </button>
           )}
         </div>
       )}
@@ -163,20 +226,78 @@ function ThreadCard({
   );
 }
 
+function StoredThreadCard({ entry, storageName }: { entry: ThreadSyncEntry; storageName: string }) {
+  const updatedAt = entry.storage_updated_at ?? entry.local_updated_at ?? null;
+  const shortId = entry.thread_id.length > 12 ? entry.thread_id.slice(0, 8) : entry.thread_id;
+  const title = entry.display_name && entry.display_name !== entry.thread_id
+    ? entry.display_name
+    : `Stored thread ${shortId}`;
+  return (
+    <article className="v3-history-thread-card v3-history-stored-thread">
+      <div className="v3-history-thread-topline">
+        <div className="v3-history-thread-title" title={entry.thread_id}>
+          <strong>{title}</strong>
+          <ThreadSyncIndicator entry={entry} storageName={storageName} />
+          {updatedAt && (
+            <time
+              className="v3-history-thread-updated"
+              dateTime={new Date(updatedAt * 1_000).toISOString()}
+              title={`Updated ${formatDate(updatedAt)}`}
+            >
+              {formatRelativeTime(updatedAt)}
+            </time>
+          )}
+        </div>
+      </div>
+    </article>
+  );
+}
+
 export function ProjectChatHistoryContent({
   project, binding, history, loading, loadingMore, actionError, actionBusyThreadId,
   detailsByThread = {}, openDetailOccurrences = new Set(), onBranchChange, onRefresh, onLoadMore, onOpenSettings, onOpenCodex,
-  onOpenTerminal, onToggleDetails, onLoadMoreDetails, embedded = false,
+  onOpenTerminal, onToggleDetails, onLoadMoreDetails, embedded = false, comparison = null,
+  comparisonLoading = false, comparisonError = null, activeStorageName = null,
 }: ContentProps) {
   const label = projectLabel(project);
   const aliased = label !== project.display_name;
   const threads = useMemo(() => new Map((history?.threads ?? []).map((thread) => [thread.thread_id, thread])), [history?.threads]);
+  const syncByThread = useMemo(() => new Map((comparison?.entries ?? []).map((entry) => [entry.thread_id, entry])), [comparison?.entries]);
+  const comparisonStorageName = comparison?.storage_name ?? activeStorageName ?? "selected storage";
+  const storedOnlyEntries = useMemo(() => (comparison?.entries ?? [])
+    .filter((entry) => !entry.local_present && entry.storage_present && !threads.has(entry.thread_id))
+    .filter((entry) => !history || entry.storage_updated_at == null || entry.storage_updated_at >= history.window_start),
+  [comparison?.entries, history, threads]);
   const hasCodexProfile = !!binding?.profile_ids?.codex;
   const settingsCanRecover = !!actionError && /profile|active binding|project root/i.test(actionError);
+  const embeddedTitle = history?.git ? "Git history" : history ? "Codex threads" : "Activity";
+  const embeddedThreadCount = history
+    ? new Set([...history.threads.map((thread) => thread.thread_id), ...storedOnlyEntries.map((entry) => entry.thread_id)]).size
+    : null;
+  const visibleComparisonCounts = useMemo(() => {
+    const visibleThreadIds = new Set(threads.keys());
+    storedOnlyEntries.forEach((entry) => visibleThreadIds.add(entry.thread_id));
+    const counts = { local: 0, storage: 0, diverged: 0, unknown: 0 };
+
+    for (const entry of comparison?.entries ?? []) {
+      if (!visibleThreadIds.has(entry.thread_id)) continue;
+      if (entry.state === "local_only" || entry.state === "local_ahead") counts.local += 1;
+      else if (entry.state === "storage_only" || entry.state === "storage_ahead") counts.storage += 1;
+      else if (entry.state === "diverged") counts.diverged += 1;
+      else if (entry.state === "unknown") counts.unknown += 1;
+    }
+
+    return counts;
+  }, [comparison?.entries, storedOnlyEntries, threads]);
+  const visibleComparisonChangeCount = visibleComparisonCounts.local
+    + visibleComparisonCounts.storage
+    + visibleComparisonCounts.diverged
+    + visibleComparisonCounts.unknown;
   const renderThread = (thread: CodexThreadSummary, key: string) => (
     <ThreadCard key={key} thread={thread} occurrenceKey={key} busy={actionBusyThreadId === thread.thread_id}
       details={detailsByThread[thread.thread_id]} detailsOpen={openDetailOccurrences.has(key)} onOpenCodex={onOpenCodex} onOpenTerminal={onOpenTerminal}
-      onToggleDetails={onToggleDetails} onLoadMoreDetails={onLoadMoreDetails} />
+      onToggleDetails={onToggleDetails} onLoadMoreDetails={onLoadMoreDetails}
+      syncEntry={syncByThread.get(thread.thread_id)} storageName={comparison ? comparisonStorageName : null} />
   );
   const orderedReferences = (references: { thread_id: string }[]) => [...references].sort((left, right) => {
     const leftThread = threads.get(left.thread_id);
@@ -186,6 +307,23 @@ export function ProjectChatHistoryContent({
       || leftThread.started_at - rightThread.started_at
       || left.thread_id.localeCompare(right.thread_id);
   });
+  const flatThreadRows: Array<
+    | { kind: "local"; id: string; updatedAt: number; thread: CodexThreadSummary }
+    | { kind: "stored"; id: string; updatedAt: number; entry: ThreadSyncEntry }
+  > = [
+    ...(history?.threads ?? []).map((thread) => ({
+      kind: "local" as const,
+      id: thread.thread_id,
+      updatedAt: thread.ended_at,
+      thread,
+    })),
+    ...storedOnlyEntries.map((entry) => ({
+      kind: "stored" as const,
+      id: entry.thread_id,
+      updatedAt: entry.storage_updated_at ?? entry.local_updated_at ?? 0,
+      entry,
+    })),
+  ].sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id));
 
   const content = (
       <section className={embedded ? "v3-history-content" : "profile-links-section"} aria-labelledby="project-activity-heading">
@@ -193,14 +331,28 @@ export function ProjectChatHistoryContent({
           <div className="profile-links-copy">
             {embedded ? (
               <h2 id="project-activity-heading" className="v3-history-embedded-title">
-                <Icon name={history?.git ? "git-branch" : "openai"} size={15} className={history?.git ? undefined : "v3-openai-icon"} />
-                Activity
+                <Icon
+                  name={history?.git ? "git-branch" : history ? "openai" : "activity"}
+                  size={15}
+                  className={!history?.git && history ? "v3-openai-icon" : undefined}
+                />
+                {embeddedTitle}
               </h2>
             ) : (
               <h1 id="project-activity-heading" className="settings-section-title">{label}</h1>
             )}
           </div>
           <div className="v3-history-toolbar">
+            {activeStorageName && (
+              <span
+                className="v3-history-storage-lens"
+                title={`Comparing threads with ${activeStorageName}`}
+                aria-label={`Comparing threads with ${activeStorageName}`}
+              >
+                <Icon name="link" size={12} />
+                <span>{activeStorageName}</span>
+              </span>
+            )}
             {history?.git && (
               <label className="v3-history-branch-select" title="Branch"><Icon name="git-branch" size={15} />
                 <span className="v3-visually-hidden">Branch</span>
@@ -209,8 +361,31 @@ export function ProjectChatHistoryContent({
                 </select>
               </label>
             )}
-            <button type="button" className="v3-history-icon-action v3-history-refresh" onClick={onRefresh} disabled={loading}
-              title="Refresh activity" aria-label="Refresh activity"><Icon name="refresh" size={15} className={loading ? "icon-spin" : undefined} /></button>
+            {(embedded && embeddedThreadCount !== null || comparison && visibleComparisonChangeCount > 0) && (
+              <span className="v3-history-toolbar-stats">
+                {embedded && embeddedThreadCount !== null && (
+                  <span
+                    className="v3-history-heading-count v3-history-toolbar-count"
+                    title={`${embeddedThreadCount} thread${embeddedThreadCount === 1 ? "" : "s"} shown`}
+                    aria-label={`${embeddedThreadCount} thread${embeddedThreadCount === 1 ? "" : "s"}`}
+                  >
+                    <Icon name="message" size={12} />{embeddedThreadCount}
+                  </span>
+                )}
+                {comparison && visibleComparisonChangeCount > 0 && (
+                  <span className="v3-thread-sync-summary" aria-label={`Visible thread comparison with ${comparisonStorageName}`}>
+                    {visibleComparisonCounts.local > 0 && <span className="local" title={`${visibleComparisonCounts.local} local thread change${visibleComparisonCounts.local === 1 ? "" : "s"}`}><Icon name="upload" size={12} />{visibleComparisonCounts.local}</span>}
+                    {visibleComparisonCounts.storage > 0 && <span className="storage" title={`${visibleComparisonCounts.storage} thread change${visibleComparisonCounts.storage === 1 ? "" : "s"} in ${comparisonStorageName}`}><Icon name="download" size={12} />{visibleComparisonCounts.storage}</span>}
+                    {visibleComparisonCounts.diverged > 0 && <span className="diverged" title={`${visibleComparisonCounts.diverged} diverged thread${visibleComparisonCounts.diverged === 1 ? "" : "s"}`}><Icon name="alert-triangle" size={12} />{visibleComparisonCounts.diverged}</span>}
+                    {visibleComparisonCounts.unknown > 0 && <span className="unknown" title={`${visibleComparisonCounts.unknown} thread state${visibleComparisonCounts.unknown === 1 ? "" : "s"} could not be determined`}><Icon name="help-circle" size={12} />{visibleComparisonCounts.unknown}</span>}
+                  </span>
+                )}
+              </span>
+            )}
+            {comparisonLoading && <span className="v3-thread-sync-loading" role="status" aria-label={`Comparing threads with ${activeStorageName ?? "storage"}`}><span className="status-loader" /></span>}
+            {comparisonError && <span className="v3-thread-sync-error" tabIndex={0} data-tooltip={comparisonError} aria-label={`Storage comparison failed: ${comparisonError}`}><Icon name="alert-triangle" size={13} /></span>}
+            <button type="button" className="v3-history-icon-action v3-history-refresh" onClick={onRefresh} disabled={loading || comparisonLoading}
+              title="Refresh activity" aria-label="Refresh activity"><Icon name="refresh" size={15} className={loading || comparisonLoading ? "icon-spin" : undefined} /></button>
           </div>
         </header>
 
@@ -219,29 +394,40 @@ export function ProjectChatHistoryContent({
           <div className="v3-history-state v3-history-profile-state"><Icon name="alert-triangle" size={18} /><div><strong>Choose a Codex profile to view this project’s sessions.</strong><span>Activity only scans the profile bound to this project.</span></div><button type="button" className="btn btn-primary" onClick={onOpenSettings}>Open Project Settings</button></div>
         ) : loading && !history ? <div className="v3-history-state" role="status" aria-live="polite"><span className="status-loader" /> Loading project activity…</div> : !history ? null : (
           <>
-            <section className="v3-history-project-context" aria-label="Project information">
-              <span className="v3-history-context-item" title={`Project directory: ${binding?.canonical_project_root ?? binding?.project_root ?? project.project_root ?? "Not configured"}`}>
-                <Icon name="folder" size={14} /><span>{compactProjectPath(binding?.canonical_project_root ?? binding?.project_root ?? project.project_root ?? "Not configured")}</span>
-              </span>
-              <span className="v3-history-context-item" title={`Codex configuration: ${history.codex_home}`}>
-                <Icon name="terminal" size={14} /><span>{compactProjectPath(history.codex_home)}</span>
-              </span>
-              {aliased && <span className="v3-history-context-item" title={`Repository: ${project.display_name}`}><Icon name="git-branch" size={14} /><span>{project.display_name}</span></span>}
-              {history.storage_sync.length ? history.storage_sync.map((storage) => (
-                <span key={storage.storage_id} className="v3-history-context-item v3-history-storage-item" title={`Storage: ${storage.storage_name}`}>
-                  <Icon name="cloud" size={14} /><strong>{storage.storage_name}</strong>
-                  <span className={storage.last_pull_at ? "recorded" : undefined} title={`Last pull: ${formatDate(storage.last_pull_at)}`} aria-label={`Last pull: ${formatDate(storage.last_pull_at)}`}><Icon name="download" size={13} /></span>
-                  <span className={storage.last_push_at ? "recorded" : undefined} title={`Last push: ${formatDate(storage.last_push_at)}`} aria-label={`Last push: ${formatDate(storage.last_push_at)}`}><Icon name="upload" size={13} /></span>
+            {!embedded && (
+              <section className="v3-history-project-context" aria-label="Project information">
+                <span className="v3-history-context-item" title={`Project directory: ${binding?.canonical_project_root ?? binding?.project_root ?? project.project_root ?? "Not configured"}`}>
+                  <Icon name="folder" size={14} /><span>{compactProjectPath(binding?.canonical_project_root ?? binding?.project_root ?? project.project_root ?? "Not configured")}</span>
                 </span>
-              )) : <span className="v3-history-context-item muted" title="No storage linked"><Icon name="cloud" size={14} /><span>No storage</span></span>}
-              {!embedded && (
+                <span className="v3-history-context-item" title={`Codex configuration: ${history.codex_home}`}>
+                  <Icon name="terminal" size={14} /><span>{compactProjectPath(history.codex_home)}</span>
+                </span>
+                {aliased && <span className="v3-history-context-item" title={`Repository: ${project.display_name}`}><Icon name="git-branch" size={14} /><span>{project.display_name}</span></span>}
+                {history.storage_sync.length ? history.storage_sync.map((storage) => (
+                  <span key={storage.storage_id} className="v3-history-context-item v3-history-storage-item" title={`Storage: ${storage.storage_name}`}>
+                    <Icon name="cloud" size={14} /><strong>{storage.storage_name}</strong>
+                    <span className={storage.last_pull_at ? "recorded" : undefined} title={`Last pull: ${formatDate(storage.last_pull_at)}`} aria-label={`Last pull: ${formatDate(storage.last_pull_at)}`}><Icon name="download" size={13} /></span>
+                    <span className={storage.last_push_at ? "recorded" : undefined} title={`Last push: ${formatDate(storage.last_push_at)}`} aria-label={`Last push: ${formatDate(storage.last_push_at)}`}><Icon name="upload" size={13} /></span>
+                  </span>
+                )) : <span className="v3-history-context-item muted" title="No storage linked"><Icon name="cloud" size={14} /><span>No storage</span></span>}
                 <button type="button" className="v3-history-icon-action v3-history-settings" onClick={onOpenSettings}
                   title="Project settings" aria-label="Project settings"><Icon name="settings" size={15} /></button>
-              )}
-            </section>
+              </section>
+            )}
 
             {history.git ? (
               <>
+                {storedOnlyEntries.length > 0 && (
+                  <section className="v3-history-storage-only" aria-labelledby="storage-only-heading">
+                    <div className="v3-history-section-heading">
+                      <h2 id="storage-only-heading">Only in {comparisonStorageName}</h2>
+                      <span className="v3-history-heading-count" title="Threads not available on this machine"><Icon name="download" size={12} />{storedOnlyEntries.length}</span>
+                    </div>
+                    <div className="v3-history-thread-list flat">
+                      {storedOnlyEntries.map((entry) => <StoredThreadCard key={`stored:${entry.resource_id}`} entry={entry} storageName={comparisonStorageName} />)}
+                    </div>
+                  </section>
+                )}
                 {history.unmapped.length > 0 && (
                   <section className="v3-history-uncommitted" aria-labelledby="uncommitted-heading">
                     <div className="v3-history-section-heading"><h2 id="uncommitted-heading">Uncommitted</h2><span className="v3-history-heading-count" title="Sessions not linked to a commit"><Icon name="message" size={12} />{history.unmapped.length}</span></div>
@@ -249,7 +435,7 @@ export function ProjectChatHistoryContent({
                   </section>
                 )}
                 <section className="v3-history-commit-section" aria-label={`First-parent commits on ${history.git.selected_branch}`}>
-                  <div className="v3-history-section-heading"><h2>Commit history</h2><div className="v3-history-heading-counts"><span title={`${history.git.unique_thread_count} sessions`} aria-label={`${history.git.unique_thread_count} sessions`}><Icon name="message" size={12} />{history.git.unique_thread_count}</span><span title={`${history.git.reference_count} commit occurrences`} aria-label={`${history.git.reference_count} commit occurrences`}><Icon name="git-branch" size={12} />{history.git.reference_count}</span></div></div>
+                  {!embedded && <div className="v3-history-section-heading"><h2>Commit history</h2><div className="v3-history-heading-counts"><span title={`${history.git.unique_thread_count} sessions`} aria-label={`${history.git.unique_thread_count} sessions`}><Icon name="message" size={12} />{history.git.unique_thread_count}</span><span title={`${history.git.reference_count} commit occurrences`} aria-label={`${history.git.reference_count} commit occurrences`}><Icon name="git-branch" size={12} />{history.git.reference_count}</span></div></div>}
                   {history.git.commits.length === 0 ? <div className="v3-history-state">No commits are available in this 30-day window.</div> : (
                     <ol className="v3-history-commit-rail">{history.git.commits.map((commit) => (
                       <li key={commit.sha} className="v3-history-commit"><span className="v3-history-commit-node" aria-hidden="true" />
@@ -261,7 +447,13 @@ export function ProjectChatHistoryContent({
                 </section>
               </>
             ) : (
-              <section aria-labelledby="codex-sessions-heading"><div className="v3-history-section-heading"><h2 id="codex-sessions-heading" className="v3-history-codex-heading"><Icon name="openai" size={14} className="v3-openai-icon" />Codex threads</h2><span className="v3-history-heading-count" title={`${history.threads.length} threads`}><Icon name="message" size={12} />{history.threads.length}</span></div><div className="v3-history-thread-list flat">{history.threads.length ? history.threads.map((thread) => renderThread(thread, thread.thread_id)) : <div className="v3-history-state">No project-owned Codex sessions were found in this 30-day window.</div>}</div></section>
+              <section aria-labelledby={embedded ? "project-activity-heading" : "codex-sessions-heading"}>
+                {!embedded && <div className="v3-history-section-heading"><h2 id="codex-sessions-heading" className="v3-history-codex-heading"><Icon name="openai" size={14} className="v3-openai-icon" />Codex threads</h2><span className="v3-history-heading-count" title={`${history.threads.length} threads`}><Icon name="message" size={12} />{history.threads.length}</span></div>}
+                <div className="v3-history-thread-list flat">{flatThreadRows.length ? flatThreadRows.map((row) => row.kind === "local"
+                  ? renderThread(row.thread, row.thread.thread_id)
+                  : <StoredThreadCard key={`stored:${row.entry.resource_id}`} entry={row.entry} storageName={comparisonStorageName} />)
+                  : <div className="v3-history-state">No project-owned Codex sessions were found in this 30-day window.</div>}</div>
+              </section>
             )}
             {history.next_before != null && <button type="button" className="btn v3-history-load-more" disabled={loadingMore} onClick={onLoadMore}>{loadingMore ? "Loading…" : "Load previous 30 days"}</button>}
           </>
@@ -299,8 +491,19 @@ function mergePages(previous: ProjectChatHistory | null, next: ProjectChatHistor
   return { ...next, threads: mergedThreads, unmapped: [...unmapped.values()], git: { ...next.git, commits: mergedCommits, reference_count: references, unique_thread_count: unique } };
 }
 
-export default function ProjectChatHistoryPage({ project, binding, refreshEpoch, onOpenProjectSettings, embedded = false }: PageProps) {
+export default function ProjectChatHistoryPage({
+  project,
+  binding,
+  refreshEpoch,
+  onOpenProjectSettings,
+  embedded = false,
+  activeStorageId = null,
+  activeStorageName = null,
+}: PageProps) {
   const [history, setHistory] = useState<ProjectChatHistory | null>(null);
+  const [comparison, setComparison] = useState<ThreadSyncComparison | null>(null);
+  const [comparisonLoading, setComparisonLoading] = useState(false);
+  const [comparisonError, setComparisonError] = useState<string | null>(null);
   const [branch, setBranch] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
@@ -309,6 +512,7 @@ export default function ProjectChatHistoryPage({ project, binding, refreshEpoch,
   const [detailsByThread, setDetailsByThread] = useState<Record<string, ThreadDetailsState>>({});
   const [openDetailOccurrences, setOpenDetailOccurrences] = useState<Set<string>>(new Set());
   const requestRef = useRef(0);
+  const comparisonRequestRef = useRef(0);
   const detailRequestRef = useRef<Record<string, number>>({});
   const detailSequenceRef = useRef(0);
   const contextKey = `${project.local_project_id}:${binding?.revision ?? "none"}:${binding?.profile_ids?.codex ?? "none"}`;
@@ -332,12 +536,43 @@ export default function ProjectChatHistoryPage({ project, binding, refreshEpoch,
     }
   };
 
+  const loadComparison = async () => {
+    if (!binding?.profile_ids?.codex || !activeStorageId) {
+      comparisonRequestRef.current += 1;
+      setComparison(null);
+      setComparisonLoading(false);
+      setComparisonError(null);
+      return;
+    }
+    const requestId = ++comparisonRequestRef.current;
+    setComparisonLoading(true);
+    setComparisonError(null);
+    try {
+      const next = await projectSyncApi.getThreadSyncComparison(project.local_project_id, activeStorageId);
+      if (requestId !== comparisonRequestRef.current) return;
+      setComparison(next);
+    } catch (reason) {
+      if (requestId !== comparisonRequestRef.current) return;
+      setComparison(null);
+      setComparisonError(errorMessage(reason));
+    } finally {
+      if (requestId === comparisonRequestRef.current) setComparisonLoading(false);
+    }
+  };
+
   useEffect(() => {
     detailRequestRef.current = {};
     setHistory(null); setBranch(null); setDetailsByThread({}); setOpenDetailOccurrences(new Set()); void load(null, null);
     return () => { requestRef.current += 1; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project.local_project_id, binding?.revision, refreshEpoch]);
+
+  useEffect(() => {
+    setComparison(null);
+    void loadComparison();
+    return () => { comparisonRequestRef.current += 1; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [project.local_project_id, binding?.revision, activeStorageId, refreshEpoch]);
 
   const changeBranch = (nextBranch: string) => { setBranch(nextBranch); setHistory(null); setDetailsByThread({}); setOpenDetailOccurrences(new Set()); void load(null, nextBranch); };
   const openCodex = async (threadId: string) => {
@@ -361,11 +596,11 @@ export default function ProjectChatHistoryPage({ project, binding, refreshEpoch,
     detailRequestRef.current[threadId] = requestId;
     setDetailsByThread((current) => ({ ...current, [threadId]: { loading: true, error: null, page: current[threadId]?.page ?? null } }));
     try {
-      const next = await projectSyncApi.getProjectChatThreadDetails(projectId, threadId, cursor);
+      const next = await projectSyncApi.getProjectChatThreadDetails(projectId, threadId, cursor, CHAT_HISTORY_PAGE_SIZE);
       if (contextKeyRef.current !== requestContext || detailRequestRef.current[threadId] !== requestId) return;
       setDetailsByThread((current) => {
         const previous = current[threadId]?.page;
-        const turns = cursor && previous ? [...previous.turns, ...next.turns] : next.turns;
+        const turns = cursor != null && previous ? [...next.turns, ...previous.turns] : next.turns;
         return { ...current, [threadId]: { loading: false, error: null, page: { ...next, turns } } };
       });
     } catch (reason) {
@@ -383,5 +618,5 @@ export default function ProjectChatHistoryPage({ project, binding, refreshEpoch,
     if (!wasOpen && !detailsByThread[threadId]?.page && !detailsByThread[threadId]?.loading) void loadDetails(threadId);
   };
 
-  return <ProjectChatHistoryContent project={project} binding={binding} history={history} loading={loading} loadingMore={loadingMore} actionError={actionError} actionBusyThreadId={actionBusyThreadId} detailsByThread={detailsByThread} openDetailOccurrences={openDetailOccurrences} onBranchChange={changeBranch} onRefresh={() => void load(null, branch, true)} onLoadMore={() => void load(history?.next_before ?? null, branch)} onOpenSettings={onOpenProjectSettings} onOpenCodex={(id) => void openCodex(id)} onOpenTerminal={(id) => void openTerminal(id)} onToggleDetails={toggleDetails} onLoadMoreDetails={(id) => void loadDetails(id, detailsByThread[id]?.page?.next_cursor)} embedded={embedded} />;
+  return <ProjectChatHistoryContent project={project} binding={binding} history={history} loading={loading} loadingMore={loadingMore} actionError={actionError} actionBusyThreadId={actionBusyThreadId} detailsByThread={detailsByThread} openDetailOccurrences={openDetailOccurrences} onBranchChange={changeBranch} onRefresh={() => { void load(null, branch, true); void loadComparison(); }} onLoadMore={() => void load(history?.next_before ?? null, branch)} onOpenSettings={onOpenProjectSettings} onOpenCodex={(id) => void openCodex(id)} onOpenTerminal={(id) => void openTerminal(id)} onToggleDetails={toggleDetails} onLoadMoreDetails={(id) => void loadDetails(id, detailsByThread[id]?.page?.next_cursor)} embedded={embedded} comparison={comparison} comparisonLoading={comparisonLoading} comparisonError={comparisonError} activeStorageName={activeStorageName} />;
 }

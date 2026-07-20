@@ -6,6 +6,7 @@ import ProjectChatHistoryPage, {
   ThreadMetrics,
 } from "../../src/components/project-sync/ProjectChatHistoryPage";
 import ProjectSidebar from "../../src/components/project-sync/ProjectSidebar";
+import { createSingleFlight } from "../../src/components/project-sync/api";
 
 const project = {
   local_project_id: "project-mallard",
@@ -67,6 +68,32 @@ const history = {
   }],
 };
 
+test("history requests share concurrent work but not completed results", async () => {
+  const singleFlight = createSingleFlight();
+  let starts = 0;
+  let resolveRequest!: (value: string) => void;
+  const pending = new Promise<string>((resolve) => {
+    resolveRequest = resolve;
+  });
+  const start = () => {
+    starts += 1;
+    return pending;
+  };
+
+  const first = singleFlight("project-history", start);
+  const duplicate = singleFlight("project-history", start);
+  assert.strictEqual(first, duplicate);
+  assert.equal(starts, 1);
+
+  resolveRequest("complete");
+  assert.deepEqual(await Promise.all([first, duplicate]), ["complete", "complete"]);
+  assert.equal(await singleFlight("project-history", async () => {
+    starts += 1;
+    return "refreshed";
+  }), "refreshed");
+  assert.equal(starts, 2);
+});
+
 test("history content uses the local alias and renders commit/thread actions", () => {
   const html = renderToStaticMarkup(
     <ProjectChatHistoryContent
@@ -115,7 +142,7 @@ test("history content uses the local alias and renders commit/thread actions", (
   assert.doesNotMatch(html, /Appears under 2 commits/);
   assert.doesNotMatch(html, /during session|after session|started from/);
   assert.doesNotMatch(html, /Map project-owned Codex sessions onto/);
-  assert.match(html, /aria-label="Show conversation details"/);
+  assert.doesNotMatch(html, /aria-label="Show conversation details"/);
   assert.match(html, /aria-label="Open in Codex"/);
   assert.match(html, /aria-label="Open in Terminal"/);
   assert.match(html, /v3-openai-icon/);
@@ -131,6 +158,59 @@ test("expanded session details label every metric icon", () => {
   assert.match(html, /data-tooltip="Total tokens · 24\.8K"/);
   assert.match(html, /data-tooltip="Agent messages · 5"/);
   assert.match(html, /data-tooltip="Tool calls · 8"/);
+});
+
+test("chat history loads through its own control inside session details", () => {
+  const thread = history.threads[0];
+  const html = renderToStaticMarkup(
+    <ProjectChatHistoryContent
+      embedded
+      project={project}
+      binding={{
+        replica_id: "replica",
+        local_project_id: project.local_project_id,
+        bundle_id: project.bundle_id,
+        project_root: project.project_root,
+        canonical_project_root: project.project_root,
+        profile_ids: { codex: "profile-codex" },
+        state: "active",
+        revision: 1,
+        updated_at: 2,
+      }}
+      history={{ ...history, git: null }}
+      loading={false}
+      loadingMore={false}
+      actionError={null}
+      actionBusyThreadId={null}
+      detailsByThread={{
+        [thread.thread_id]: {
+          loading: false,
+          error: null,
+          page: {
+            thread_id: thread.thread_id,
+            turns: [{ ordinal: 1, role: "user", timestamp: thread.started_at, preview: "Nested conversation preview" }],
+            next_cursor: 10,
+          },
+        },
+      }}
+      openDetailOccurrences={new Set([thread.thread_id])}
+      onBranchChange={() => undefined}
+      onRefresh={() => undefined}
+      onLoadMore={() => undefined}
+      onOpenSettings={() => undefined}
+      onOpenCodex={() => undefined}
+      onOpenTerminal={() => undefined}
+      onToggleDetails={() => undefined}
+    />,
+  );
+
+  assert.match(html, /aria-label="Hide session details"/);
+  assert.doesNotMatch(html, /conversation details/);
+  assert.match(html, /aria-label="Hide chat history"/);
+  assert.match(html, /data-tooltip="User turns · 3"/);
+  assert.match(html, /Load 10 older messages/);
+  assert.ok(html.indexOf("Load 10 older messages") < html.indexOf("Nested conversation preview"));
+  assert.match(html, /Nested conversation preview/);
 });
 
 test("embedded history follows project settings without repeating project controls", () => {
@@ -164,9 +244,131 @@ test("embedded history follows project settings without repeating project contro
   );
 
   assert.match(html, /v3-history-embedded/);
-  assert.match(html, /<h2[^>]*v3-history-embedded-title[^>]*>.*Activity/s);
+  assert.match(html, /<h2[^>]*v3-history-embedded-title[^>]*>.*Git history/s);
+  assert.doesNotMatch(html, />Commit history</);
+  assert.match(html, /aria-label="1 thread"/);
   assert.doesNotMatch(html, /<main/);
   assert.doesNotMatch(html, /aria-label="Project settings"/);
+  assert.doesNotMatch(html, /v3-history-project-context/);
+  assert.doesNotMatch(html, /Local storage 1/);
+});
+
+test("embedded non-Git history uses one Codex threads heading", () => {
+  const html = renderToStaticMarkup(
+    <ProjectChatHistoryContent
+      embedded
+      project={project}
+      binding={{
+        replica_id: "replica",
+        local_project_id: project.local_project_id,
+        bundle_id: project.bundle_id,
+        project_root: project.project_root,
+        canonical_project_root: project.project_root,
+        profile_ids: { codex: "profile-codex" },
+        state: "active",
+        revision: 1,
+        updated_at: 2,
+      }}
+      history={{ ...history, git: null }}
+      loading={false}
+      loadingMore={false}
+      actionError={null}
+      actionBusyThreadId={null}
+      onBranchChange={() => undefined}
+      onRefresh={() => undefined}
+      onLoadMore={() => undefined}
+      onOpenSettings={() => undefined}
+      onOpenCodex={() => undefined}
+      onOpenTerminal={() => undefined}
+    />,
+  );
+
+  assert.equal(html.match(/Codex threads/g)?.length, 1);
+  assert.doesNotMatch(html, />Activity</);
+  assert.match(html, /aria-label="1 thread"/);
+});
+
+test("selected storage adds directional indicators and storage-only threads", () => {
+  const comparison = {
+    project_id: project.local_project_id,
+    storage_id: "storage-1",
+    storage_name: "Local storage 1",
+    generation: 4,
+    base_generation: 3,
+    compared_at: 1_752_804_000,
+    counts: { synced: 0, local: 2, storage: 1, diverged: 0, unknown: 0 },
+    warnings: [],
+    entries: [
+      {
+        thread_id: history.threads[0].thread_id,
+        resource_id: `codex:session:${history.threads[0].thread_id}`,
+        display_name: history.threads[0].thread_id,
+        state: "local_ahead" as const,
+        local_present: true,
+        storage_present: true,
+        local_updated_at: history.threads[0].ended_at,
+        storage_updated_at: history.threads[0].ended_at - 60,
+      },
+      {
+        thread_id: "019f7798-5437-7632-9dbc-5b589cf68bf1",
+        resource_id: "codex:session:019f7798-5437-7632-9dbc-5b589cf68bf1",
+        display_name: "019f7798-5437-7632-9dbc-5b589cf68bf1",
+        state: "storage_only" as const,
+        local_present: false,
+        storage_present: true,
+        storage_updated_at: 1_752_802_500,
+      },
+      {
+        thread_id: "019f7798-5437-7632-9dbc-5b589cf68bf2",
+        resource_id: "codex:session:019f7798-5437-7632-9dbc-5b589cf68bf2",
+        display_name: "019f7798-5437-7632-9dbc-5b589cf68bf2",
+        state: "local_ahead" as const,
+        local_present: true,
+        storage_present: true,
+        local_updated_at: history.window_start - 60,
+        storage_updated_at: history.window_start - 120,
+      },
+    ],
+  };
+  const html = renderToStaticMarkup(
+    <ProjectChatHistoryContent
+      embedded
+      project={project}
+      binding={{
+        replica_id: "replica",
+        local_project_id: project.local_project_id,
+        bundle_id: project.bundle_id,
+        project_root: project.project_root,
+        canonical_project_root: project.project_root,
+        profile_ids: { codex: "profile-codex" },
+        state: "active",
+        revision: 1,
+        updated_at: 2,
+      }}
+      history={{ ...history, git: null }}
+      comparison={comparison}
+      activeStorageName="Local storage 1"
+      loading={false}
+      loadingMore={false}
+      actionError={null}
+      actionBusyThreadId={null}
+      onBranchChange={() => undefined}
+      onRefresh={() => undefined}
+      onLoadMore={() => undefined}
+      onOpenSettings={() => undefined}
+      onOpenCodex={() => undefined}
+      onOpenTerminal={() => undefined}
+    />,
+  );
+
+  assert.match(html, /aria-label="Comparing threads with Local storage 1"/);
+  assert.match(html, /aria-label="Visible thread comparison with Local storage 1"/);
+  assert.match(html, /title="1 local thread change"/);
+  assert.doesNotMatch(html, /title="2 local thread changes"/);
+  assert.match(html, /aria-label="Newer on this computer\. Push to update Local storage 1\."/);
+  assert.match(html, /aria-label="Only in Local storage 1\. Pull to download it here\."/);
+  assert.match(html, /Stored thread 019f7798/);
+  assert.match(html, /aria-label="2 threads"/);
 });
 
 test("non-Git history renders a flat Codex thread list", () => {

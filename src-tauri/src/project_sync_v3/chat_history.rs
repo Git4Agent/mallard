@@ -421,7 +421,7 @@ pub fn get_project_chat_thread_details(
     limit: Option<usize>,
 ) -> Result<CodexThreadDetailsPage, String> {
     let (_, rollout_path) = resolve_owned_rollout(repository, local_project_id, thread_id)?;
-    let mut page = parse_thread_detail_file(&rollout_path, cursor, limit.unwrap_or(50))?;
+    let mut page = parse_thread_detail_file(&rollout_path, cursor, limit.unwrap_or(10))?;
     page.thread_id = thread_id.to_string();
     Ok(page)
 }
@@ -1151,7 +1151,6 @@ fn parse_thread_detail_lines<'a>(
     cursor: Option<usize>,
     limit: usize,
 ) -> CodexThreadDetailsPage {
-    let start = cursor.unwrap_or(0);
     let limit = limit.clamp(1, 50);
     let mut visible = Vec::new();
     let mut previous: Option<(ChatTurnRole, String, Option<u64>)> = None;
@@ -1174,13 +1173,8 @@ fn parse_thread_detail_lines<'a>(
             preview,
         });
     }
-    let turns = visible
-        .iter()
-        .skip(start)
-        .take(limit)
-        .cloned()
-        .collect::<Vec<_>>();
-    let next_cursor = (start + turns.len() < visible.len()).then_some(start + turns.len());
+    let (start, end, next_cursor) = latest_turn_bounds(visible.len(), cursor, limit);
+    let turns = visible[start..end].to_vec();
     CodexThreadDetailsPage {
         thread_id: String::new(),
         turns,
@@ -1188,19 +1182,26 @@ fn parse_thread_detail_lines<'a>(
     }
 }
 
-fn parse_thread_detail_file(
-    path: &Path,
+fn latest_turn_bounds(
+    total: usize,
     cursor: Option<usize>,
     limit: usize,
-) -> Result<CodexThreadDetailsPage, String> {
+) -> (usize, usize, Option<usize>) {
+    let newer_turns = cursor.unwrap_or(0).min(total);
+    let end = total.saturating_sub(newer_turns);
+    let start = end.saturating_sub(limit);
+    let next_cursor = (start > 0).then_some(newer_turns.saturating_add(end - start));
+    (start, end, next_cursor)
+}
+
+fn scan_thread_detail_file(
+    path: &Path,
+    mut visit: impl FnMut(ChatTurnPreview) -> bool,
+) -> Result<usize, String> {
     let file = File::open(path).map_err(|error| format!("open '{}': {error}", path.display()))?;
     let mut reader = BufReader::new(file);
-    let start = cursor.unwrap_or(0);
-    let limit = limit.clamp(1, 50);
     let mut ordinal = 0usize;
-    let mut turns = Vec::new();
     let mut bytes = Vec::new();
-    let mut has_more = false;
     let mut previous: Option<(ChatTurnRole, String, Option<u64>)> = None;
     loop {
         let record_start = reader
@@ -1228,23 +1229,41 @@ fn parse_thread_detail_file(
             continue;
         }
         previous = Some((role, preview.clone(), timestamp));
-        if ordinal >= start {
-            if turns.len() == limit {
-                has_more = true;
-                break;
-            }
-            turns.push(ChatTurnPreview {
-                ordinal,
-                role,
-                timestamp,
-                preview,
-            });
-        }
+        let turn = ChatTurnPreview {
+            ordinal,
+            role,
+            timestamp,
+            preview,
+        };
         ordinal = ordinal.saturating_add(1);
+        if !visit(turn) {
+            break;
+        }
+    }
+    Ok(ordinal)
+}
+
+fn parse_thread_detail_file(
+    path: &Path,
+    cursor: Option<usize>,
+    limit: usize,
+) -> Result<CodexThreadDetailsPage, String> {
+    let limit = limit.clamp(1, 50);
+    let total = scan_thread_detail_file(path, |_| true)?;
+    let (start, end, next_cursor) = latest_turn_bounds(total, cursor, limit);
+    let mut turns = Vec::new();
+    if start < end {
+        scan_thread_detail_file(path, |turn| {
+            let ordinal = turn.ordinal;
+            if ordinal >= start && ordinal < end {
+                turns.push(turn);
+            }
+            ordinal.saturating_add(1) < end
+        })?;
     }
     Ok(CodexThreadDetailsPage {
         thread_id: String::new(),
-        next_cursor: has_more.then_some(start + turns.len()),
+        next_cursor,
         turns,
     })
 }
@@ -2357,14 +2376,14 @@ mod tests {
 
         let first_page = parse_thread_detail_file(&path, None, 1).unwrap();
         assert_eq!(first_page.turns.len(), 1);
-        assert_eq!(first_page.turns[0].ordinal, 0);
-        assert_eq!(first_page.turns[0].preview, "Visible user request");
+        assert_eq!(first_page.turns[0].ordinal, 1);
+        assert_eq!(first_page.turns[0].preview, "Visible Codex response");
         assert_eq!(first_page.next_cursor, Some(1));
 
         let second_page = parse_thread_detail_file(&path, Some(1), 1).unwrap();
         assert_eq!(second_page.turns.len(), 1);
-        assert_eq!(second_page.turns[0].ordinal, 1);
-        assert_eq!(second_page.turns[0].preview, "Visible Codex response");
+        assert_eq!(second_page.turns[0].ordinal, 0);
+        assert_eq!(second_page.turns[0].preview, "Visible user request");
         assert_eq!(second_page.next_cursor, None);
     }
 
@@ -2561,9 +2580,46 @@ mod tests {
 
         let page = parse_thread_detail_lines(lines.iter().map(String::as_str), None, 2);
         assert_eq!(page.turns.len(), 2);
-        assert_eq!(page.turns[0].role, ChatTurnRole::User);
-        assert_eq!(page.turns[1].role, ChatTurnRole::Assistant);
+        assert_eq!(page.turns[0].role, ChatTurnRole::Assistant);
+        assert_eq!(page.turns[1].role, ChatTurnRole::User);
         assert_eq!(page.next_cursor, Some(2));
+
+        let older = parse_thread_detail_lines(lines.iter().map(String::as_str), Some(2), 2);
+        assert_eq!(older.turns.len(), 1);
+        assert_eq!(older.turns[0].role, ChatTurnRole::User);
+        assert_eq!(older.next_cursor, None);
+    }
+
+    #[test]
+    fn chat_detail_pages_start_with_the_latest_ten_turns() {
+        let lines = (0..25)
+            .map(|index| {
+                json!({
+                    "timestamp": 100 + index,
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": format!("Message {index}")}
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        let latest = parse_thread_detail_lines(lines.iter().map(String::as_str), None, 10);
+        assert_eq!(latest.turns.len(), 10);
+        assert_eq!(latest.turns.first().unwrap().ordinal, 15);
+        assert_eq!(latest.turns.last().unwrap().ordinal, 24);
+        assert_eq!(latest.next_cursor, Some(10));
+
+        let middle = parse_thread_detail_lines(lines.iter().map(String::as_str), Some(10), 10);
+        assert_eq!(middle.turns.len(), 10);
+        assert_eq!(middle.turns.first().unwrap().ordinal, 5);
+        assert_eq!(middle.turns.last().unwrap().ordinal, 14);
+        assert_eq!(middle.next_cursor, Some(20));
+
+        let oldest = parse_thread_detail_lines(lines.iter().map(String::as_str), Some(20), 10);
+        assert_eq!(oldest.turns.len(), 5);
+        assert_eq!(oldest.turns.first().unwrap().ordinal, 0);
+        assert_eq!(oldest.turns.last().unwrap().ordinal, 4);
+        assert_eq!(oldest.next_cursor, None);
     }
 
     #[test]

@@ -183,6 +183,22 @@ impl ActivityLogEntry {
         }
         Ok(())
     }
+
+    fn normalize_legacy_history_classification(&mut self) {
+        if self.event == "history.scan_completed"
+            || self.message.starts_with("Session history scan complete:")
+        {
+            self.log_type = ActivityLogType::History;
+            self.level = ActivityLogLevel::Info;
+            self.event = "history.scan_completed".to_string();
+        } else if self.message.starts_with("Scanning Codex session history") {
+            self.log_type = ActivityLogType::History;
+            self.event = "history.scan_started".to_string();
+        } else if self.message.starts_with("Session history scan failed:") {
+            self.log_type = ActivityLogType::History;
+            self.event = "history.scan_failed".to_string();
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -343,9 +359,10 @@ impl ActivityLogStore {
                 if line.len() > MAX_ENTRY_BYTES {
                     continue;
                 }
-                let Ok(entry) = serde_json::from_str::<ActivityLogEntry>(&line) else {
+                let Ok(mut entry) = serde_json::from_str::<ActivityLogEntry>(&line) else {
                     continue;
                 };
+                entry.normalize_legacy_history_classification();
                 if entry.validate().is_err()
                     || (!query.types.is_empty() && !query.types.contains(&entry.log_type))
                     || (!query.levels.is_empty() && !query.levels.contains(&entry.level))
@@ -1112,6 +1129,42 @@ mod tests {
         assert_eq!(page.entries.len(), 1);
         assert_eq!(page.entries[0].message, "pull failed");
         assert_eq!(store.stats().unwrap().file_count, 1);
+    }
+
+    #[test]
+    fn query_reclassifies_legacy_history_completion_as_info() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ActivityLogStore::from_home_dir(temp.path()).unwrap();
+        let mut legacy = entry(
+            timestamp("2026-07-19", 10),
+            ActivityLogType::System,
+            ActivityLogLevel::Success,
+            "Session history scan complete: 1 sessions in this 30-day window",
+        );
+        legacy.event = "system.success".to_string();
+        store.append(&legacy).unwrap();
+
+        let info_page = store
+            .query(&ActivityLogQuery {
+                types: vec![ActivityLogType::History],
+                levels: vec![ActivityLogLevel::Info],
+                limit: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(info_page.entries.len(), 1);
+        assert_eq!(info_page.entries[0].log_type, ActivityLogType::History);
+        assert_eq!(info_page.entries[0].level, ActivityLogLevel::Info);
+        assert_eq!(info_page.entries[0].event, "history.scan_completed");
+
+        let success_page = store
+            .query(&ActivityLogQuery {
+                levels: vec![ActivityLogLevel::Success],
+                limit: Some(10),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(success_page.entries.is_empty());
     }
 
     #[test]

@@ -627,6 +627,11 @@ impl BundleRecipe {
 pub struct RecipeBase {
     pub generation: u64,
     pub manifest_sha256: String,
+    /// Immutable commit that established this reviewed base. Keeping the
+    /// commit ID locally lets status views reload the exact historical
+    /// manifest after the storage head advances.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
     pub recipe_revision: u64,
     /// The machine binding that established this reviewed remote base. Older
     /// experimental bases deserialize as `None` and cannot authorize Push.
@@ -640,7 +645,11 @@ pub struct RecipeBase {
 
 impl RecipeBase {
     pub fn validate(&self) -> Result<(), String> {
-        validate_sha256("recipe base manifest", &self.manifest_sha256)
+        validate_sha256("recipe base manifest", &self.manifest_sha256)?;
+        if let Some(commit_id) = &self.commit_id {
+            validate_named_id("recipe base commit", commit_id)?;
+        }
+        Ok(())
     }
 }
 

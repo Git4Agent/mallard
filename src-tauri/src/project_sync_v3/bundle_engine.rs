@@ -768,16 +768,49 @@ impl<S: BundleObjectStore> BundleEngine<S> {
     /// payload objects. Discovery uses this to match repository identities
     /// without downloading every session or project file in a storage.
     pub fn inspect(&self, bundle_id: &BundleId) -> Result<BundleSnapshot, String> {
-        let (head, _) = self
-            .read_head(bundle_id)?
-            .ok_or_else(|| format!("bundle '{}' does not exist", bundle_id))?;
+        self.inspect_optional(bundle_id)?
+            .ok_or_else(|| format!("bundle '{}' does not exist", bundle_id))
+    }
+
+    /// The optional form is used by read-only status views where an empty
+    /// linked destination is a valid state rather than an error.
+    pub fn inspect_optional(
+        &self,
+        bundle_id: &BundleId,
+    ) -> Result<Option<BundleSnapshot>, String> {
+        let Some((head, _)) = self.read_head(bundle_id)? else {
+            return Ok(None);
+        };
         let manifest = self.read_manifest(&head)?;
-        Ok(BundleSnapshot {
+        Ok(Some(BundleSnapshot {
             storage_id: self.storage_id.clone(),
             head,
             manifest,
             fetched_at: now_secs(),
-        })
+        }))
+    }
+
+    /// Load one immutable historical manifest using the coordinates retained
+    /// by a reviewed local sync base. This reads metadata only; payload
+    /// objects such as conversation rollouts are not downloaded.
+    pub fn inspect_manifest_version(
+        &self,
+        bundle_id: &BundleId,
+        generation: u64,
+        commit_id: &str,
+        manifest_sha256: &str,
+    ) -> Result<BundleManifest, String> {
+        let head = BundleHead {
+            schema_version: BUNDLE_SCHEMA_V3,
+            bundle_id: bundle_id.clone(),
+            kind: BundleKind::Project,
+            generation,
+            commit_id: commit_id.to_string(),
+            manifest_key: format!("_manifests/{generation}-{commit_id}.json"),
+            manifest_sha256: manifest_sha256.to_string(),
+            updated_at: 0,
+        };
+        self.read_manifest(&head)
     }
 
     /// Cursor-paginated remote discovery. The cursor is the last returned

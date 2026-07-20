@@ -76,7 +76,7 @@ test("binding setup renders one profile editor behind an explicit agent choice",
   assert.doesNotMatch(html, /aria-label="Claude profile"/);
 });
 
-test("the configured profile keeps a repair action inline above simple storage rows", () => {
+test("the configured profile keeps a repair action inline with the storage heading", () => {
   const projectId = "project-one";
   const storageId = "storage-one";
   const secondStorageId = "storage-two";
@@ -119,6 +119,7 @@ test("the configured profile keeps a repair action inline above simple storage r
         project_root: binding.project_root,
       }]}
       activeProjectId={projectId}
+      activeStorageId={storageId}
       bindings={[binding]}
       profiles={[codexProfile, claudeProfile]}
       storages={[
@@ -172,6 +173,7 @@ test("the configured profile keeps a repair action inline above simple storage r
       conversationPathAuditErrors={{}}
       conversationPathAuditLoading={false}
       onSelectProject={() => undefined}
+      onSelectStorage={() => undefined}
       onLinkStorage={() => undefined}
       onUnlinkStorage={() => undefined}
       onPush={() => undefined}
@@ -192,21 +194,18 @@ test("the configured profile keeps a repair action inline above simple storage r
     />,
   );
 
-  const profileIndex = html.indexOf("project-profile-group-header");
-  const profileEndIndex = html.indexOf("</header>", profileIndex);
   const warningIndex = html.indexOf("conversation-path-repair-notice");
   const storageHeadingIndex = html.indexOf("project-profile-storage-heading");
+  const storageActionsIndex = html.indexOf("project-profile-storage-actions", storageHeadingIndex);
   const addStorageIndex = html.indexOf(">Add storage<", storageHeadingIndex);
   const storageIndex = html.indexOf("storage-link-block");
   const settingsIndex = html.indexOf('aria-label="Hide project settings"');
   const activityIndex = html.indexOf(">Activity<");
 
-  assert.ok(profileIndex >= 0);
-  assert.ok(profileEndIndex > profileIndex);
-  assert.ok(warningIndex > profileIndex);
-  assert.ok(warningIndex < profileEndIndex);
-  assert.ok(storageHeadingIndex > warningIndex);
-  assert.ok(addStorageIndex > storageHeadingIndex);
+  assert.ok(warningIndex >= 0);
+  assert.ok(warningIndex > storageHeadingIndex);
+  assert.ok(storageActionsIndex > warningIndex);
+  assert.ok(addStorageIndex > storageActionsIndex);
   assert.ok(addStorageIndex < storageIndex);
   assert.ok(storageIndex > warningIndex);
   assert.ok(settingsIndex >= 0);
@@ -217,6 +216,9 @@ test("the configured profile keeps a repair action inline above simple storage r
   assert.equal(html.match(/conversation-path-repair-notice/g)?.length, 1);
   assert.equal(html.match(/class="storage-link-block/g)?.length, 2);
   assert.equal(html.match(/class="storage-link-unlink"/g)?.length, 2);
+  assert.equal(html.match(/type="radio"/g)?.length, 2);
+  assert.match(html, /aria-label="Compare threads with Local storage"[^>]*checked=""/);
+  assert.match(html, /aria-label="Compare threads with R2 storage"/);
   assert.match(html, /aria-label="Unlink Local storage from Project one"/);
   assert.match(html, /aria-label="Unlink R2 storage from Project one"/);
   assert.equal(html.match(/class="storage-link-profile-section/g)?.length ?? 0, 0);
@@ -226,11 +228,11 @@ test("the configured profile keeps a repair action inline above simple storage r
   assert.doesNotMatch(html, /Linked storage/);
   assert.doesNotMatch(html, /project-profile-group-footer/);
   assert.equal(html.match(/Default Codex/g)?.length, 1);
-  assert.match(html, /project-profile-group-path/);
-  assert.match(html, /~\/\.codex/);
+  assert.match(html, /title="Codex agent home: \/Users\/test\/\.codex"/);
+  assert.match(html, /v3-project-heading-agent/);
   assert.doesNotMatch(html, /Codex ·/);
-  assert.match(html, /project-profile-group-icon/);
-  assert.match(html, /Agent home is fixed after project setup/);
+  assert.doesNotMatch(html, /project-profile-group-header|project-profile-group-icon|project-profile-group-path/);
+  assert.doesNotMatch(html, /Agent home is fixed after project setup/);
   assert.doesNotMatch(html, /Configure project profile/);
   assert.doesNotMatch(html, />CLAUDE</);
   assert.doesNotMatch(html, /Not used/);

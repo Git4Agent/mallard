@@ -74,6 +74,7 @@ const EMPTY_CONFIG: SyncConfigV3 = {
 };
 
 const PROJECT_SIDEBAR_WIDTH_KEY = "agent-sync.project-sidebar-width";
+const ACTIVE_STORAGE_BY_PROJECT_KEY = "mallard.active-storage-by-project";
 const DEFAULT_PROJECT_SIDEBAR_WIDTH = 318;
 const MIN_PROJECT_SIDEBAR_WIDTH = 220;
 const MAX_PROJECT_SIDEBAR_WIDTH = 560;
@@ -97,6 +98,18 @@ function storedSidebarWidth(): number {
       : DEFAULT_PROJECT_SIDEBAR_WIDTH;
   } catch {
     return DEFAULT_PROJECT_SIDEBAR_WIDTH;
+  }
+}
+
+function storedActiveStorages(): Record<string, string> {
+  try {
+    const value = JSON.parse(window.localStorage.getItem(ACTIVE_STORAGE_BY_PROJECT_KEY) ?? "{}");
+    if (!value || typeof value !== "object" || Array.isArray(value)) return {};
+    return Object.fromEntries(Object.entries(value).filter((entry): entry is [string, string] => (
+      typeof entry[0] === "string" && typeof entry[1] === "string"
+    )));
+  } catch {
+    return {};
   }
 }
 
@@ -176,7 +189,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const [detail, setDetail] = useState<ProjectDetail | null>(null);
   const [inventory, setInventory] = useState<ResourceInventoryModel | null>(null);
   const [readiness, setReadiness] = useState<BundleReadiness | null>(null);
-  const [activeStorageByProject, setActiveStorageByProject] = useState<Record<string, string>>({});
+  const [activeStorageByProject, setActiveStorageByProject] = useState<Record<string, string>>(storedActiveStorages);
   const [activeStorageSettingsId, setActiveStorageSettingsId] = useState<string | null>(null);
   const [storageEditorRequest, setStorageEditorRequest] = useState<
     | { mode: "toggle"; storageId: string; requestId: number }
@@ -257,6 +270,14 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       // Persistence is a convenience; resizing still works if storage is unavailable.
     }
   }, [sidebarWidth]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(ACTIVE_STORAGE_BY_PROJECT_KEY, JSON.stringify(activeStorageByProject));
+    } catch {
+      // The selected comparison target remains available for this session.
+    }
+  }, [activeStorageByProject]);
 
   useEffect(() => {
     const fitSidebarToWindow = () => {
@@ -630,6 +651,14 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     await loadProjectData(projectId, config, preferredStorage);
   };
 
+  const selectStorage = (projectId: string, storageId: string) => {
+    if (!config.links.some((link) => (
+      link.local_project_id === projectId && link.storage_id === storageId
+    ))) return;
+    setActiveProjectId(projectId);
+    setActiveStorageByProject((current) => ({ ...current, [projectId]: storageId }));
+  };
+
   const createProfileAtPath = async (provider: ProjectProvider, path: string): Promise<ProviderProfile | null> => {
     if (!path.trim()) return null;
     setBusy(true);
@@ -894,6 +923,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     try {
       const result = await projectSyncApi.pushBundle(projectId, storageId, recipe);
       setNotice(result.message);
+      setHistoryRefreshEpoch((epoch) => epoch + 1);
       setPendingPush(null);
       setActiveProjectId(projectId);
       setActiveStorageByProject((current) => ({ ...current, [projectId]: storageId }));
@@ -960,8 +990,8 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         setDetail((current) => current ? { ...current, project: updated } : current);
       }
       setNotice(alias
-        ? `Project shown as “${alias}” on this machine. The shared repo name is unchanged.`
-        : "Custom name cleared; showing the shared repo name again.");
+        ? `Shown as “${alias}” on this computer.`
+        : `Name reset to “${updated.display_name}”.`);
       return true;
     } catch (reason) {
       setError(errorMessage(reason));
@@ -1667,14 +1697,20 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
           </div>
         )}
         {notice && (
-          <button type="button" className="v3-notice" onClick={() => setNotice(null)} title="Dismiss">
-            <Icon name="check-circle" size={14} /> {notice} <Icon name="x" size={12} />
-          </button>
+          <div className="v3-notice" role="status" aria-live="polite">
+            <Icon name="check-circle" size={14} />
+            <span>{notice}</span>
+            <button type="button" className="v3-notice-dismiss" onClick={() => setNotice(null)}
+              title="Dismiss" aria-label="Dismiss notification">
+              <Icon name="x" size={12} />
+            </button>
+          </div>
         )}
 
         <ProjectLinksWorkspace
             projects={projects}
             activeProjectId={activeProjectId}
+            activeStorageId={activeStorageId}
             bindings={bindings}
             profiles={profiles}
             storages={config.storages}
@@ -1686,6 +1722,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
             conversationPathAuditErrors={conversationPathAuditErrors}
             conversationPathAuditLoading={conversationPathAuditLoading}
             onSelectProject={(projectId, storageId) => selectProject(projectId, storageId)}
+            onSelectStorage={(projectId, storageId) => selectStorage(projectId, storageId)}
             onLinkStorage={(projectId, storageId) => linkStorage(projectId, storageId)}
             onUnlinkStorage={(projectId, storageId) => unlinkStorage(projectId, storageId)}
             onPush={(projectId, storageId) => openPushChooser(projectId, storageId)}

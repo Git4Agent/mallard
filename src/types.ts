@@ -441,6 +441,7 @@ export interface LocalProjectRegistration {
   recipe_bases: Record<string, {
     generation: number;
     manifest_sha256: string;
+    commit_id?: string | null;
     recipe_revision: number;
     binding_revision?: number | null;
     last_pull_at?: number | null;
@@ -935,6 +936,46 @@ export interface StorageSyncSummary {
   storage_name: string;
   last_pull_at?: number | null;
   last_push_at?: number | null;
+}
+
+export type ThreadSyncState =
+  | "synced"
+  | "local_only"
+  | "local_ahead"
+  | "storage_only"
+  | "storage_ahead"
+  | "diverged"
+  | "unknown";
+
+export interface ThreadSyncEntry {
+  thread_id: string;
+  resource_id: string;
+  display_name: string;
+  state: ThreadSyncState;
+  local_present: boolean;
+  storage_present: boolean;
+  local_updated_at?: number | null;
+  storage_updated_at?: number | null;
+}
+
+export interface ThreadSyncCounts {
+  synced: number;
+  local: number;
+  storage: number;
+  diverged: number;
+  unknown: number;
+}
+
+export interface ThreadSyncComparison {
+  project_id: string;
+  storage_id: string;
+  storage_name: string;
+  generation?: number | null;
+  base_generation?: number | null;
+  compared_at: number;
+  entries: ThreadSyncEntry[];
+  counts: ThreadSyncCounts;
+  warnings: string[];
 }
 
 export interface GitCommitSummary {

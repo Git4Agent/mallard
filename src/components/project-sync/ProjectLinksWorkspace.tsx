@@ -41,6 +41,7 @@ type InlineStorageReview = {
 interface Props {
   projects: LocalProjectSummary[];
   activeProjectId: string | null;
+  activeStorageId: string | null;
   bindings: ProjectBinding[];
   profiles: ProviderProfileSummary[];
   storages: StorageConfigV3[];
@@ -52,6 +53,7 @@ interface Props {
   conversationPathAuditErrors: Record<string, string>;
   conversationPathAuditLoading: boolean;
   onSelectProject: (projectId: string, storageId?: string | null) => Promise<void> | void;
+  onSelectStorage: (projectId: string, storageId: string) => Promise<void> | void;
   onLinkStorage: (projectId: string, storageId: string) => Promise<void> | void;
   onUnlinkStorage: (projectId: string, storageId: string) => Promise<void> | void;
   onPush: (projectId: string, storageId: string) => Promise<void> | void;
@@ -140,6 +142,7 @@ export function conversationPathsBlockSync(
 export default function ProjectLinksWorkspace({
   projects,
   activeProjectId,
+  activeStorageId,
   bindings,
   profiles,
   storages,
@@ -151,6 +154,7 @@ export default function ProjectLinksWorkspace({
   conversationPathAuditErrors,
   conversationPathAuditLoading,
   onSelectProject,
+  onSelectStorage,
   onLinkStorage,
   onUnlinkStorage,
   onPush,
@@ -348,6 +352,29 @@ export default function ProjectLinksWorkspace({
     : null;
   const activeProject = projects.find((project) => project.local_project_id === activeProjectId) ?? null;
   const workspaceProject = newProjectSetup ? null : settingsProject ?? activeProject;
+  const workspaceBinding = workspaceProject
+    ? bindingByProject.get(workspaceProject.local_project_id)
+    : undefined;
+  const workspaceProviders = PROJECT_PROVIDERS.filter((provider) => (
+    workspaceBinding?.profile_ids?.[provider]
+  ));
+  const workspaceHasMultipleProviders = workspaceProviders.length > 1;
+  const workspaceProvider = configuredProjectProvider(workspaceBinding?.profile_ids);
+  const workspaceProfileId = workspaceProvider
+    ? workspaceBinding?.profile_ids?.[workspaceProvider]
+    : null;
+  const workspaceProfile = profiles.find((candidate) => candidate.profile_id === workspaceProfileId);
+  const workspaceProfileReady = !workspaceHasMultipleProviders
+    && !!workspaceProfile?.available
+    && workspaceProfile.readable;
+  const workspaceProfileLabel = workspaceHasMultipleProviders
+    ? "Choose one agent"
+    : workspaceProfile?.display_name ?? "No agent configured";
+  const workspaceProfileTitle = workspaceHasMultipleProviders
+    ? "Codex and Claude are both assigned"
+    : workspaceProfile
+      ? `${providerLabel(workspaceProvider ?? "codex")} agent home: ${workspaceProfile.path}${workspaceProfileReady ? "" : " (unavailable)"}`
+      : "No agent profile is assigned";
   const proposedProjectAlias = workspaceProject
     ? projectAliasDraft.trim() && projectAliasDraft.trim() !== workspaceProject.display_name
       ? projectAliasDraft.trim()
@@ -579,6 +606,13 @@ export default function ProjectLinksWorkspace({
                       <Icon name="folder" size={12} />
                       <span>{compactProjectPath(workspaceProject.project_root)}</span>
                     </span>
+                    <span
+                      className={`v3-project-heading-meta-item v3-project-heading-agent${workspaceProfileReady ? "" : " warning"}`}
+                      title={workspaceProfileTitle}
+                    >
+                      <Icon name="terminal" size={12} />
+                      <span>{workspaceProfileLabel}</span>
+                    </span>
                   </div>
                   {renamingProjectId === workspaceProject.local_project_id && error && (
                     <div className="v3-project-heading-error"><Icon name="alert-triangle" size={13} /> {error}</div>
@@ -604,12 +638,11 @@ export default function ProjectLinksWorkspace({
                 }}
                 disabled={busy}
                 aria-label={settingsProject ? "Hide project settings" : "Show project settings"}
+                title={settingsProject ? "Hide project settings" : "Show project settings"}
                 aria-expanded={!!settingsProject}
                 aria-controls="project-configuration-panel"
               >
                 <Icon name="settings" size={15} />
-                <span>Settings</span>
-                <Icon name="chevron-down" size={13} className="v3-project-settings-chevron" />
               </button>
             ) : (
               <div className="profile-links-heading-actions">
@@ -657,7 +690,6 @@ export default function ProjectLinksWorkspace({
               ));
               const hasMultipleProviders = configuredProviders.length > 1;
               const projectProvider = configuredProjectProvider(projectBinding?.profile_ids);
-              const displayedProvider = projectProvider ?? "codex";
               const projectProfileId = projectProvider
                 ? projectBinding?.profile_ids?.[projectProvider]
                 : null;
@@ -671,6 +703,8 @@ export default function ProjectLinksWorkspace({
               const codexConfigured = projectProvider === "codex" && !hasMultipleProviders;
               const conversationPathAudit = conversationPathAudits[project.local_project_id];
               const conversationPathAuditError = conversationPathAuditErrors[project.local_project_id];
+              const conversationPathNoticeBlocked = !!conversationPathAuditError
+                || !!conversationPathAudit?.blockers.length;
               const conversationPathBlocked = conversationPathsBlockSync(
                 codexConfigured,
                 conversationPathAudit,
@@ -691,10 +725,6 @@ export default function ProjectLinksWorkspace({
                 : !profilesReadable && projectBinding
                   ? "The selected agent profile is unavailable"
                   : null;
-              const conversationPathRepairable = codexConfigured
-                && !conversationPathAuditLoading
-                && !conversationPathAuditError
-                && !!conversationPathAudit?.can_repair;
               const conversationPathNotice = codexConfigured && !conversationPathAuditLoading ? (
                 <ConversationPathRepairNotice
                   audit={conversationPathAudit}
@@ -718,82 +748,48 @@ export default function ProjectLinksWorkspace({
                 >
                   <div className="profile-link-connections">
                     <section
-                      className={`project-profile-group storage-link-provider-${displayedProvider}`}
-                      aria-label={`${providerLabel(displayedProvider)} agent home`}
+                      className="project-profile-group project-storage-group"
+                      aria-label={`${projectLabel(project)} storage`}
                     >
-                      <header className="project-profile-group-header">
-                        <span className="project-profile-group-icon">
-                          <Icon name="terminal" size={17} />
-                        </span>
-                        <span className="project-profile-group-copy">
-                          <strong className={projectProfile && profilesReadable ? undefined : "warning"}>
-                            {hasMultipleProviders
-                              ? "Choose one agent"
-                              : projectProfile?.display_name ?? "No agent configured"}
-                          </strong>
-                          <span className="project-profile-group-path" title={projectProfile?.path}>
-                            {hasMultipleProviders
-                              ? <span>Codex and Claude are both assigned</span>
-                              : projectProfile
-                                ? (
-                                  <>
-                                    <Icon name="folder" size={11} />
-                                    <span>{compactProjectPath(projectProfile.path)}{profilesReadable ? "" : " · Unavailable"}</span>
-                                  </>
-                                )
-                                : <span>Choose a Codex or Claude profile</span>}
-                          </span>
-                        </span>
-                        {conversationPathRepairable && conversationPathNotice}
-                        {projectBinding && (
-                          <span
-                            className="project-profile-group-lock"
-                            title="Agent home is fixed after project setup"
-                            aria-label="Agent home is fixed after project setup"
-                          >
-                            <Icon name="lock" size={15} />
-                          </span>
-                        )}
-                      </header>
+                      {conversationPathNoticeBlocked && conversationPathNotice}
 
-                      {!conversationPathRepairable && conversationPathNotice}
-
-                    <div
-                      className="project-profile-storage-heading"
-                      aria-label={`${projectLinks.length} linked storage location${projectLinks.length === 1 ? "" : "s"}`}
-                    >
-                      <Icon name="link" size={12} className="project-profile-storage-icon" />
-                      <span>Storage</span>
-                      <small>{projectLinks.length}</small>
-                      <span className="project-profile-storage-actions">
-                        {availableStorages.length > 0 && (
+                      <div
+                        className="project-profile-storage-heading"
+                        aria-label={`${projectLinks.length} linked storage location${projectLinks.length === 1 ? "" : "s"}`}
+                      >
+                        <Icon name="link" size={14} className="project-profile-storage-icon" />
+                        <span>Storage</span>
+                        <small>{projectLinks.length}</small>
+                        {!conversationPathNoticeBlocked && conversationPathNotice}
+                        <span className="project-profile-storage-actions">
+                          {availableStorages.length > 0 && (
+                            <button
+                              type="button"
+                              className={`profile-link-another${linkingProjectId === project.local_project_id ? " active" : ""}`}
+                              disabled={busy}
+                              aria-expanded={linkingProjectId === project.local_project_id}
+                              onClick={() => {
+                                setLinkingProjectId((current) => current === project.local_project_id ? null : project.local_project_id);
+                              }}
+                            >
+                              <Icon name="link" size={13} />
+                              Link storage
+                            </button>
+                          )}
                           <button
                             type="button"
-                            className={`profile-link-another${linkingProjectId === project.local_project_id ? " active" : ""}`}
+                            className="profile-link-another"
                             disabled={busy}
-                            aria-expanded={linkingProjectId === project.local_project_id}
                             onClick={() => {
-                              setLinkingProjectId((current) => current === project.local_project_id ? null : project.local_project_id);
+                              setLinkingProjectId(null);
+                              onOpenStorageSettings();
                             }}
                           >
-                            <Icon name="link" size={13} />
-                            Link storage
+                            <Icon name="plus" size={14} />
+                            Add storage
                           </button>
-                        )}
-                        <button
-                          type="button"
-                          className="profile-link-another"
-                          disabled={busy}
-                          onClick={() => {
-                            setLinkingProjectId(null);
-                            onOpenStorageSettings();
-                          }}
-                        >
-                          <Icon name="plus" size={14} />
-                          Add storage
-                        </button>
-                      </span>
-                    </div>
+                        </span>
+                      </div>
                     {projectLinks.length === 0 && <div className="profile-link-no-storage">No storage linked yet.</div>}
 
                     <div className="project-profile-storage-list">
@@ -803,12 +799,24 @@ export default function ProjectLinksWorkspace({
                       const reviewOpen = inlineStorageReview?.projectId === project.local_project_id
                         && inlineStorageReview.storageId === storage.id;
                       const actionPrefix = `${project.local_project_id}:${storage.id}`;
+                      const selectedForComparison = project.local_project_id === activeProjectId
+                        && storage.id === activeStorageId;
 
                       return (
-                        <div key={storage.id} className={`storage-link-block${reviewOpen ? " v3-review-open" : ""}`}>
+                        <div key={storage.id} className={`storage-link-block${reviewOpen ? " v3-review-open" : ""}${selectedForComparison ? " selected" : ""}`}>
                           <div className="storage-link-row">
                             <div className="storage-link-storage-section">
-                              <div className="storage-link-main">
+                              <label className="storage-link-main" title={`Compare threads with ${storage.name || "this storage"}`}>
+                                <input
+                                  className="storage-link-selector-input"
+                                  type="radio"
+                                  name={`comparison-storage-${project.local_project_id}`}
+                                  checked={selectedForComparison}
+                                  disabled={busy || !!runningAction}
+                                  onChange={() => void onSelectStorage(project.local_project_id, storage.id)}
+                                  aria-label={`Compare threads with ${storage.name || "this storage"}`}
+                                />
+                                <span className="storage-link-selector" aria-hidden="true"><span /></span>
                                 <span className="storage-link-icon">
                                   <Icon name={storage.kind === "local" ? "drive" : "cloud"} size={23} />
                                 </span>
@@ -816,7 +824,7 @@ export default function ProjectLinksWorkspace({
                                   <strong>{storage.name || "(unnamed)"}</strong>
                                   <span title={storageSubtitle(storage)}>{storageSubtitle(storage)}</span>
                                 </span>
-                              </div>
+                              </label>
                               <div className="storage-link-row-controls">
                                 <button
                                   type="button"
@@ -937,6 +945,8 @@ export default function ProjectLinksWorkspace({
             binding={bindingByProject.get(activeProject.local_project_id) ?? null}
             refreshEpoch={historyRefreshEpoch}
             onOpenProjectSettings={() => void openProjectSettings(activeProject.local_project_id)}
+            activeStorageId={activeStorageId}
+            activeStorageName={storages.find((storage) => storage.id === activeStorageId)?.name ?? null}
           />
         )}
       </section>
