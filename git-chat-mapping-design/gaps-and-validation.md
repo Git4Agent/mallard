@@ -8,7 +8,7 @@
 - Recorded SHA is context only and never proves authorship or controls attachment.
 - First-parent history is intentionally not the full Git DAG. Rebases, amended/cherry-picked commits, shallow clones, deleted branches, clock skew, and active sessions can alter or remove temporal relationships.
 - Commit correlation remains bounded to the newest 10,000 first-parent commits to prevent an unbounded Git subprocess result. Rollout files and session counts themselves are not capped.
-- A single JSONL record over 1 MiB is skipped so corrupted input cannot allocate without bound; the rest of that session is still streamed and marked partial.
+- JSONL records over 1 MiB leave the bounded fast path and are selectively streamed for metadata and visible text while image data and other large irrelevant fields are discarded. Malformed oversized records are skipped, mark the session partial, and produce one diagnostic per rollout scan.
 - The session index still has a defensive 16 MiB cap. It affects preferred titles only, not rollout discovery, dates, metrics, details, or pagination.
 - Token totals are maximum Codex-reported cumulative usage, not billing estimates.
 - Restored sessions may be visible before Codex rebuilds its own index.
@@ -20,6 +20,18 @@
 - macOS is the only implemented automated launch platform.
 - The Superdesign CLI was validated at version 0.6.0 but was not authenticated. An interactive `superdesign login` is required before generating the one approved remote export. `assets/` intentionally contains no fabricated design.
 - Manual Tauri verification is still required for real long rollouts, a profile path/project path containing quotes and spaces, both themes, launch actions, shallow/worktree repositories, and a Pull-restored task.
+
+## Oversized-record recovery validation
+
+Automated coverage demonstrates that:
+
+- an oversized User record containing small input text plus a multi-megabyte image returns the text without retaining the image;
+- an oversized assistant record returns eligible Codex output text while ignoring image or attachment data;
+- oversized compaction snapshots and tool-output bodies create no visible turns or warnings;
+- oversized tool calls still contribute their counter without retaining arguments;
+- a malformed oversized record produces one deduplicated warning, marks metrics partial, and does not hide later valid messages;
+- recovered turns preserve chronological pagination, stable ordinals, duplicate suppression, and the 240-character preview cap; and
+- the ordinary line buffer remains bounded to 1 MiB while ignored oversized strings are streamed without allocation proportional to their payload size.
 
 ## Automated evidence
 
@@ -40,7 +52,7 @@ Frontend integration coverage includes alias/repository presentation, project/pr
 Latest verified during implementation:
 
 - `npm run test:frontend-integration` — 6/6 passed.
-- focused `project_sync_v3::chat_history::tests` — 25/25 passed, including a rollout larger than 16 MiB, bounded oversized-line discard, timestamp precedence under partial parsing, injected-message filtering, duplicate rollout selection, and private cache persistence.
+- focused `project_sync_v3::chat_history::tests` — 29/29 passed, including oversized image-text recovery, silent compaction/tool-output projection, malformed-record warning deduplication, recovered-turn pagination, a rollout larger than 16 MiB, timestamp precedence under partial parsing, injected-message filtering, duplicate rollout selection, and private cache persistence.
 - schema-3 command integration tests — 28/28 passed, including successful/failed Pull timestamp semantics.
 - frontend integration tests — 6/6 passed.
 - `cd src-tauri && cargo check` — passed.

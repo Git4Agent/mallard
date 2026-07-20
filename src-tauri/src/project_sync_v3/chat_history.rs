@@ -6,11 +6,12 @@
 
 use super::domain::{BindingState, LocalProjectId, MaterializationStatus, Provider};
 use super::persistence::{read_json_bounded, write_json_atomic, V3Repository};
-use serde::{Deserialize, Serialize};
+use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,7 +27,7 @@ const AFTER_SESSION_WINDOW_SECS: u64 = 24 * 60 * 60;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const DEFAULT_HISTORY_WINDOW_DAYS: u64 = 30;
 const DAY_SECS: u64 = 24 * 60 * 60;
-const CHAT_CACHE_SCHEMA: u32 = 1;
+const CHAT_CACHE_SCHEMA: u32 = 2;
 const MAX_CHAT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CHAT_CACHE_ENTRIES: usize = 50_000;
 
@@ -884,17 +885,32 @@ fn parse_rollout_file(
     let mut reader = BufReader::new(file);
     let mut parser = RolloutParser::new(fallback_time);
     let mut bytes = Vec::new();
+    let mut malformed_oversized_warned = false;
     loop {
+        let record_start = reader
+            .stream_position()
+            .map_err(|error| format!("read '{}': {error}", path.display()))?;
         match read_bounded_line(&mut reader, &mut bytes, MAX_LINE_BYTES)
             .map_err(|error| format!("read '{}': {error}", path.display()))?
         {
             BoundedLine::Eof => break,
             BoundedLine::Oversized => {
-                parser.metrics_complete = false;
-                warnings.push(format!(
-                    "Ignored oversized JSONL line in '{}'",
-                    path.display()
-                ));
+                let record_end = reader
+                    .stream_position()
+                    .map_err(|error| format!("read '{}': {error}", path.display()))?;
+                match recover_oversized_record(&mut reader, record_start, record_end) {
+                    Ok(value) => parser.consume(&value),
+                    Err(error) => {
+                        parser.metrics_complete = false;
+                        if !malformed_oversized_warned {
+                            warnings.push(format!(
+                                "Ignored malformed oversized JSONL record in '{}': {error}",
+                                path.display()
+                            ));
+                            malformed_oversized_warned = true;
+                        }
+                    }
+                }
                 continue;
             }
             BoundedLine::Line => {}
@@ -1187,14 +1203,22 @@ fn parse_thread_detail_file(
     let mut has_more = false;
     let mut previous: Option<(ChatTurnRole, String, Option<u64>)> = None;
     loop {
-        match read_bounded_line(&mut reader, &mut bytes, MAX_LINE_BYTES)
+        let record_start = reader
+            .stream_position()
+            .map_err(|error| format!("read '{}': {error}", path.display()))?;
+        let value = match read_bounded_line(&mut reader, &mut bytes, MAX_LINE_BYTES)
             .map_err(|error| format!("read '{}': {error}", path.display()))?
         {
             BoundedLine::Eof => break,
-            BoundedLine::Oversized => continue,
-            BoundedLine::Line => {}
-        }
-        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            BoundedLine::Oversized => {
+                let record_end = reader
+                    .stream_position()
+                    .map_err(|error| format!("read '{}': {error}", path.display()))?;
+                recover_oversized_record(&mut reader, record_start, record_end).ok()
+            }
+            BoundedLine::Line => serde_json::from_slice::<Value>(&bytes).ok(),
+        };
+        let Some(value) = value else {
             continue;
         };
         let Some((role, preview, timestamp)) = visible_chat_message(&value) else {
@@ -1253,6 +1277,189 @@ fn extract_text(value: &Value) -> Option<String> {
             .or_else(|| object.get("content").and_then(extract_text)),
         _ => None,
     }
+}
+
+// Oversized rollouts commonly contain base64 images, compaction snapshots, or
+// tool output. This projection keeps only fields used by history/details;
+// serde consumes unknown values through IgnoredAny without retaining them.
+#[derive(Default, Serialize)]
+#[serde(transparent)]
+struct ProjectedText(String);
+
+impl<'de> Deserialize<'de> for ProjectedText {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ProjectedTextVisitor;
+
+        impl<'de> Visitor<'de> for ProjectedTextVisitor {
+            type Value = ProjectedText;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("text or a nested message-content value")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+                Ok(ProjectedText(value.to_string()))
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+                Ok(ProjectedText(value))
+            }
+
+            fn visit_none<E>(self) -> Result<Self::Value, E> {
+                Ok(ProjectedText::default())
+            }
+
+            fn visit_unit<E>(self) -> Result<Self::Value, E> {
+                Ok(ProjectedText::default())
+            }
+
+            fn visit_bool<E>(self, _value: bool) -> Result<Self::Value, E> {
+                Ok(ProjectedText::default())
+            }
+
+            fn visit_i64<E>(self, _value: i64) -> Result<Self::Value, E> {
+                Ok(ProjectedText::default())
+            }
+
+            fn visit_u64<E>(self, _value: u64) -> Result<Self::Value, E> {
+                Ok(ProjectedText::default())
+            }
+
+            fn visit_f64<E>(self, _value: f64) -> Result<Self::Value, E> {
+                Ok(ProjectedText::default())
+            }
+
+            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut parts = Vec::new();
+                while let Some(ProjectedText(text)) = sequence.next_element::<ProjectedText>()? {
+                    if !text.is_empty() {
+                        parts.push(text);
+                    }
+                }
+                Ok(ProjectedText(parts.join(" ")))
+            }
+
+            fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                let mut parts = Vec::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if matches!(key.as_str(), "text" | "content" | "message") {
+                        let ProjectedText(text) = map.next_value::<ProjectedText>()?;
+                        if !text.is_empty() {
+                            parts.push(text);
+                        }
+                    } else {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+                Ok(ProjectedText(parts.join(" ")))
+            }
+        }
+
+        deserializer.deserialize_any(ProjectedTextVisitor)
+    }
+}
+
+#[derive(Deserialize, Serialize)]
+struct ProjectedGit {
+    #[serde(default, alias = "git_branch", skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    #[serde(
+        default,
+        alias = "commit",
+        alias = "sha",
+        alias = "git_commit",
+        skip_serializing_if = "Option::is_none"
+    )]
+    commit_hash: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ProjectedTokenUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_tokens: Option<u64>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ProjectedInfo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    total_token_usage: Option<ProjectedTokenUsage>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ProjectedRecord {
+    #[serde(
+        default,
+        alias = "created_at",
+        alias = "started_at",
+        skip_serializing_if = "Option::is_none"
+    )]
+    timestamp: Option<Value>,
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    record_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    role: Option<String>,
+    #[serde(
+        default,
+        alias = "thread_id",
+        alias = "session_id",
+        skip_serializing_if = "Option::is_none"
+    )]
+    id: Option<String>,
+    #[serde(
+        default,
+        alias = "working_directory",
+        alias = "project_path",
+        skip_serializing_if = "Option::is_none"
+    )]
+    cwd: Option<String>,
+    #[serde(default, alias = "git_branch", skip_serializing_if = "Option::is_none")]
+    branch: Option<String>,
+    #[serde(
+        default,
+        alias = "git_commit",
+        alias = "commit_hash",
+        skip_serializing_if = "Option::is_none"
+    )]
+    commit_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<ProjectedText>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    text: Option<ProjectedText>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    content: Option<ProjectedText>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git: Option<ProjectedGit>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    info: Option<ProjectedInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload: Option<Box<ProjectedRecord>>,
+}
+
+fn recover_oversized_record(
+    reader: &mut BufReader<File>,
+    record_start: u64,
+    record_end: u64,
+) -> Result<Value, String> {
+    reader
+        .seek(SeekFrom::Start(record_start))
+        .map_err(|error| error.to_string())?;
+    let parsed = {
+        let limited = Read::by_ref(reader).take(record_end.saturating_sub(record_start));
+        serde_json::from_reader::<_, ProjectedRecord>(limited).map_err(|error| error.to_string())
+    };
+    reader
+        .seek(SeekFrom::Start(record_end))
+        .map_err(|error| error.to_string())?;
+    serde_json::to_value(parsed?).map_err(|error| error.to_string())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2102,6 +2309,130 @@ mod tests {
     }
 
     #[test]
+    fn oversized_image_records_recover_visible_user_and_assistant_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("image-rollout.jsonl");
+        let image = "a".repeat(MAX_LINE_BYTES + 1);
+        let lines = [
+            json!({"timestamp":100,"type":"session_meta","payload":{"id":"019f742a-a206-7932-876c-9db8d8ce575a","cwd":"/tmp/project"}}),
+            json!({"timestamp":101,"type":"event_msg","payload":{"type":"user_message","message":[{"type":"input_text","text":"Visible user request"},{"type":"input_image","image_url":image}]}}),
+            json!({"timestamp":102,"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Visible Codex response"},{"type":"output_image","image_url":image}]}}),
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let mut reader = BufReader::new(File::open(&path).unwrap());
+        let mut bytes = Vec::new();
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut bytes, MAX_LINE_BYTES).unwrap(),
+            BoundedLine::Line
+        );
+        let record_start = reader.stream_position().unwrap();
+        assert_eq!(
+            read_bounded_line(&mut reader, &mut bytes, MAX_LINE_BYTES).unwrap(),
+            BoundedLine::Oversized
+        );
+        let record_end = reader.stream_position().unwrap();
+        let projection = recover_oversized_record(&mut reader, record_start, record_end).unwrap();
+        let projected_bytes = serde_json::to_vec(&projection).unwrap();
+        assert!(projected_bytes.len() < 1_024);
+        assert!(!projected_bytes
+            .windows(9)
+            .any(|bytes| bytes == b"image_url"));
+
+        let mut warnings = Vec::new();
+        let parsed = parse_rollout_file(&path, 1, &mut warnings).unwrap();
+        assert_eq!(parsed.thread.summary, "Visible user request");
+        assert_eq!(parsed.thread.user_round_count, 1);
+        assert!(parsed.thread.metrics_complete);
+        assert!(warnings.is_empty());
+
+        let first_page = parse_thread_detail_file(&path, None, 1).unwrap();
+        assert_eq!(first_page.turns.len(), 1);
+        assert_eq!(first_page.turns[0].ordinal, 0);
+        assert_eq!(first_page.turns[0].preview, "Visible user request");
+        assert_eq!(first_page.next_cursor, Some(1));
+
+        let second_page = parse_thread_detail_file(&path, Some(1), 1).unwrap();
+        assert_eq!(second_page.turns.len(), 1);
+        assert_eq!(second_page.turns[0].ordinal, 1);
+        assert_eq!(second_page.turns[0].preview, "Visible Codex response");
+        assert_eq!(second_page.next_cursor, None);
+    }
+
+    #[test]
+    fn malformed_oversized_records_warn_once_and_continue() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("malformed-oversized-rollout.jsonl");
+        let malformed = format!(
+            "{{\"timestamp\":101,\"payload\":{}",
+            "x".repeat(MAX_LINE_BYTES + 1)
+        );
+        fs::write(
+            &path,
+            format!(
+                "{}\n{malformed}\n{malformed}\n{}\n",
+                json!({"timestamp":100,"type":"session_meta","payload":{"id":"019f742a-a206-7932-876c-9db8d8ce575a","cwd":"/tmp/project"}}),
+                json!({"timestamp":103,"type":"event_msg","payload":{"type":"agent_message","message":"Later valid response"}}),
+            ),
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let parsed = parse_rollout_file(&path, 1, &mut warnings).unwrap();
+        assert_eq!(parsed.thread.ended_at, 103);
+        assert_eq!(parsed.thread.agent_message_count, 1);
+        assert!(!parsed.thread.metrics_complete);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("malformed oversized JSONL record"));
+    }
+
+    #[test]
+    fn oversized_irrelevant_bodies_are_silent_but_keep_metrics() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("oversized-metrics-rollout.jsonl");
+        let large = "x".repeat(MAX_LINE_BYTES + 1);
+        let lines = [
+            json!({"timestamp":100,"type":"session_meta","payload":{"id":"019f742a-a206-7932-876c-9db8d8ce575a","cwd":"/tmp/project"}}),
+            json!({"timestamp":101,"type":"compacted","replacement_history":large}),
+            json!({"timestamp":102,"type":"response_item","payload":{"type":"custom_tool_call","name":"large_tool","arguments":large}}),
+            json!({"timestamp":103,"type":"response_item","payload":{"type":"custom_tool_call_output","output":large}}),
+            json!({"timestamp":104,"type":"event_msg","payload":{"type":"token_count","padding":large,"info":{"total_token_usage":{"total_tokens":42}}}}),
+            json!({"timestamp":105,"type":"event_msg","payload":{"type":"agent_message","message":"Done"}}),
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+
+        let mut warnings = Vec::new();
+        let parsed = parse_rollout_file(&path, 1, &mut warnings).unwrap();
+        assert_eq!(parsed.thread.ended_at, 105);
+        assert_eq!(parsed.thread.tool_call_count, 1);
+        assert_eq!(parsed.thread.total_tokens, Some(42));
+        assert!(parsed.thread.metrics_complete);
+        assert!(warnings.is_empty());
+
+        let details = parse_thread_detail_file(&path, None, 50).unwrap();
+        assert_eq!(details.turns.len(), 1);
+        assert_eq!(details.turns[0].preview, "Done");
+    }
+
+    #[test]
     fn session_windows_are_start_inclusive_and_end_exclusive() {
         assert!(thread_in_window(&thread("start", 1, 100), 100, 200));
         assert!(thread_in_window(&thread("inside", 1, 199), 100, 200));
@@ -2166,6 +2497,11 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    #[test]
+    fn chat_cache_schema_invalidates_pre_recovery_entries() {
+        assert_eq!(CHAT_CACHE_SCHEMA, 2);
     }
 
     #[test]
