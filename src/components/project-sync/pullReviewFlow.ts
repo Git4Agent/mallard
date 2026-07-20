@@ -12,8 +12,8 @@ import { errorMessage } from "./model";
 export interface PullReviewApi {
   fetchBundle: (storageId: string, bundleId: string) => Promise<BundleSnapshotSummary>;
   planRestore: (storageId: string, bundleId: string, binding: ProjectBinding) => Promise<RestorePlan>;
-  planDependencies: (bundleId: string, binding: ProjectBinding) => Promise<DependencyPlan>;
-  getReadiness: (bundleId: string, binding: ProjectBinding) => Promise<BundleReadiness>;
+  planDependencies: (restorePlanId: string) => Promise<DependencyPlan>;
+  getRestoreReadiness: (restorePlanId: string) => Promise<BundleReadiness>;
 }
 
 export interface PullReviewRequest {
@@ -44,7 +44,7 @@ export interface PullReviewSelection {
 export interface PullReviewApplyApi {
   applyRestore: (planId: string, actionIds: string[]) => Promise<RestoreResult>;
   applyDependencies: (planId: string, actionIds: string[]) => Promise<DependencyResult>;
-  getReadiness: (bundleId: string, binding: ProjectBinding) => Promise<BundleReadiness>;
+  getRestoreReadiness: (restorePlanId: string) => Promise<BundleReadiness>;
 }
 
 export interface PullReviewApplyResult {
@@ -97,7 +97,6 @@ export async function applyPullReview(
   api: PullReviewApplyApi,
   restorePlan: RestorePlan,
   dependencyPlan: DependencyPlan | null,
-  binding: ProjectBinding,
   selection: PullReviewSelection,
   onPhase: (phase: PullApplyPhase) => void,
 ): Promise<PullReviewApplyResult> {
@@ -133,7 +132,7 @@ export async function applyPullReview(
 
   onPhase("verifying");
   try {
-    readiness = await api.getReadiness(restorePlan.bundle_id, binding);
+    readiness = await api.getRestoreReadiness(restorePlan.plan_id);
   } catch (reason) {
     const verificationError = `Readiness verification failed: ${errorMessage(reason)}`;
     executionError = executionError ? `${executionError} ${verificationError}` : verificationError;
@@ -166,7 +165,7 @@ export async function beginPullReview(
   const restorePlan = await preparePullReview(api, request);
   return {
     restorePlan,
-    support: loadPullReviewSupport(api, request),
+    support: loadPullReviewSupport(api, restorePlan),
   };
 }
 
@@ -186,11 +185,11 @@ export async function preparePullReview(
 /** Load non-blocking context shown alongside an already-visible review. */
 export async function loadPullReviewSupport(
   api: PullReviewApi,
-  request: Pick<PullReviewRequest, "bundleId" | "binding">,
+  restorePlan: RestorePlan,
 ): Promise<PullReviewSupport> {
   const [dependencies, readiness] = await Promise.allSettled([
-    api.planDependencies(request.bundleId, request.binding),
-    api.getReadiness(request.bundleId, request.binding),
+    api.planDependencies(restorePlan.plan_id),
+    api.getRestoreReadiness(restorePlan.plan_id),
   ]);
   const errors: string[] = [];
   if (dependencies.status === "rejected") {

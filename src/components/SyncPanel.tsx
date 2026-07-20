@@ -453,7 +453,7 @@ function StorageEditor({
               type="text"
               value={storage.local_dir ?? ""}
               onChange={(e) => set({ local_dir: e.target.value })}
-              placeholder="/Volumes/backup/agent-sync"
+              placeholder="/Volumes/backup/mallard"
               spellCheck={false}
               autoComplete="off"
             />
@@ -491,7 +491,7 @@ function StorageEditor({
                 type="text"
                 value={storage.account_id ?? ""}
                 onChange={(e) => handleAccountIdChange(e.target.value)}
-                placeholder="9cc0c910ec34cb9a7d…"
+                placeholder="023e105f4ecef8ad9ca31a8372d0c353"
                 spellCheck={false}
                 autoComplete="off"
               />

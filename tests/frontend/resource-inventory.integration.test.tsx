@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
+import PushResourceWorkspace from "../../src/components/project-sync/PushResourceWorkspace";
 import ResourceInventory from "../../src/components/project-sync/ResourceInventory";
 import type { ProjectResourceDescriptor } from "../../src/types";
 
@@ -91,4 +92,28 @@ test("duplicate effective-name claims remain unselectable", () => {
   assert.equal((html.match(/v3-resource-row blocked/g) ?? []).length, 2);
   const disabledInputs = html.match(/<input[^>]*disabled=""[^>]*>/g) ?? [];
   assert.equal(disabledInputs.length, 2);
+});
+
+test("the push chooser shows one concise selection summary", () => {
+  const resource = standaloneSkill("review", "review");
+  const html = renderToStaticMarkup(
+    <PushResourceWorkspace
+      resources={[resource]}
+      selected={new Set([resource.resource_id])}
+      projectDefaults={new Set([resource.resource_id])}
+      busy={false}
+      error={null}
+      onToggle={() => undefined}
+      onUseProjectDefaults={() => undefined}
+      onClear={() => undefined}
+      onClose={() => undefined}
+      onPush={() => undefined}
+    />,
+  );
+
+  assert.match(html, />Push resources</);
+  assert.match(html, />Defaults \(1\)</);
+  assert.match(html, />Push 1 resource</);
+  assert.doesNotMatch(html, /Choose resources to push/);
+  assert.doesNotMatch(html, /last selection|selection will be remembered|resource selected/i);
 });

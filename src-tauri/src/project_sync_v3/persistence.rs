@@ -236,7 +236,9 @@ impl V3Repository {
         for draft in loaded {
             match draft.validate() {
                 Ok(()) => drafts.push(draft),
-                Err(error) => warnings.push(format!("invalid draft '{}': {}", draft.draft_id, error)),
+                Err(error) => {
+                    warnings.push(format!("invalid draft '{}': {}", draft.draft_id, error))
+                }
             }
         }
         drafts.sort_by(|left, right| {
@@ -273,7 +275,10 @@ impl V3Repository {
     /// Revision-guarded draft save.  Creation submits revision 0 against a
     /// missing file; updates must submit the revision they read.  The stored
     /// document gets the next revision, which is also returned.
-    pub fn save_setup_draft(&self, mut draft: ProjectSetupDraft) -> Result<ProjectSetupDraft, String> {
+    pub fn save_setup_draft(
+        &self,
+        mut draft: ProjectSetupDraft,
+    ) -> Result<ProjectSetupDraft, String> {
         let _guard = persistence_guard()?;
         let path = self.setup_draft_path(&draft.draft_id);
         let current: Option<ProjectSetupDraft> =
@@ -291,11 +296,10 @@ impl V3Repository {
                 if draft.revision != 0 {
                     return Err("new setup draft must start at revision 0".to_string());
                 }
-                let (existing, _) =
-                    self.list_documents::<ProjectSetupDraft>(
-                        &self.root.join("project_drafts"),
-                        MAX_SETUP_DRAFT_BYTES,
-                    )?;
+                let (existing, _) = self.list_documents::<ProjectSetupDraft>(
+                    &self.root.join("project_drafts"),
+                    MAX_SETUP_DRAFT_BYTES,
+                )?;
                 if existing.len() >= MAX_SETUP_DRAFTS {
                     return Err(format!(
                         "too many setup drafts (limit {}); discard one first",
@@ -395,13 +399,9 @@ impl V3Repository {
         max_bytes: u64,
     ) -> Result<(Vec<T>, Vec<String>), String> {
         match fs::symlink_metadata(directory) {
-            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => {
-                return Err(format!(
-                    "'{}' is not a real directory",
-                    directory.display()
-                ))
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
             }
+            Ok(_) => return Err(format!("'{}' is not a real directory", directory.display())),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Ok((Vec::new(), Vec::new()))
             }

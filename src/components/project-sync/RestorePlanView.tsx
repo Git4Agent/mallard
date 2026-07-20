@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 import type {
   BundleReadiness,
   DependencyPlan,
@@ -38,6 +38,7 @@ interface Props {
   failedResourceIds: ReadonlySet<string>;
   busy: boolean;
   error: string | null;
+  embedded?: boolean;
   onApply: (selection: PullReviewSelection) => void;
   onRefresh: () => void;
   onBack: () => void;
@@ -141,6 +142,14 @@ function ItemList({
   disabled: boolean;
   onToggle: (resourceId: string) => void;
 }) {
+  const [expandedItems, setExpandedItems] = useState<Set<string>>(() => new Set());
+  const toggleDetails = (resourceId: string) => setExpandedItems((current) => {
+    const next = new Set(current);
+    if (next.has(resourceId)) next.delete(resourceId);
+    else next.add(resourceId);
+    return next;
+  });
+
   return (
     <div className="v3-pull-items" role="list">
       {items.map((item) => {
@@ -155,9 +164,10 @@ function ItemList({
           supportLoading;
         const blocked = pending.length === 0 || completed || waitingForInstaller;
         const checked = selected.has(item.resourceId) && !completed;
+        const expanded = expandedItems.has(item.resourceId);
         const activeRestore = phase === "restoring" && checked && restoreActionIds(item).some((id) => !completedActionIds.has(id));
         const activeInstall = phase === "installing" && checked && dependencyActionIds(item).some((id) => !completedActionIds.has(id));
-        const status = item.category === "global_tool"
+        const status: string | null = item.category === "global_tool"
           ? completed
             ? "Installed"
             : failed
@@ -165,7 +175,7 @@ function ItemList({
               : activeRestore || activeInstall
                 ? "Installing"
                 : checked || waitingForInstaller
-                  ? "Waiting to install"
+                  ? null
                   : "Needs approval"
           : completed
             ? "Restored"
@@ -175,7 +185,9 @@ function ItemList({
                 ? "Restoring"
                 : requiresApproval(item) && !checked
                   ? "Needs approval"
-                  : "Ready";
+                  : checked
+                    ? null
+                    : "Not selected";
         return (
           <div
             key={item.resourceId}
@@ -191,28 +203,43 @@ function ItemList({
                 onChange={() => onToggle(item.resourceId)}
               />
             </label>
-            <span className="v3-pull-item-icon">
-              <Icon
-                name={failed ? "alert-triangle" : completed ? "check-circle" : item.toolKind === "plugin" ? "download" : "file"}
-                size={17}
-              />
-            </span>
-            <span className="v3-pull-item-copy">
-              <strong>{item.title}</strong>
-              <small>{itemKindLabel(item)}{item.provider ? ` · ${providerLabel(item.provider)}` : ""}</small>
-              <span>{item.detail}</span>
-            </span>
-            <span className={`v3-pull-item-status ${status.toLowerCase().replace(/\s+/g, "-")}`}>{status}</span>
-            <details className="v3-pull-item-details">
-              <summary>Details</summary>
-              <span><strong>Resource ID</strong><code>{item.resourceId}</code></span>
-              {item.restoreActions.map((action) => (
-                <span key={action.action_id}><strong>Restore action</strong><code>{action.action_id}</code></span>
-              ))}
-              {item.dependencyActions.map((action) => (
-                <span key={action.action_id}><strong>Native action</strong><code>{action.action_id}</code></span>
-              ))}
-            </details>
+            <button
+              type="button"
+              className="v3-pull-item-main"
+              onClick={() => toggleDetails(item.resourceId)}
+              aria-expanded={expanded}
+              aria-label={`${expanded ? "Hide" : "Show"} details for ${item.title}`}
+            >
+              <span className="v3-pull-item-toggle">
+                <Icon name={expanded ? "chevron-down" : "chevron-right"} size={12} />
+              </span>
+              <span className="v3-pull-item-icon">
+                <Icon
+                  name={failed ? "alert-triangle" : completed ? "check-circle" : item.toolKind === "plugin" ? "download" : item.toolKind === "custom_skill" ? "folder" : "file"}
+                  size={14}
+                />
+              </span>
+              <span className="v3-pull-item-copy">
+                <strong>{item.title}</strong>
+                <span>{itemKindLabel(item)}{item.provider ? ` · ${providerLabel(item.provider)}` : ""}</span>
+              </span>
+              {status && <span className={`v3-pull-item-status ${status.toLowerCase().replace(/\s+/g, "-")}`}>{status}</span>}
+            </button>
+            {expanded && (
+              <div className="v3-pull-item-detail">
+                <p>{item.detail}</p>
+                <div className="v3-pull-item-detail-grid">
+                  <span>Type</span><code>{itemKindLabel(item)}{item.provider ? ` · ${providerLabel(item.provider)}` : ""}</code>
+                  <span>Resource</span><code>{item.resourceId}</code>
+                  {item.restoreActions.map((action) => (
+                    <Fragment key={action.action_id}><span>Restore</span><code>{action.action_id}</code></Fragment>
+                  ))}
+                  {item.dependencyActions.map((action) => (
+                    <Fragment key={action.action_id}><span>Installer</span><code>{action.action_id}</code></Fragment>
+                  ))}
+                </div>
+              </div>
+            )}
           </div>
         );
       })}
@@ -236,6 +263,7 @@ export default function RestorePlanView({
   failedResourceIds,
   busy,
   error,
+  embedded = false,
   onApply,
   onRefresh,
   onBack,
@@ -306,7 +334,7 @@ export default function RestorePlanView({
           ? `Apply ${selectedCount} remaining change${selectedCount === 1 ? "" : "s"}`
           : hasResult
             ? "Review complete"
-        : `Apply ${selectedCount} selected change${selectedCount === 1 ? "" : "s"}`;
+        : `Apply ${selectedCount} change${selectedCount === 1 ? "" : "s"}`;
 
   const toggle = (resourceId: string) => setSelected((current) => {
     const next = new Set(current);
@@ -323,25 +351,60 @@ export default function RestorePlanView({
     }
     return next;
   });
+  const clearItems = (chosen: PullReviewItem[]) => setSelected((current) => {
+    const next = new Set(current);
+    for (const item of chosen) next.delete(item.resourceId);
+    return next;
+  });
+  const pendingProjectItems = projectItems.filter((item) => (
+    pendingIds(item, completedActionIds).length > 0 && !completedResourceIds.has(item.resourceId)
+  ));
+  const pendingGlobalItems = globalItems.filter((item) => (
+    pendingIds(item, completedActionIds).length > 0 && !completedResourceIds.has(item.resourceId)
+  ));
+  const allProjectItemsSelected = pendingProjectItems.length > 0 && pendingProjectItems.every((item) => selected.has(item.resourceId));
+  const allGlobalItemsSelected = pendingGlobalItems.length > 0 && pendingGlobalItems.every((item) => selected.has(item.resourceId));
+  const dependencyMessages = (dependencyPlan?.blockers?.length ?? 0) + (dependencyPlan?.warnings?.length ?? 0);
+
+  const ReviewContainer = embedded ? "section" : "main";
 
   return (
-    <main className="v3-main v3-pull-review-workspace" aria-labelledby="v3-pull-review-title">
-      <header className="v3-pull-review-header">
-        <button type="button" className="btn btn-ghost v3-pull-back" onClick={onBack} disabled={busy}>
-          <Icon name="chevron-left" size={15} /> Back to {projectName}
-        </button>
-        <span className="v3-eyebrow">Pull review · nothing changes until you apply</span>
-        <div className="v3-pull-review-heading">
+    <ReviewContainer
+      className={embedded ? "v3-inline-action-review v3-inline-pull-review" : "v3-main v3-pull-review-workspace"}
+      aria-labelledby="v3-pull-review-title"
+    >
+      <header className={embedded ? "v3-inline-action-header v3-inline-pull-header" : "v3-pull-review-header"}>
+        {!embedded && (
+          <button type="button" className="btn btn-ghost v3-pull-back" onClick={onBack} disabled={busy}>
+            <Icon name="chevron-left" size={15} /> Back to {projectName}
+          </button>
+        )}
+        <div className={embedded ? "v3-inline-action-heading" : "v3-pull-review-heading"}>
           <div>
-            <h1 id="v3-pull-review-title">Restore {projectName}</h1>
-            <p>{compactProjectPath(binding.project_root)}</p>
+            {embedded
+              ? <h2 id="v3-pull-review-title">Pull changes</h2>
+              : <h1 id="v3-pull-review-title">Restore {projectName}</h1>}
+            <p className="v3-pull-review-meta">
+              <span>{compactProjectPath(binding.project_root)}</span>
+              <span aria-hidden="true">·</span>
+              <span>Generation {plan.generation}</span>
+            </p>
           </div>
-          <span className="v3-pull-generation">Generation {plan.generation}</span>
         </div>
-        <p className="v3-pull-review-intro">Review project data and global tools together. Each resource appears once, and one Apply action runs every approved phase.</p>
+        {embedded && (
+          <button
+            type="button"
+            className="btn btn-ghost v3-inline-action-close"
+            onClick={onBack}
+            disabled={busy}
+            aria-label={`Close pull review for ${projectName}`}
+          >
+            <Icon name="x" size={15} />
+          </button>
+        )}
       </header>
 
-      <div className="v3-pull-review-content">
+      <div className={embedded ? "v3-pull-review-content v3-inline-action-content" : "v3-pull-review-content"}>
         {phase !== "idle" && (
           <PhaseProgress
             phase={phase}
@@ -366,59 +429,89 @@ export default function RestorePlanView({
           </section>
         )}
 
-        <section className="v3-pull-section" aria-labelledby="v3-pull-project-data">
-          <div className="v3-pull-section-heading">
-            <div>
-              <h2 id="v3-pull-project-data">Project data</h2>
-              <p>Conversations, files, and definitions. Existing targets are backed up before replacement.</p>
+        {projectItems.length > 0 && (
+          <section className="v3-pull-section" aria-labelledby="v3-pull-project-data">
+            <div className="v3-pull-section-heading">
+              <span className="v3-pull-section-icon"><Icon name="folder" size={16} /></span>
+              <div>
+                <h2 id="v3-pull-project-data">Project files</h2>
+                <p>Backups are created before existing files are replaced.</p>
+              </div>
+              {pendingProjectItems.length > 0 && (
+                <button
+                  type="button"
+                  className="btn btn-ghost v3-pull-group-action"
+                  disabled={busy || finalReady}
+                  onClick={() => allProjectItemsSelected ? clearItems(projectItems) : selectItems(projectItems)}
+                >
+                  {allProjectItemsSelected ? "Clear" : "Select all"}
+                </button>
+              )}
             </div>
-            <button type="button" className="btn btn-ghost" disabled={busy || finalReady} onClick={() => selectItems(projectItems)}>Select recommended</button>
-          </div>
-          <ItemList
-            items={projectItems}
-            selected={selected}
-            completedActionIds={completedActionIds}
-            completedResourceIds={completedResourceIds}
-            failedResourceIds={failedResourceIds}
-            phase={phase}
-            supportLoading={supportLoading}
-            disabled={busy || finalReady}
-            onToggle={toggle}
-          />
-          {projectItems.length === 0 && <div className="v3-inline-empty">No project data changes are needed.</div>}
-        </section>
+            <ItemList
+              items={projectItems}
+              selected={selected}
+              completedActionIds={completedActionIds}
+              completedResourceIds={completedResourceIds}
+              failedResourceIds={failedResourceIds}
+              phase={phase}
+              supportLoading={supportLoading}
+              disabled={busy || finalReady}
+              onToggle={toggle}
+            />
+          </section>
+        )}
 
-        <section className="v3-pull-section" aria-labelledby="v3-pull-global-tools">
-          <div className="v3-pull-section-heading">
-            <div>
-              <h2 id="v3-pull-global-tools">Global tools <span>· installs into {profileLabel}</span></h2>
-              <p>Custom skills restore from the bundle; plugins use the provider's native installer.</p>
+        {(supportLoading || globalItems.length > 0 || dependencyMessages > 0) && (
+          <section className="v3-pull-section" aria-labelledby="v3-pull-global-tools">
+            <div className="v3-pull-section-heading">
+              <span className="v3-pull-section-icon"><Icon name="folder" size={16} /></span>
+              <div>
+                <h2 id="v3-pull-global-tools">Tools</h2>
+                <p>Install into {profileLabel}</p>
+              </div>
+              {pendingGlobalItems.length > 0 && (
+                <button
+                  type="button"
+                  className="btn btn-ghost v3-pull-group-action"
+                  disabled={busy || finalReady || supportLoading}
+                  onClick={() => allGlobalItemsSelected ? clearItems(globalItems) : selectItems(globalItems)}
+                >
+                  {allGlobalItemsSelected ? "Clear" : "Select all"}
+                </button>
+              )}
             </div>
-            <button type="button" className="btn btn-ghost" disabled={busy || finalReady || supportLoading} onClick={() => selectItems(globalItems)}>Select recommended</button>
+            <ItemList
+              items={globalItems}
+              selected={selected}
+              completedActionIds={completedActionIds}
+              completedResourceIds={completedResourceIds}
+              failedResourceIds={failedResourceIds}
+              phase={phase}
+              supportLoading={supportLoading}
+              disabled={busy || finalReady}
+              onToggle={toggle}
+            />
+            {supportLoading && <div className="v3-pull-support-loading"><Icon name="refresh" className="icon-spin" size={14} /> Checking installers…</div>}
+            {(dependencyPlan?.blockers ?? []).map((blocker) => <div key={blocker} className="v3-callout error"><Icon name="alert-triangle" size={15} /> {blocker}</div>)}
+            {(dependencyPlan?.warnings ?? []).map((warning) => <div key={warning} className="v3-callout"><Icon name="alert-triangle" size={15} /> {warning}</div>)}
+          </section>
+        )}
+
+        {!supportLoading && items.length === 0 && (
+          <div className="v3-pull-empty">
+            <Icon name="check-circle" size={16} />
+            <span><strong>Nothing to pull</strong><small>This project already matches the selected generation.</small></span>
           </div>
-          <ItemList
-            items={globalItems}
-            selected={selected}
-            completedActionIds={completedActionIds}
-            completedResourceIds={completedResourceIds}
-            failedResourceIds={failedResourceIds}
-            phase={phase}
-            supportLoading={supportLoading}
-            disabled={busy || finalReady}
-            onToggle={toggle}
-          />
-          {supportLoading && <div className="v3-pull-support-loading"><Icon name="refresh" className="icon-spin" size={14} /> Checking native installers and readiness…</div>}
-          {!supportLoading && globalItems.length === 0 && <div className="v3-inline-empty">No global tools need to be installed.</div>}
-          {(dependencyPlan?.blockers ?? []).map((blocker) => <div key={blocker} className="v3-callout error"><Icon name="alert-triangle" size={15} /> {blocker}</div>)}
-          {(dependencyPlan?.warnings ?? []).map((warning) => <div key={warning} className="v3-callout"><Icon name="alert-triangle" size={15} /> {warning}</div>)}
-        </section>
+        )}
 
         {((readiness?.issues.length ?? 0) > 0 || (hasResult && !finalReady)) && (
           <section className="v3-pull-section" aria-labelledby="v3-pull-readiness">
             <div className="v3-pull-section-heading">
+              <span className="v3-pull-section-icon"><Icon name="check-circle" size={16} /></span>
               <div>
                 <h2 id="v3-pull-readiness">Readiness</h2>
-                <p>Items that may still require setup after the selected changes run.</p>
+                <p>{readiness?.issues.length ?? 0} check{readiness?.issues.length === 1 ? "" : "s"} may still need attention after pull.</p>
               </div>
               <button type="button" className="btn btn-ghost" onClick={onRefresh} disabled={busy}><Icon name="refresh" size={13} /> Recheck</button>
             </div>
@@ -444,10 +537,10 @@ export default function RestorePlanView({
         <ResultDetails restoreResult={restoreResult} dependencyResult={dependencyResult} />
       </div>
 
-      <footer className="v3-pull-apply-bar">
+      <footer className={embedded ? "v3-pull-apply-bar v3-inline-action-footer" : "v3-pull-apply-bar"}>
         <span>
-          <strong>{hasResult ? outcomeTitle : `${selectedCount} selected change${selectedCount === 1 ? "" : "s"}`}</strong>
-          <small>{hasResult ? "Review the result above or return to the project." : "Files, skills, plugins, then readiness verification."}</small>
+          <strong>{hasResult ? outcomeTitle : `${selectedCount} selected`}</strong>
+          <small>{hasResult ? "Review the result above or return to the project." : "Nothing changes until you apply."}</small>
         </span>
         <button
           type="button"
@@ -455,10 +548,10 @@ export default function RestorePlanView({
           disabled={busy || selectedCount === 0 || finalReady}
           onClick={() => onApply(selection)}
         >
-          <Icon name={busy ? "refresh" : "check-circle"} size={16} className={busy ? "icon-spin" : undefined} />
+          {busy && <Icon name="refresh" size={16} className="icon-spin" />}
           {buttonLabel}
         </button>
       </footer>
-    </main>
+    </ReviewContainer>
   );
 }

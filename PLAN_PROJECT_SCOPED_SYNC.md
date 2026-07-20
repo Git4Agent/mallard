@@ -54,8 +54,9 @@ Migration and compatibility are out of scope, as requested.
 1. Introduce local config schema **3** under a separate `app_data/v3/`
    namespace. Do not parse, overwrite, or convert schema 2 profiles, links,
    baselines, or selections.
-2. Introduce a versioned cloud namespace under `v3/bundles/`. Do not discover
-   old whole-profile heads as project bundles.
+2. Introduce the Mallard storage namespace under
+   `.mallard/v1/repositories/`, identified by `.mallard/_storage.json`. Do not
+   discover the former `v3/bundles/` namespace or old whole-profile heads.
 3. Leave old local and cloud data untouched. The new app ignores it; it does
    not delete it.
 4. Remove the `.codex | .claude` profile as the user-facing sync unit. A
@@ -691,14 +692,16 @@ Canonical project registrations may be nested. Without an ownership rule,
 Reuse the immutable-history design under a clean namespace:
 
 ```text
-v3/bundles/<bundle-id>/
-  _head.json
-  _tag.json
-  _manifests/<generation>-<commit-id>.json
-  _commits/<generation>-<commit-id>.json
-  _uploads/<upload-id>/
-    _upload.json
-    files/<logical-path>
+.mallard/
+  _storage.json
+  v1/repositories/<bundle-id>/
+    _head.json
+    _tag.json
+    _manifests/<generation>-<commit-id>.json
+    _commits/<generation>-<commit-id>.json
+    _uploads/<upload-id>/
+      _upload.json
+      files/<logical-path>
 ```
 
 The new head identifies a bundle, not an agent root:
@@ -910,7 +913,7 @@ Before reusing `Store`, introduce validated `BundleId`, `StoreKey`, and
 `LogicalPath` newtypes. Every store method must accept validated keys rather
 than raw strings. Local-folder reads, writes, locks, and deletes must prove
 canonical containment and reject symlink traversal. Existing profile-specific
-validators cannot simply be bypassed for `v3/bundles/`.
+validators cannot simply be bypassed for `.mallard/v1/repositories/`.
 
 Suggested Tauri surface:
 
@@ -1081,7 +1084,7 @@ manifest.
 - Parameterize/reuse `Store` only through the validated key boundary, then add
   CAS head publication, immutable history, hash verification, baseline,
   backup, and conflict infrastructure.
-- Add `v3/bundles/<id>` discovery and cursor pagination.
+- Add `.mallard/v1/repositories/<id>` discovery and cursor pagination.
 - Add typed bundle manifests and per-resource statuses.
 - Add dual-backend tests before provider materialization.
 

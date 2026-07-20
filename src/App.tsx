@@ -467,7 +467,7 @@ function LegacyApp({ theme, onThemeChange, onOpenProjects }: LegacyAppProps) {
       const result = direction === "push"
         ? await invoke<SyncResult>("sync_upload", { storage, profile, files })
         : await invoke<SyncResult>("sync_download", { storage, profile });
-      appendLog({ level: "ok", message: result.message });
+      appendLog({ level: "success", message: result.message });
       setSyncStatus({
         state: "success",
         message: result.message,
@@ -521,7 +521,7 @@ function LegacyApp({ theme, onThemeChange, onOpenProjects }: LegacyAppProps) {
             files: src ? [src.path] : [],
           })
         : await invoke<SyncResult>("sync_download", { storage, profile });
-      appendLog({ level: "ok", message: result.message });
+      appendLog({ level: "success", message: result.message });
       setSyncStatus({ state: "success", message: result.message, lastSync: result.timestamp, filesSynced: result.files_synced });
       await loadConfig();
       await loadFiles();
@@ -865,7 +865,8 @@ function LegacyApp({ theme, onThemeChange, onOpenProjects }: LegacyAppProps) {
           <div className="sidebar-chrome">
             <div className="sidebar-titlebar-drag-region" data-tauri-drag-region />
             <div className="sidebar-title-row" data-tauri-drag-region>
-              <span className="sidebar-product-title">Agent Sync</span>
+              <img className="sidebar-product-logo" src="/mallard-logo.png" alt="" data-tauri-drag-region />
+              <span className="sidebar-product-title">Mallard</span>
             </div>
 
             <div className="sidebar-nav">

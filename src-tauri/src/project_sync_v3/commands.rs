@@ -5,9 +5,10 @@
 //! S3 is rejected explicitly until a CAS-capable schema-3 adapter is wired in.
 
 use super::bundle_engine::{
-    BundleEngine, BundleObjectStore, CasExpectation, CasOutcome, FetchedBundle,
-    ImmutablePutOutcome, LocalBundleObjectStore, ObjectKey, ObjectPrefix, PublishBundleRequest,
-    PublishExpectation, RemoteBundlePage, StoreListPage, StoredObject,
+    write_immutable_backup, write_target_atomic, BundleEngine, BundleObjectStore, CasExpectation,
+    CasOutcome, FetchedBundle, ImmutablePutOutcome, LocalBundleObjectStore, ObjectKey,
+    ObjectPrefix, PublishBundleRequest, PublishExpectation, RemoteBundlePage, StoreListPage,
+    StoredObject,
 };
 use super::chat_history::{self, CodexThreadDetailsPage, ProjectChatHistory};
 use super::domain::{
@@ -30,7 +31,7 @@ use super::provider_capture::{
     ResourceCandidate,
 };
 use super::s3_store::S3BundleObjectStore;
-use crate::emit_log;
+use crate::activity_log::{emit_typed_log, ActivityLogScope, ActivityLogType};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,9 +41,15 @@ use std::process::Stdio;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::process::Command;
 use tokio::time::{timeout, Duration};
+use walkdir::WalkDir;
 
 const DEFAULT_OPERATION_TIMEOUT: Duration = Duration::from_secs(120);
 const PLAN_LIFETIME_SECS: u64 = 24 * 60 * 60;
+const MAX_CODEX_GLOBAL_STATE_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_CONVERSATION_REPAIR_BYTES: u64 = 512 * 1024 * 1024;
+const MAX_CODEX_SESSION_FILES: usize = 20_000;
+const AGENT_HOME_LOCKED_MESSAGE: &str =
+    "agent home is fixed after project setup; remove and set up the project again to use a different agent home";
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct RegisterLocalProjectRequest {
@@ -97,6 +104,43 @@ pub struct ProjectDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub binding: Option<ProjectBinding>,
     pub materializations: Vec<MaterializationRecord>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct CodexConversationPathIssue {
+    pub thread_id: String,
+    pub transcript_path: String,
+    pub recorded_cwd: String,
+    pub target_cwd: String,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct CodexConversationPathAudit {
+    pub local_project_id: LocalProjectId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile_path: Option<String>,
+    pub project_root: String,
+    pub assigned_thread_count: usize,
+    pub matching_thread_count: usize,
+    #[serde(default)]
+    pub issues: Vec<CodexConversationPathIssue>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub ready: bool,
+    pub can_repair: bool,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct CodexConversationPathRepairResult {
+    pub audit: CodexConversationPathAudit,
+    #[serde(default)]
+    pub repaired_thread_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backup_dir: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
@@ -349,6 +393,77 @@ fn storage_log_label(repository: &V3Repository, storage_id: &StorageId) -> Strin
         .unwrap_or_else(|| storage_id.to_string())
 }
 
+fn storage_change_summary(
+    previous: &[StorageConfigV3],
+    next: &[StorageConfigV3],
+) -> Option<(&'static str, String, StorageId, String)> {
+    let added = next
+        .iter()
+        .filter(|storage| !previous.iter().any(|candidate| candidate.id == storage.id))
+        .collect::<Vec<_>>();
+    let updated = next
+        .iter()
+        .filter(|storage| {
+            previous
+                .iter()
+                .find(|candidate| candidate.id == storage.id)
+                .is_some_and(|candidate| candidate != *storage)
+        })
+        .collect::<Vec<_>>();
+    let removed = previous
+        .iter()
+        .filter(|storage| !next.iter().any(|candidate| candidate.id == storage.id))
+        .collect::<Vec<_>>();
+    let total = added.len() + updated.len() + removed.len();
+    if total == 0 {
+        return None;
+    }
+
+    let (event, message, primary) = if total == 1 && added.len() == 1 {
+        let storage = added[0];
+        (
+            "storage.added",
+            format!("Storage added — {}", storage.name),
+            storage,
+        )
+    } else if total == 1 && updated.len() == 1 {
+        let storage = updated[0];
+        (
+            "storage.settings_updated",
+            format!("Storage settings updated — {}", storage.name),
+            storage,
+        )
+    } else if total == 1 {
+        let storage = removed[0];
+        (
+            "storage.removed",
+            format!("Storage removed — {}", storage.name),
+            storage,
+        )
+    } else {
+        let primary = added
+            .first()
+            .or_else(|| updated.first())
+            .or_else(|| removed.first())?;
+        (
+            "storage.settings_updated",
+            format!(
+                "Storage settings updated — {} added, {} changed, {} removed",
+                added.len(),
+                updated.len(),
+                removed.len()
+            ),
+            *primary,
+        )
+    };
+    let name = if primary.name.trim().is_empty() {
+        primary.id.to_string()
+    } else {
+        primary.name.clone()
+    };
+    Some((event, message, primary.id.clone(), name))
+}
+
 async fn run_blocking<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T, String> + Send + 'static,
 ) -> Result<T, String> {
@@ -367,7 +482,26 @@ pub async fn save_project_sync_config(
     app: tauri::AppHandle,
     config: SyncConfigV3,
 ) -> Result<SyncConfigV3, String> {
-    save_project_sync_config_with_repository(&repository(&app)?, config)
+    let repository = repository(&app)?;
+    let storage_change = repository
+        .load_config()
+        .ok()
+        .and_then(|previous| storage_change_summary(&previous.storages, &config.storages));
+    let result = save_project_sync_config_with_repository(&repository, config);
+    if let Some((event, message, storage_id, storage_name)) = storage_change {
+        let log = ActivityLogScope::new(ActivityLogType::Storage)
+            .storage(&storage_id, Some(&storage_name));
+        match &result {
+            Ok(_) => log.emit(&app, "ok", event, &message),
+            Err(error) => log.emit(
+                &app,
+                "error",
+                "storage.settings_update_failed",
+                &format!("Storage settings could not be saved: {error}"),
+            ),
+        }
+    }
+    result
 }
 
 fn save_project_sync_config_with_repository(
@@ -388,7 +522,7 @@ pub async fn list_local_projects(
     // The shell lists projects first on every launch, so an interrupted
     // finalization heals here before any project data is rendered.
     for warning in recover_setup_state(&repository) {
-        emit_log(&app, "warn", &warning);
+        emit_typed_log(&app, ActivityLogType::Configuration, "warning", &warning);
     }
     Ok(repository.load_config()?.projects)
 }
@@ -431,9 +565,11 @@ pub async fn get_project_chat_history(
     force_revalidate: Option<bool>,
 ) -> Result<ProjectChatHistory, String> {
     let repository = repository(&app)?;
-    emit_log(
+    let log = ActivityLogScope::new(ActivityLogType::History).project(&local_project_id, None);
+    log.emit(
         &app,
         "info",
+        "history.scan_started",
         &format!("Scanning Codex session history for project {local_project_id}…"),
     );
     let result = run_blocking(move || {
@@ -450,11 +586,12 @@ pub async fn get_project_chat_history(
     match &result {
         Ok(history) => {
             for warning in &history.warnings {
-                emit_log(&app, "warn", warning);
+                log.emit(&app, "warning", "history.scan_warning", warning);
             }
-            emit_log(
+            log.emit(
                 &app,
                 "ok",
+                "history.scan_completed",
                 &format!(
                     "Session history scan complete: {} sessions in this {}-day window",
                     history.threads.len(),
@@ -462,7 +599,12 @@ pub async fn get_project_chat_history(
                 ),
             );
         }
-        Err(error) => emit_log(&app, "error", &format!("Session history scan failed: {error}")),
+        Err(error) => log.emit(
+            &app,
+            "error",
+            "history.scan_failed",
+            &format!("Session history scan failed: {error}"),
+        ),
     }
     result
 }
@@ -496,12 +638,21 @@ pub async fn open_codex_thread_in_terminal(
 ) -> Result<(), String> {
     let repository = repository(&app)?;
     let worker_app = app.clone();
+    let worker_log =
+        ActivityLogScope::new(ActivityLogType::History).project(&local_project_id, None);
     run_blocking(move || {
         chat_history::open_codex_thread_in_terminal(
             &repository,
             &local_project_id,
             &thread_id,
-            |command| emit_log(&worker_app, "info", &format!("$ {command}")),
+            |command| {
+                worker_log.emit(
+                    &worker_app,
+                    "info",
+                    "history.opened_in_terminal",
+                    &format!("$ {command}"),
+                )
+            },
         )
     })
     .await
@@ -515,12 +666,21 @@ pub async fn open_codex_thread_in_app(
 ) -> Result<(), String> {
     let repository = repository(&app)?;
     let worker_app = app.clone();
+    let worker_log =
+        ActivityLogScope::new(ActivityLogType::History).project(&local_project_id, None);
     run_blocking(move || {
         chat_history::open_codex_thread_in_app(
             &repository,
             &local_project_id,
             &thread_id,
-            |command| emit_log(&worker_app, "info", &format!("$ {command}")),
+            |command| {
+                worker_log.emit(
+                    &worker_app,
+                    "info",
+                    "history.opened_in_app",
+                    &format!("$ {command}"),
+                )
+            },
         )
     })
     .await
@@ -598,9 +758,13 @@ pub async fn connect_project_to_remote_bundle(
 ) -> Result<ProjectDetail, String> {
     let repository = repository(&app)?;
     let storage = storage_log_label(&repository, &request.storage_id);
-    emit_log(
+    let log = ActivityLogScope::new(ActivityLogType::Configuration)
+        .project(&request.local_project_id, None)
+        .storage(&request.storage_id, Some(&storage));
+    log.emit(
         &app,
         "info",
+        "configuration.remote_connected_started",
         &format!(
             "Connecting project to bundle {} in {}…",
             request.bundle_id, storage
@@ -611,17 +775,19 @@ pub async fn connect_project_to_remote_bundle(
     })
     .await;
     match &result {
-        Ok(detail) => emit_log(
+        Ok(detail) => log.emit(
             &app,
             "ok",
+            "configuration.remote_connected",
             &format!(
                 "Connected {} to remote bundle {}",
                 detail.project.display_name, detail.project.bundle_id
             ),
         ),
-        Err(error) => emit_log(
+        Err(error) => log.emit(
             &app,
             "error",
+            "configuration.remote_connect_failed",
             &format!("Failed to connect remote bundle: {}", error),
         ),
     }
@@ -634,12 +800,32 @@ pub async fn remove_project_link(
     local_project_id: LocalProjectId,
     storage_id: StorageId,
 ) -> Result<bool, String> {
-    repository(&app)?.mutate_config(|config| {
+    remove_project_link_with_repository(&repository(&app)?, &local_project_id, &storage_id)
+}
+
+fn remove_project_link_with_repository(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    storage_id: &StorageId,
+) -> Result<bool, String> {
+    repository.mutate_config(|config| {
         let before = config.links.len();
         config.links.retain(|link| {
-            link.local_project_id != local_project_id || link.storage_id != storage_id
+            &link.local_project_id != local_project_id || &link.storage_id != storage_id
         });
-        Ok(before != config.links.len())
+        let removed = before != config.links.len();
+        if removed {
+            let project = config
+                .projects
+                .iter_mut()
+                .find(|project| &project.local_project_id == local_project_id)
+                .ok_or_else(|| "linked project no longer exists".to_string())?;
+            if project.recipe_bases.remove(storage_id).is_some() {
+                project.revision = project.revision.saturating_add(1);
+                project.updated_at = now_secs();
+            }
+        }
+        Ok(removed)
     })
 }
 
@@ -715,6 +901,60 @@ pub async fn get_project_binding(
         .load_bindings()?
         .active_for(&local_project_id)
         .cloned())
+}
+
+#[tauri::command]
+pub async fn audit_codex_conversation_paths(
+    app: tauri::AppHandle,
+    local_project_id: LocalProjectId,
+) -> Result<CodexConversationPathAudit, String> {
+    let repository = repository(&app)?;
+    run_blocking(move || {
+        audit_codex_conversation_paths_with_repository(&repository, &local_project_id)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn repair_codex_conversation_paths(
+    app: tauri::AppHandle,
+    local_project_id: LocalProjectId,
+) -> Result<CodexConversationPathRepairResult, String> {
+    let repository = repository(&app)?;
+    let log = ActivityLogScope::new(ActivityLogType::Repair).project(&local_project_id, None);
+    log.emit(
+        &app,
+        "info",
+        "repair.conversation_paths_started",
+        "Repairing Codex conversation paths…",
+    );
+    let result = run_blocking(move || {
+        repair_codex_conversation_paths_with_repository(&repository, &local_project_id)
+    })
+    .await;
+    match &result {
+        Ok(report) => log.emit(
+            &app,
+            "ok",
+            "repair.conversation_paths_completed",
+            &format!(
+                "Repaired {} conversation path{}",
+                report.repaired_thread_ids.len(),
+                if report.repaired_thread_ids.len() == 1 {
+                    ""
+                } else {
+                    "s"
+                }
+            ),
+        ),
+        Err(error) => log.emit(
+            &app,
+            "error",
+            "repair.conversation_paths_failed",
+            &format!("Conversation path repair failed: {error}"),
+        ),
+    }
+    result
 }
 
 #[tauri::command]
@@ -830,9 +1070,11 @@ pub async fn fetch_bundle(
 ) -> Result<BundleSnapshotSummary, String> {
     let repository = repository(&app)?;
     let storage = storage_log_label(&repository, &storage_id);
-    emit_log(
+    let log = ActivityLogScope::new(ActivityLogType::Pull).storage(&storage_id, Some(&storage));
+    log.emit(
         &app,
         "info",
+        "pull.fetch_started",
         &format!("↓  Fetching bundle {} from {}", bundle_id, storage),
     );
     let result = run_blocking(move || {
@@ -841,15 +1083,21 @@ pub async fn fetch_bundle(
     })
     .await;
     match &result {
-        Ok(snapshot) => emit_log(
+        Ok(snapshot) => log.emit(
             &app,
             "ok",
+            "pull.fetch_completed",
             &format!(
                 "↓  Fetched {} generation {} ({} resources)",
                 snapshot.display_name, snapshot.generation, snapshot.resource_count
             ),
         ),
-        Err(error) => emit_log(&app, "error", &format!("✗  Pull fetch failed: {}", error)),
+        Err(error) => log.emit(
+            &app,
+            "error",
+            "pull.fetch_failed",
+            &format!("✗  Pull fetch failed: {}", error),
+        ),
     }
     result
 }
@@ -872,45 +1120,66 @@ pub async fn push_bundle(
     app: tauri::AppHandle,
     local_project_id: LocalProjectId,
     storage_id: StorageId,
+    recipe: Option<BundleRecipe>,
 ) -> Result<ProjectOperationResult, String> {
     let repository = repository(&app)?;
     let (project, storage) =
         project_storage_log_labels(&repository, &local_project_id, &storage_id);
-    emit_log(
+    let log = ActivityLogScope::new(ActivityLogType::Push)
+        .project(&local_project_id, Some(&project))
+        .storage(&storage_id, Some(&storage));
+    log.emit(
         &app,
         "info",
+        "push.started",
         &format!("↑  Push started — {} → {}", project, storage),
     );
     let worker_app = app.clone();
+    let worker_log = log.clone();
+    let selected_count = recipe.as_ref().map(|recipe| recipe.entries.len());
     let result = run_blocking(move || {
-        emit_log(
+        worker_log.emit(
             &worker_app,
             "info",
-            "   Scanning selected project resources…",
+            "push.scan_started",
+            &selected_count
+                .map(|count| format!("   Scanning {} resources selected for this storage…", count))
+                .unwrap_or_else(|| "   Scanning selected project resources…".to_string()),
         );
-        push_bundle_with_repository(&repository, &local_project_id, &storage_id)
+        push_bundle_with_recipe_with_repository(&repository, &local_project_id, &storage_id, recipe)
     })
     .await;
     match &result {
         Ok(operation) => {
             for resource in &operation.results {
-                emit_log(
+                log.emit(
                     &app,
                     if resource.state == "synced" {
                         "ok"
                     } else {
                         "info"
                     },
+                    if resource.state == "synced" {
+                        "push.resource_synced"
+                    } else {
+                        "push.resource_checked"
+                    },
                     &format!("↑  {} ({})", resource.resource_id, resource.state),
                 );
             }
-            emit_log(
+            log.emit(
                 &app,
                 "ok",
+                "push.completed",
                 &format!("✓  Push complete — {}", operation.message),
             );
         }
-        Err(error) => emit_log(&app, "error", &format!("✗  Push failed: {}", error)),
+        Err(error) => log.emit(
+            &app,
+            "error",
+            "push.failed",
+            &format!("✗  Push failed: {}", error),
+        ),
     }
     result
 }
@@ -925,9 +1194,13 @@ pub async fn plan_bundle_restore(
     let repository = repository(&app)?;
     let (project, storage) =
         project_storage_log_labels(&repository, &binding.local_project_id, &storage_id);
-    emit_log(
+    let log = ActivityLogScope::new(ActivityLogType::Pull)
+        .project(&binding.local_project_id, Some(&project))
+        .storage(&storage_id, Some(&storage));
+    log.emit(
         &app,
         "info",
+        "pull.review_started",
         &format!("↓  Preparing Pull review — {} ← {}", project, storage),
     );
     let result = run_blocking(move || {
@@ -937,26 +1210,34 @@ pub async fn plan_bundle_restore(
     match &result {
         Ok(plan) => {
             for action in &plan.actions {
-                emit_log(&app, "info", &format!("↓  Review {}", action.resource_id));
+                log.emit(
+                    &app,
+                    "info",
+                    "pull.resource_review",
+                    &format!("↓  Review {}", action.resource_id),
+                );
             }
-            emit_log(
+            log.emit(
                 &app,
                 "ok",
+                "pull.plan_ready",
                 &format!(
                     "✓  Pull plan ready — generation {}, {} actions",
                     plan.generation,
                     plan.actions.len()
                 ),
             );
-            emit_log(
+            log.emit(
                 &app,
                 "info",
+                "pull.awaiting_approval",
                 "   Nothing has been applied yet — use “Apply approved changes” in the Pull review.",
             );
         }
-        Err(error) => emit_log(
+        Err(error) => log.emit(
             &app,
             "error",
+            "pull.planning_failed",
             &format!("✗  Pull planning failed: {}", error),
         ),
     }
@@ -972,9 +1253,11 @@ pub async fn apply_bundle_restore(
     let repository = repository(&app)?;
     let log_repository = repository.clone();
     let plan_for_log = repository.load_restore_plan(&plan_id).ok();
-    emit_log(
+    let log = ActivityLogScope::new(ActivityLogType::Pull);
+    log.emit(
         &app,
         "info",
+        "pull.apply_started",
         &format!(
             "↓  Applying {} approved Pull actions…",
             approved_action_ids.len()
@@ -996,18 +1279,29 @@ pub async fn apply_bundle_restore(
                     })
                     .map(|action| action.resource_id.to_string())
                     .unwrap_or_else(|| action_id.to_string());
-                emit_log(&app, "ok", &format!("↓  {}", resource));
+                log.emit(
+                    &app,
+                    "ok",
+                    "pull.resource_applied",
+                    &format!("↓  {}", resource),
+                );
             }
             for failure in &operation.failed_actions {
-                emit_log(
+                log.emit(
                     &app,
                     "error",
+                    "pull.resource_failed",
                     &format!("✗  {}: {}", failure.action_id, failure.message),
                 );
             }
-            emit_log(
+            log.emit(
                 &app,
                 if operation.success { "ok" } else { "error" },
+                if operation.success {
+                    "pull.completed"
+                } else {
+                    "pull.completed_with_errors"
+                },
                 &format!(
                     "{}  Pull finished — {}",
                     if operation.success { "✓" } else { "✗" },
@@ -1021,20 +1315,36 @@ pub async fn apply_bundle_restore(
                     .and_then(|plan| current_binding_for_restore_plan(&log_repository, plan))
                 {
                     Ok(binding) => {
-                        emit_log(&app, "info", "   Open this project after Pull:");
+                        log.emit(
+                            &app,
+                            "info",
+                            "pull.open_project_hint",
+                            "   Open this project after Pull:",
+                        );
                         for (label, command) in project_open_commands(&binding) {
-                            emit_log(&app, "info", &format!("   {}: {}", label, command));
+                            log.emit(
+                                &app,
+                                "info",
+                                "pull.open_project_command",
+                                &format!("   {}: {}", label, command),
+                            );
                         }
                     }
-                    Err(error) => emit_log(
+                    Err(error) => log.emit(
                         &app,
                         "info",
+                        "pull.open_project_unavailable",
                         &format!("   Open command unavailable: {}", error),
                     ),
                 }
             }
         }
-        Err(error) => emit_log(&app, "error", &format!("✗  Pull failed: {}", error)),
+        Err(error) => log.emit(
+            &app,
+            "error",
+            "pull.failed",
+            &format!("✗  Pull failed: {}", error),
+        ),
     }
     result
 }
@@ -1042,11 +1352,10 @@ pub async fn apply_bundle_restore(
 #[tauri::command]
 pub async fn plan_dependencies(
     app: tauri::AppHandle,
-    bundle_id: BundleId,
-    binding: ProjectBinding,
+    restore_plan_id: PlanId,
 ) -> Result<DependencyPlan, String> {
     let repository = repository(&app)?;
-    run_blocking(move || plan_dependencies_with_repository(&repository, &bundle_id, &binding)).await
+    run_blocking(move || plan_dependencies_with_repository(&repository, &restore_plan_id)).await
 }
 
 #[tauri::command]
@@ -1061,12 +1370,24 @@ pub async fn apply_dependency_actions(
 #[tauri::command]
 pub async fn get_bundle_readiness(
     app: tauri::AppHandle,
+    storage_id: StorageId,
     bundle_id: BundleId,
     binding: ProjectBinding,
 ) -> Result<BundleReadiness, String> {
     let repository = repository(&app)?;
-    run_blocking(move || get_bundle_readiness_with_repository(&repository, &bundle_id, &binding))
-        .await
+    run_blocking(move || {
+        get_bundle_readiness_with_repository(&repository, &storage_id, &bundle_id, &binding)
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn get_restore_readiness(
+    app: tauri::AppHandle,
+    restore_plan_id: PlanId,
+) -> Result<BundleReadiness, String> {
+    let repository = repository(&app)?;
+    run_blocking(move || get_restore_readiness_with_repository(&repository, &restore_plan_id)).await
 }
 
 fn provider_name(provider: Provider) -> &'static str {
@@ -2029,6 +2350,11 @@ fn get_bundle_status_with_repository(
         .cloned()
         .ok_or_else(|| format!("unknown local project '{}'", local_project_id))?;
     require_project_link(&config, &project, storage_id)?;
+    let destination_recipe = config
+        .links
+        .iter()
+        .find(|link| link.local_project_id == *local_project_id && link.storage_id == *storage_id)
+        .and_then(|link| link.recipe.clone());
     let binding = repository
         .load_bindings()?
         .active_for(local_project_id)
@@ -2046,7 +2372,8 @@ fn get_bundle_status_with_repository(
         &project.local_project_id,
         &discovered.resources,
     )?;
-    let capture = provider_capture::capture_recipe(&capture_request, &project.recipe)?;
+    let effective_recipe = destination_recipe.unwrap_or_else(|| project.recipe.clone());
+    let capture = provider_capture::capture_recipe(&capture_request, &effective_recipe)?;
     let local_resources = provider_capture::domain_resources(&capture)?;
     let unavailable: BTreeSet<_> = capture
         .unavailable_resource_ids
@@ -2064,8 +2391,8 @@ fn get_bundle_status_with_repository(
     let remote_resources = remote
         .as_ref()
         .map(|fetched| &fetched.snapshot.manifest.resources);
-    let mut statuses = Vec::with_capacity(project.recipe.entries.len());
-    for resource_id in project.recipe.entries.keys() {
+    let mut statuses = Vec::with_capacity(effective_recipe.entries.len());
+    for resource_id in effective_recipe.entries.keys() {
         let local_digest = local_resources
             .get(resource_id)
             .and_then(|resource| resource.metadata.get("content_sha256"))
@@ -2109,10 +2436,20 @@ fn get_bundle_status_with_repository(
     })
 }
 
+#[cfg(test)]
 fn push_bundle_with_repository(
     repository: &V3Repository,
     local_project_id: &LocalProjectId,
     storage_id: &StorageId,
+) -> Result<ProjectOperationResult, String> {
+    push_bundle_with_recipe_with_repository(repository, local_project_id, storage_id, None)
+}
+
+fn push_bundle_with_recipe_with_repository(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    storage_id: &StorageId,
+    requested_recipe: Option<BundleRecipe>,
 ) -> Result<ProjectOperationResult, String> {
     let config = repository.load_config()?;
     let mut project = config
@@ -2120,6 +2457,11 @@ fn push_bundle_with_repository(
         .cloned()
         .ok_or_else(|| format!("unknown local project '{}'", local_project_id))?;
     require_project_link(&config, &project, storage_id)?;
+    let stored_destination_recipe = config
+        .links
+        .iter()
+        .find(|link| link.local_project_id == *local_project_id && link.storage_id == *storage_id)
+        .and_then(|link| link.recipe.clone());
     let binding = repository
         .load_bindings()?
         .active_for(local_project_id)
@@ -2130,6 +2472,7 @@ fn push_bundle_with_repository(
                 local_project_id
             )
         })?;
+    require_codex_conversation_paths_ready(repository, &binding.local_project_id)?;
     let capture_request = capture_request_for_binding(repository, &binding)?;
     let discovered = provider_capture::discover_project(&capture_request)?;
     project = persist_auto_selected_conversations(
@@ -2137,7 +2480,19 @@ fn push_bundle_with_repository(
         &project.local_project_id,
         &discovered.resources,
     )?;
-    let capture = provider_capture::capture_recipe(&capture_request, &project.recipe)?;
+    let push_recipe = match requested_recipe {
+        Some(mut requested) => {
+            requested.validate()?;
+            requested.revision = match &stored_destination_recipe {
+                Some(current) if current.entries == requested.entries => current.revision,
+                Some(current) => current.revision.saturating_add(1),
+                None => 1,
+            };
+            requested
+        }
+        None => project.recipe.clone(),
+    };
+    let capture = provider_capture::capture_recipe(&capture_request, &push_recipe)?;
     let (_, engine) = storage_engine(repository, storage_id)?;
     let expected_head = match (
         engine.read_head(&project.bundle_id)?,
@@ -2183,7 +2538,7 @@ fn push_bundle_with_repository(
             kind: BundleKind::Project,
             repository_fingerprint: project.repository_fingerprint.clone(),
         },
-        recipe: project.recipe.clone(),
+        recipe: push_recipe.clone(),
         captured_with: CapturedWith {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             codex_version: None,
@@ -2197,8 +2552,9 @@ fn push_bundle_with_repository(
     let generation = published.snapshot.head.generation;
     let commit_id = published.snapshot.head.commit_id.clone();
     let manifest_sha256 = published.snapshot.head.manifest_sha256.clone();
-    let recipe_revision = project.recipe.revision;
+    let recipe_revision = push_recipe.revision;
     let expected_project_revision = project.revision;
+    let expected_project_recipe_revision = project.recipe.revision;
     let bundle_id = project.bundle_id.clone();
     repository.mutate_config(|config| {
         let current = config
@@ -2207,7 +2563,7 @@ fn push_bundle_with_repository(
             .find(|current| current.local_project_id == *local_project_id)
             .ok_or_else(|| "project was removed while publishing".to_string())?;
         if current.revision != expected_project_revision
-            || current.recipe.revision != recipe_revision
+            || current.recipe.revision != expected_project_recipe_revision
             || current.bundle_id != bundle_id
         {
             return Err(
@@ -2230,6 +2586,14 @@ fn push_bundle_with_repository(
                 last_push_at: Some(pushed_at),
             },
         );
+        let current_link = config
+            .links
+            .iter_mut()
+            .find(|link| {
+                link.local_project_id == *local_project_id && link.storage_id == *storage_id
+            })
+            .ok_or_else(|| "project storage link was removed while publishing".to_string())?;
+        current_link.recipe = Some(push_recipe.clone());
         current.revision = current.revision.saturating_add(1);
         current.updated_at = pushed_at;
         Ok(())
@@ -2270,6 +2634,7 @@ fn plan_bundle_restore_with_repository(
     if &binding.bundle_id != bundle_id {
         return Err("binding and requested bundle IDs differ".to_string());
     }
+    require_codex_conversation_paths_ready(repository, &binding.local_project_id)?;
     let (engine, fetched) = fetch_from_storage(repository, storage_id, bundle_id)?;
     let plan = engine.build_restore_plan(&fetched, &binding, now_secs())?;
     repository.save_restore_plan(&plan)?;
@@ -2296,6 +2661,7 @@ fn apply_bundle_restore_with_repository(
         ));
     }
     let (engine, fetched) = fetch_from_storage(repository, &plan.storage_id, &plan.bundle_id)?;
+    let restored_recipe = fetched.snapshot.manifest.recipe.clone();
     let applied_at = now_secs();
     let applied = engine.apply_restore_plan(
         &fetched,
@@ -2375,7 +2741,7 @@ fn apply_bundle_restore_with_repository(
                 RecipeBase {
                     generation: plan.generation,
                     manifest_sha256: plan.manifest_sha256.clone(),
-                    recipe_revision: project.recipe.revision,
+                    recipe_revision: restored_recipe.revision,
                     binding_revision: Some(binding.revision),
                     last_pull_at: successful_pull_timestamp(
                         previous_pull_at,
@@ -2385,6 +2751,17 @@ fn apply_bundle_restore_with_repository(
                     last_push_at,
                 },
             );
+            let link = config
+                .links
+                .iter_mut()
+                .find(|link| {
+                    link.local_project_id == binding.local_project_id
+                        && link.storage_id == plan.storage_id
+                })
+                .ok_or_else(|| {
+                    "project storage link was removed while applying Pull".to_string()
+                })?;
+            link.recipe = Some(restored_recipe.clone());
             project.revision = project.revision.saturating_add(1);
             project.updated_at = applied_at;
             Ok(())
@@ -2434,16 +2811,41 @@ fn successful_pull_timestamp(
     overall_success.then_some(applied_at).or(previous)
 }
 
+/// Load the exact storage snapshot approved by a RestorePlan. Dependency and
+/// readiness support must never discover a different linked storage on their
+/// own, because each storage advances its bundle generations independently.
+fn restore_support_context(
+    repository: &V3Repository,
+    restore_plan_id: &PlanId,
+) -> Result<(RestorePlan, ProjectBinding, FetchedBundle), String> {
+    let plan = repository.load_restore_plan(restore_plan_id)?;
+    let now = now_secs();
+    if now < plan.created_at || now > plan.expires_at {
+        return Err("restore plan has expired or is not active yet".to_string());
+    }
+    let binding = current_binding_for_restore_plan(repository, &plan)?;
+    let (_, fetched) = fetch_from_storage(repository, &plan.storage_id, &plan.bundle_id)?;
+    let head = &fetched.snapshot.head;
+    if plan.storage_id != fetched.snapshot.storage_id
+        || plan.bundle_id != head.bundle_id
+        || plan.replica_id != binding.replica_id
+        || plan.generation != head.generation
+        || plan.commit_id != head.commit_id
+        || plan.manifest_sha256 != head.manifest_sha256
+        || plan.binding_revision != binding.revision
+    {
+        return Err(
+            "bundle head changed after restore planning; refresh the Pull review".to_string(),
+        );
+    }
+    Ok((plan, binding, fetched))
+}
+
 fn plan_dependencies_with_repository(
     repository: &V3Repository,
-    bundle_id: &BundleId,
-    binding: &ProjectBinding,
+    restore_plan_id: &PlanId,
 ) -> Result<DependencyPlan, String> {
-    let binding = require_current_binding(repository, binding)?;
-    if &binding.bundle_id != bundle_id {
-        return Err("binding and requested bundle IDs differ".to_string());
-    }
-    let (storage_id, _, fetched) = fetch_from_linked_storage(repository, &binding, bundle_id)?;
+    let (restore_plan, binding, fetched) = restore_support_context(repository, restore_plan_id)?;
     let created_at = now_secs();
     let plan = DependencyPlan {
         schema_version: DEPENDENCY_PLAN_SCHEMA_V1,
@@ -2451,15 +2853,17 @@ fn plan_dependencies_with_repository(
         // The plan type and its persistence directory already distinguish
         // dependency plans from restore plans.
         plan_id: PlanId::parse(generated_named_id("plan")?)?,
-        storage_id,
-        bundle_id: bundle_id.clone(),
+        storage_id: restore_plan.storage_id,
+        bundle_id: restore_plan.bundle_id,
         replica_id: binding.replica_id,
-        generation: fetched.snapshot.head.generation,
-        commit_id: fetched.snapshot.head.commit_id.clone(),
-        manifest_sha256: fetched.snapshot.head.manifest_sha256.clone(),
+        generation: restore_plan.generation,
+        commit_id: restore_plan.commit_id,
+        manifest_sha256: restore_plan.manifest_sha256,
         binding_revision: binding.revision,
         created_at,
-        expires_at: created_at.saturating_add(PLAN_LIFETIME_SECS),
+        expires_at: restore_plan
+            .expires_at
+            .min(created_at.saturating_add(PLAN_LIFETIME_SECS)),
         actions: fetched.dependency_actions,
         blockers: Vec::new(),
         warnings: Vec::new(),
@@ -2591,6 +2995,7 @@ async fn apply_dependency_actions_with_repository(
 
 fn get_bundle_readiness_with_repository(
     repository: &V3Repository,
+    storage_id: &StorageId,
     bundle_id: &BundleId,
     binding: &ProjectBinding,
 ) -> Result<BundleReadiness, String> {
@@ -2598,8 +3003,30 @@ fn get_bundle_readiness_with_repository(
     if &binding.bundle_id != bundle_id {
         return Err("binding and requested bundle IDs differ".to_string());
     }
-    let (_, _, fetched) = fetch_from_linked_storage(repository, &binding, bundle_id)?;
+    let config = repository.load_config()?;
+    let project = config
+        .project(&binding.local_project_id)
+        .ok_or_else(|| "bound project is no longer registered".to_string())?;
+    require_project_link(&config, project, storage_id)?;
+    let (_, fetched) = fetch_from_storage(repository, storage_id, bundle_id)?;
+    bundle_readiness_for_fetched(repository, &binding, &fetched)
+}
+
+fn get_restore_readiness_with_repository(
+    repository: &V3Repository,
+    restore_plan_id: &PlanId,
+) -> Result<BundleReadiness, String> {
+    let (_, binding, fetched) = restore_support_context(repository, restore_plan_id)?;
+    bundle_readiness_for_fetched(repository, &binding, &fetched)
+}
+
+fn bundle_readiness_for_fetched(
+    repository: &V3Repository,
+    binding: &ProjectBinding,
+    fetched: &FetchedBundle,
+) -> Result<BundleReadiness, String> {
     let head = &fetched.snapshot.head;
+    let bundle_id = &head.bundle_id;
     let materialization = repository
         .load_materializations()?
         .records
@@ -3159,36 +3586,7 @@ fn engine_for_storage_config(storage: &StorageConfigV3) -> Result<StorageEngine,
         }
         StorageKind::S3 => ConfiguredStore::S3(S3BundleObjectStore::from_current_runtime(storage)?),
     };
-    Ok(BundleEngine::new(store, storage.id.clone()))
-}
-
-fn fetch_from_linked_storage(
-    repository: &V3Repository,
-    binding: &ProjectBinding,
-    bundle_id: &BundleId,
-) -> Result<(StorageId, StorageEngine, FetchedBundle), String> {
-    let config = repository.load_config()?;
-    let mut last_error = None;
-    for link in config.links.iter().filter(|link| {
-        link.local_project_id == binding.local_project_id && &link.bundle_id == bundle_id
-    }) {
-        if !config
-            .storages
-            .iter()
-            .any(|storage| storage.id == link.storage_id)
-        {
-            continue;
-        }
-        match fetch_from_storage(repository, &link.storage_id, bundle_id) {
-            Ok((engine, fetched)) => return Ok((link.storage_id.clone(), engine, fetched)),
-            Err(error) => last_error = Some(error),
-        }
-    }
-    if let Some(error) = last_error {
-        Err(error)
-    } else {
-        Err(format!("bundle '{}' has no linked storage", bundle_id))
-    }
+    BundleEngine::open(store, storage.id.clone())
 }
 
 fn validate_config_storage_isolation(
@@ -3322,18 +3720,30 @@ fn get_project_with_repository(
     }))
 }
 
-/// Machine-local default nickname for a new project: repo name + hostname,
-/// counter-suffixed until it matches no existing project's visible label, so
-/// two checkouts of the same repo stay distinguishable out of the box.
+/// Machine-local default nickname for a new project: repo name plus the
+/// provider config it uses ("healthGame (conf2)"). The hostname stands in
+/// when no config is known (registration without a binding), and a counter
+/// is the last resort, so sibling projects stay distinguishable out of the
+/// box.
 fn default_local_alias(
     display_name: &str,
+    config_qualifier: Option<&str>,
     existing: &[LocalProjectRegistration],
 ) -> Option<String> {
-    let base = format!(
-        "{} ({})",
-        display_name.trim(),
-        crate::default_machine_name()
-    );
+    let qualifier = config_qualifier
+        .map(str::trim)
+        .filter(|qualifier| !qualifier.is_empty())
+        .map(|qualifier| {
+            // Abbreviate generated config names to their distinctive part:
+            // "conf2 · Codex" → "conf2", "Default Codex" → "Codex".
+            // User-chosen names pass through unchanged.
+            let stem = qualifier.split(" · ").next().unwrap_or(qualifier);
+            stem.strip_prefix("Default ")
+                .filter(|rest| !rest.trim().is_empty())
+                .unwrap_or(stem)
+                .to_string()
+        })
+        .unwrap_or_else(crate::default_machine_name);
     let taken: BTreeSet<&str> = existing
         .iter()
         .map(|project| {
@@ -3344,10 +3754,11 @@ fn default_local_alias(
                 .trim()
         })
         .collect();
-    let mut candidate = base.clone();
+    let stem = format!("{} ({})", display_name.trim(), qualifier);
+    let mut candidate = stem.clone();
     let mut counter = 2u64;
     while taken.contains(candidate.as_str()) {
-        candidate = format!("{} {}", base, counter);
+        candidate = format!("{} {}", stem, counter);
         counter += 1;
     }
     // Fall back to the bare display name rather than letting a pathological
@@ -3383,7 +3794,7 @@ fn register_local_project_with_repository(
         {
             return Err("generated local project id collision; try again".to_string());
         }
-        project.local_alias = default_local_alias(&project.display_name, &config.projects);
+        project.local_alias = default_local_alias(&project.display_name, None, &config.projects);
         project.validate()?;
         config.projects.push(project.clone());
         Ok(project)
@@ -3435,6 +3846,7 @@ fn save_project_link_with_repository(
             local_project_id: request.local_project_id.clone(),
             storage_id: request.storage_id.clone(),
             bundle_id: project.bundle_id.clone(),
+            recipe: None,
             pinned: request.pinned,
             created_at: now_secs(),
         };
@@ -3444,10 +3856,13 @@ fn save_project_link_with_repository(
         }) {
             // Preserve creation time while updating user intent.
             let created_at = existing.created_at;
+            let recipe = existing.recipe.clone();
             *existing = link.clone();
             existing.created_at = created_at;
+            existing.recipe = recipe.clone();
             let mut returned = link;
             returned.created_at = created_at;
+            returned.recipe = recipe;
             Ok(returned)
         } else {
             config.links.push(link.clone());
@@ -3604,6 +4019,7 @@ fn connect_project_to_remote_bundle_with_repository(
             .filter(|link| link.local_project_id == request.local_project_id)
         {
             link.bundle_id = new_bundle_id.clone();
+            link.recipe = None;
             link.pinned = request.pinned;
         }
         if !config.links.iter().any(|link| {
@@ -3614,6 +4030,7 @@ fn connect_project_to_remote_bundle_with_repository(
                 local_project_id: request.local_project_id.clone(),
                 storage_id: request.storage_id.clone(),
                 bundle_id: new_bundle_id.clone(),
+                recipe: None,
                 pinned: request.pinned,
                 created_at: now_secs(),
             });
@@ -3674,6 +4091,14 @@ fn save_project_binding_with_repository(
                         expected, current.revision
                     ));
                 }
+                // Profile paths are immutable in the catalog, so pinning the
+                // profile IDs pins each agent home while still allowing a
+                // checkout path remap.
+                if current.state == BindingState::Active
+                    && current.profile_ids != request.profile_ids
+                {
+                    return Err(AGENT_HOME_LOCKED_MESSAGE.to_string());
+                }
                 (
                     current.replica_id.clone(),
                     current.revision.saturating_add(1),
@@ -3726,6 +4151,48 @@ fn save_project_binding_with_repository(
 struct ValidatedBindingRequest {
     canonical_project_root: String,
     profile_paths: BTreeMap<Provider, String>,
+}
+
+/// First active binding (excluding `exclude`) that already claims one of the
+/// requested provider profiles for this checkout. Project identity is
+/// (canonical root, provider profile): the same folder with a different
+/// config is a separate project, only a shared profile is a collision.
+fn root_profile_collision<'a>(
+    machine: &'a MachineProjectState,
+    exclude: Option<&LocalProjectId>,
+    canonical_root: &str,
+    profile_ids: &BTreeMap<Provider, LocalProviderProfileId>,
+) -> Option<(&'a ProjectBinding, Provider)> {
+    let folded = canonical_root.to_lowercase();
+    machine
+        .bindings
+        .iter()
+        .filter(|binding| binding.state == BindingState::Active)
+        .filter(|binding| exclude != Some(&binding.local_project_id))
+        .filter(|binding| binding.canonical_project_root.to_lowercase() == folded)
+        .find_map(|binding| {
+            profile_ids.iter().find_map(|(provider, profile_id)| {
+                binding
+                    .profile_ids
+                    .values()
+                    .any(|used| used == profile_id)
+                    .then_some((binding, *provider))
+            })
+        })
+}
+
+/// Visible label for collision messages: the machine-local alias when one
+/// exists, else the shared display name, else the raw id.
+fn project_label(config: &SyncConfigV3, id: &LocalProjectId) -> String {
+    config
+        .project(id)
+        .map(|project| {
+            project
+                .local_alias
+                .clone()
+                .unwrap_or_else(|| project.display_name.clone())
+        })
+        .unwrap_or_else(|| id.to_string())
 }
 
 fn validate_binding_request(
@@ -3804,6 +4271,19 @@ fn validate_binding_request(
             return Err("Codex and Claude homes must not overlap".to_string());
         }
         provider_roots.push(path);
+    }
+    let machine = repository.load_bindings()?;
+    if let Some((other, provider)) = root_profile_collision(
+        &machine,
+        Some(&request.local_project_id),
+        &canonical.to_string_lossy(),
+        &request.profile_ids,
+    ) {
+        return Err(format!(
+            "'{}' already uses this {} config for this folder; pick a different config",
+            project_label(&config, &other.local_project_id),
+            provider_name(provider)
+        ));
     }
     Ok(ValidatedBindingRequest {
         canonical_project_root: canonical.to_string_lossy().into_owned(),
@@ -4018,18 +4498,30 @@ pub async fn finalize_project_setup(
     expected_revision: u64,
 ) -> Result<ProjectDetail, String> {
     let repository = repository(&app)?;
-    emit_log(&app, "info", "Finalizing project setup…");
+    let log = ActivityLogScope::new(ActivityLogType::Configuration);
+    log.emit(
+        &app,
+        "info",
+        "configuration.project_setup_started",
+        "Finalizing project setup…",
+    );
     let result = run_blocking(move || {
         finalize_project_setup_with_repository(&repository, &draft_id, expected_revision)
     })
     .await;
     match &result {
-        Ok(detail) => emit_log(
+        Ok(detail) => log.emit(
             &app,
             "ok",
+            "configuration.project_setup_completed",
             &format!("Project {} is set up", detail.project.display_name),
         ),
-        Err(error) => emit_log(&app, "error", &format!("Project setup failed: {}", error)),
+        Err(error) => log.emit(
+            &app,
+            "error",
+            "configuration.project_setup_failed",
+            &format!("Project setup failed: {}", error),
+        ),
     }
     result
 }
@@ -4101,19 +4593,6 @@ fn create_setup_draft_with_repository(
     if paths_overlap(&canonical, &repository_root) {
         return Err("project root overlaps schema-3 application data".to_string());
     }
-    let machine = repository.load_bindings()?;
-    for binding in machine
-        .bindings
-        .iter()
-        .filter(|binding| binding.state == BindingState::Active)
-    {
-        if Path::new(&binding.canonical_project_root) == canonical {
-            return Err(format!(
-                "this folder is already set up as project '{}'",
-                binding.local_project_id
-            ));
-        }
-    }
     let canonical_text = canonical.to_string_lossy().into_owned();
     let (existing, _) = repository.list_setup_drafts()?;
     if let Some(found) = existing
@@ -4129,14 +4608,28 @@ fn create_setup_draft_with_repository(
     ensure_default_provider_profiles(repository)?;
     let machine = repository.load_bindings()?;
     let config = repository.load_config()?;
+    // Profiles already claimed by an active project on this exact folder are
+    // taken: the composite project key (root, profile) reserves them, so a
+    // second setup here must use a different config.
+    let claimed_profiles: BTreeSet<&LocalProviderProfileId> = machine
+        .bindings
+        .iter()
+        .filter(|binding| binding.state == BindingState::Active)
+        .filter(|binding| {
+            binding.canonical_project_root.to_lowercase() == canonical_text.to_lowercase()
+        })
+        .flat_map(|binding| binding.profile_ids.values())
+        .collect();
     // Start setup with at most one agent enabled. Codex may use its single
-    // unambiguous profile as a convenience default; Claude remains opt-in so
-    // a machine with both default homes does not scan both automatically.
+    // unambiguous unclaimed profile as a convenience default; Claude remains
+    // opt-in so a machine with both default homes does not scan both
+    // automatically.
     let mut profiles = BTreeMap::new();
     let mut codex_candidates = machine
         .profiles
         .iter()
-        .filter(|profile| profile.provider == Provider::Codex);
+        .filter(|profile| profile.provider == Provider::Codex)
+        .filter(|profile| !claimed_profiles.contains(&profile.profile_id));
     if let (Some(only), None) = (codex_candidates.next(), codex_candidates.next()) {
         profiles.insert(
             Provider::Codex,
@@ -4607,6 +5100,23 @@ fn build_setup_transaction(
         );
     }
     let resolved_profiles = resolve_draft_profiles(repository, draft)?;
+    // Pending selections resolve to existing profile ids when their path is
+    // already cataloged, so an id-level collision check covers both kinds.
+    // Excluding the draft's own project keeps finalize retries idempotent.
+    let machine = repository.load_bindings()?;
+    if let Some((other, provider)) = root_profile_collision(
+        &machine,
+        Some(&draft.local_project_id),
+        &draft.canonical_project_root,
+        &resolved_profiles.profile_ids,
+    ) {
+        let config = repository.load_config()?;
+        return Err(format!(
+            "'{}' already syncs this folder with that {} config; open it instead or pick a different config",
+            project_label(&config, &other.local_project_id),
+            provider_name(provider)
+        ));
+    }
     let resolved_storage = resolve_draft_storage(repository, draft)?;
     let local_fingerprint = repository_fingerprint(&canonical);
 
@@ -4716,6 +5226,7 @@ fn build_setup_transaction(
             local_project_id: draft.local_project_id.clone(),
             storage_id: resolved.storage.id.clone(),
             bundle_id: bundle_id.clone(),
+            recipe: None,
             pinned: true,
             created_at: now,
         })
@@ -4803,6 +5314,20 @@ fn apply_setup_transaction(
         Ok(map)
     })?;
 
+    // Alias qualifier: the binding's Codex (else Claude) config name, so a
+    // second project on one checkout defaults to "repo · config (host)".
+    let machine_profiles = repository.load_bindings()?.profiles;
+    let alias_qualifier = [Provider::Codex, Provider::Claude]
+        .iter()
+        .find_map(|provider| transaction.binding.profile_ids.get(provider))
+        .and_then(|profile_id| {
+            let profile_id = profile_id_map.get(profile_id).unwrap_or(profile_id);
+            machine_profiles
+                .iter()
+                .find(|profile| &profile.profile_id == profile_id)
+                .map(|profile| profile.display_name.clone())
+        });
+
     // 2. Storage, project, and links (one atomic config mutation).
     repository.mutate_config(|config| {
         if let Some(storage) = &transaction.storage {
@@ -4820,7 +5345,11 @@ fn apply_setup_transaction(
         {
             let mut project = transaction.project.clone();
             if project.local_alias.is_none() {
-                project.local_alias = default_local_alias(&project.display_name, &config.projects);
+                project.local_alias = default_local_alias(
+                    &project.display_name,
+                    alias_qualifier.as_deref(),
+                    &config.projects,
+                );
             }
             config.projects.push(project);
         }
@@ -5044,6 +5573,865 @@ fn fs_canonicalize(path: &Path) -> Result<PathBuf, String> {
     std::fs::canonicalize(path).map_err(|error| format!("resolve '{}': {}", path.display(), error))
 }
 
+fn audit_codex_conversation_paths_with_repository(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+) -> Result<CodexConversationPathAudit, String> {
+    let stored_binding = repository
+        .load_bindings()?
+        .active_for(local_project_id)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "project '{}' is not mapped on this machine",
+                local_project_id
+            )
+        })?;
+    let binding = resolve_project_binding(repository, &stored_binding)?;
+    let profile_id = binding
+        .profile_ids
+        .get(&Provider::Codex)
+        .map(ToString::to_string);
+    let mut audit = CodexConversationPathAudit {
+        local_project_id: local_project_id.clone(),
+        profile_id,
+        profile_path: binding.codex_home.clone(),
+        project_root: binding.project_root.clone(),
+        assigned_thread_count: 0,
+        matching_thread_count: 0,
+        issues: Vec::new(),
+        blockers: Vec::new(),
+        warnings: Vec::new(),
+        ready: true,
+        can_repair: false,
+    };
+    let Some(codex_home_text) = binding.codex_home.as_deref() else {
+        return Ok(audit);
+    };
+    let codex_home = match fs_canonicalize(Path::new(codex_home_text)) {
+        Ok(path) => path,
+        Err(error) => {
+            audit.blockers.push(error);
+            return Ok(finalize_conversation_path_audit(audit));
+        }
+    };
+    let canonical_project_root = PathBuf::from(&binding.canonical_project_root);
+    let state_path = codex_home.join(".codex-global-state.json");
+    if !state_path.exists() {
+        audit.warnings.push(format!(
+            "Codex Desktop project assignments were not found in '{}'",
+            state_path.display()
+        ));
+        return Ok(finalize_conversation_path_audit(audit));
+    }
+    let state_metadata = match fs::symlink_metadata(&state_path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            audit.blockers.push(format!(
+                "inspect Codex Desktop project assignments '{}': {}",
+                state_path.display(),
+                error
+            ));
+            return Ok(finalize_conversation_path_audit(audit));
+        }
+    };
+    if !state_metadata.is_file() || state_metadata.file_type().is_symlink() {
+        audit.blockers.push(format!(
+            "Codex Desktop project assignments '{}' must be a regular file",
+            state_path.display()
+        ));
+        return Ok(finalize_conversation_path_audit(audit));
+    }
+    if state_metadata.len() > MAX_CODEX_GLOBAL_STATE_BYTES {
+        audit.blockers.push(format!(
+            "Codex Desktop project assignments '{}' exceed the {} byte safety limit",
+            state_path.display(),
+            MAX_CODEX_GLOBAL_STATE_BYTES
+        ));
+        return Ok(finalize_conversation_path_audit(audit));
+    }
+    let state_bytes = match fs::read(&state_path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            audit.blockers.push(format!(
+                "read Codex Desktop project assignments '{}': {}",
+                state_path.display(),
+                error
+            ));
+            return Ok(finalize_conversation_path_audit(audit));
+        }
+    };
+    let state: serde_json::Value = match serde_json::from_slice(&state_bytes) {
+        Ok(state) => state,
+        Err(error) => {
+            audit.blockers.push(format!(
+                "parse Codex Desktop project assignments '{}': {}",
+                state_path.display(),
+                error
+            ));
+            return Ok(finalize_conversation_path_audit(audit));
+        }
+    };
+
+    let mut desktop_project_ids = BTreeSet::new();
+    for projects in state_object_maps(&state, "local-projects") {
+        for (project_key, project) in projects {
+            let owns_root = json_path_values(project, &["rootPaths", "root_paths"])
+                .into_iter()
+                .any(|root| path_belongs_to_project(Path::new(root), &canonical_project_root));
+            if !owns_root {
+                continue;
+            }
+            desktop_project_ids.insert(project_key.clone());
+            if let Some(project_id) = project.get("id").and_then(serde_json::Value::as_str) {
+                desktop_project_ids.insert(project_id.to_string());
+            }
+        }
+    }
+
+    let mut assigned_thread_ids = BTreeSet::new();
+    for assignments in state_object_maps(&state, "thread-project-assignments") {
+        for (thread_id, assignment) in assignments {
+            let local_assignment = assignment
+                .get("projectKind")
+                .or_else(|| assignment.get("project_kind"))
+                .and_then(serde_json::Value::as_str)
+                .map(|kind| kind == "local")
+                .unwrap_or(true);
+            let assigned_project = assignment
+                .get("projectId")
+                .or_else(|| assignment.get("project_id"))
+                .and_then(serde_json::Value::as_str);
+            let legacy_cwd_matches = assigned_project.is_none()
+                && json_path_values(assignment, &["cwd"])
+                    .into_iter()
+                    .any(|cwd| path_belongs_to_project(Path::new(cwd), &canonical_project_root));
+            if local_assignment
+                && (assigned_project
+                    .map(|project_id| desktop_project_ids.contains(project_id))
+                    .unwrap_or(false)
+                    || legacy_cwd_matches)
+            {
+                insert_safe_assigned_thread(
+                    thread_id,
+                    &mut assigned_thread_ids,
+                    &mut audit.blockers,
+                );
+            }
+        }
+    }
+    for writable_roots in state_object_maps(&state, "thread-writable-roots") {
+        for (thread_id, roots) in writable_roots {
+            if json_path_values(roots, &["roots", "rootPaths", "root_paths"])
+                .into_iter()
+                .chain(json_direct_path_values(roots))
+                .any(|root| path_belongs_to_project(Path::new(root), &canonical_project_root))
+            {
+                insert_safe_assigned_thread(
+                    thread_id,
+                    &mut assigned_thread_ids,
+                    &mut audit.blockers,
+                );
+            }
+        }
+    }
+    for root_hints in state_object_maps(&state, "thread-workspace-root-hints") {
+        for (thread_id, hint) in root_hints {
+            if json_direct_path_values(hint)
+                .any(|root| path_belongs_to_project(Path::new(root), &canonical_project_root))
+            {
+                insert_safe_assigned_thread(
+                    thread_id,
+                    &mut assigned_thread_ids,
+                    &mut audit.blockers,
+                );
+            }
+        }
+    }
+    audit.assigned_thread_count = assigned_thread_ids.len();
+    if assigned_thread_ids.is_empty() {
+        return Ok(finalize_conversation_path_audit(audit));
+    }
+
+    let mut transcript_paths: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let mut visited_files = 0_usize;
+    let mut limit_reached = false;
+    for directory in ["sessions", "archived_sessions"] {
+        let session_root = codex_home.join(directory);
+        if !session_root.exists() {
+            continue;
+        }
+        let root_metadata = match fs::symlink_metadata(&session_root) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                audit.blockers.push(format!(
+                    "inspect Codex {} directory '{}': {}",
+                    directory,
+                    session_root.display(),
+                    error
+                ));
+                continue;
+            }
+        };
+        if !root_metadata.is_dir() || root_metadata.file_type().is_symlink() {
+            audit.blockers.push(format!(
+                "Codex {} directory '{}' must be a real directory",
+                directory,
+                session_root.display()
+            ));
+            continue;
+        }
+        for entry in WalkDir::new(&session_root).follow_links(false).max_depth(8) {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    audit
+                        .blockers
+                        .push(format!("walk Codex {} sessions: {}", directory, error));
+                    continue;
+                }
+            };
+            if !entry.file_type().is_file()
+                || entry.path().extension().and_then(|value| value.to_str()) != Some("jsonl")
+            {
+                continue;
+            }
+            visited_files = visited_files.saturating_add(1);
+            if visited_files > MAX_CODEX_SESSION_FILES {
+                audit.blockers.push(format!(
+                    "Codex profile contains more than {} session files; repair requires manual review",
+                    MAX_CODEX_SESSION_FILES
+                ));
+                limit_reached = true;
+                break;
+            }
+            let filename = entry.file_name().to_string_lossy();
+            let filename_matches_assignment = assigned_thread_ids
+                .iter()
+                .any(|thread_id| filename.contains(thread_id));
+            let metadata =
+                match provider_capture::scan_jsonl_metadata(entry.path(), CaptureProvider::Codex) {
+                    Ok(metadata) => metadata,
+                    Err(error) => {
+                        if filename_matches_assignment {
+                            audit.blockers.push(format!(
+                                "inspect assigned Codex conversation '{}': {}",
+                                entry.path().display(),
+                                error
+                            ));
+                        }
+                        continue;
+                    }
+                };
+            if !assigned_thread_ids.contains(&metadata.session_id) {
+                continue;
+            }
+            let canonical_path = match fs_canonicalize(entry.path()) {
+                Ok(path) => path,
+                Err(error) => {
+                    audit.blockers.push(error);
+                    continue;
+                }
+            };
+            if !canonical_path.starts_with(&codex_home) {
+                audit.blockers.push(format!(
+                    "assigned Codex conversation '{}' resolves outside its profile",
+                    entry.path().display()
+                ));
+                continue;
+            }
+            transcript_paths
+                .entry(metadata.session_id)
+                .or_default()
+                .push(canonical_path);
+        }
+        if limit_reached {
+            break;
+        }
+    }
+
+    for thread_id in assigned_thread_ids {
+        let Some(paths) = transcript_paths.get(&thread_id) else {
+            audit.warnings.push(format!(
+                "Codex Desktop assigns thread '{}' to this project, but its rollout file was not found",
+                thread_id
+            ));
+            continue;
+        };
+        if paths.len() != 1 {
+            audit.blockers.push(format!(
+                "Codex thread '{}' has {} rollout files; repair requires manual review",
+                thread_id,
+                paths.len()
+            ));
+            continue;
+        }
+        let path = &paths[0];
+        let source = match read_bounded_conversation(path) {
+            Ok(source) => source,
+            Err(error) => {
+                audit.blockers.push(error);
+                continue;
+            }
+        };
+        let stale_cwds =
+            match inspect_codex_structural_cwds(&source, &thread_id, &canonical_project_root) {
+                Ok(cwds) => cwds,
+                Err(error) => {
+                    audit.blockers.push(format!(
+                        "inspect assigned Codex conversation '{}': {}",
+                        path.display(),
+                        error
+                    ));
+                    continue;
+                }
+            };
+        if let Some(recorded_cwd) = stale_cwds.into_iter().next() {
+            let Some(transcript_path) = path.to_str() else {
+                audit.blockers.push(format!(
+                    "assigned Codex conversation path '{}' is not valid UTF-8",
+                    path.display()
+                ));
+                continue;
+            };
+            audit.issues.push(CodexConversationPathIssue {
+                thread_id,
+                transcript_path: transcript_path.to_string(),
+                recorded_cwd,
+                target_cwd: binding.project_root.clone(),
+            });
+        } else {
+            audit.matching_thread_count = audit.matching_thread_count.saturating_add(1);
+        }
+    }
+
+    Ok(finalize_conversation_path_audit(audit))
+}
+
+fn repair_codex_conversation_paths_with_repository(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+) -> Result<CodexConversationPathRepairResult, String> {
+    let audit = audit_codex_conversation_paths_with_repository(repository, local_project_id)?;
+    if !audit.blockers.is_empty() {
+        return Err(format!(
+            "conversation paths cannot be repaired safely: {}",
+            audit.blockers.join("; ")
+        ));
+    }
+    if audit.issues.is_empty() {
+        return Ok(CodexConversationPathRepairResult {
+            audit,
+            repaired_thread_ids: Vec::new(),
+            backup_dir: None,
+        });
+    }
+
+    let stored_binding = repository
+        .load_bindings()?
+        .active_for(local_project_id)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "project '{}' is not mapped on this machine",
+                local_project_id
+            )
+        })?;
+    let binding = resolve_project_binding(repository, &stored_binding)?;
+    let codex_home = binding
+        .codex_home
+        .as_deref()
+        .ok_or_else(|| "this project has no Codex profile to repair".to_string())?;
+    let canonical_codex_home = fs_canonicalize(Path::new(codex_home))?;
+    let sessions_root = canonical_codex_home.join("sessions");
+    let archived_root = canonical_codex_home.join("archived_sessions");
+
+    struct PendingRepair {
+        thread_id: String,
+        path: PathBuf,
+        original: Vec<u8>,
+        repaired: Vec<u8>,
+        mode: u32,
+    }
+
+    let mut pending = Vec::with_capacity(audit.issues.len());
+    let mut staged_source_bytes = 0_u64;
+    for issue in &audit.issues {
+        let path = PathBuf::from(&issue.transcript_path);
+        let canonical_path = fs_canonicalize(&path)?;
+        if !canonical_path.starts_with(&sessions_root)
+            && !canonical_path.starts_with(&archived_root)
+        {
+            return Err(format!(
+                "refusing to repair '{}' outside the bound Codex profile",
+                path.display()
+            ));
+        }
+        let metadata = fs::symlink_metadata(&path)
+            .map_err(|error| format!("inspect '{}': {}", path.display(), error))?;
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(format!(
+                "refusing to repair non-regular conversation file '{}'",
+                path.display()
+            ));
+        }
+        let original = read_bounded_conversation(&path)?;
+        staged_source_bytes = staged_source_bytes.saturating_add(original.len() as u64);
+        if staged_source_bytes > MAX_CONVERSATION_REPAIR_BYTES {
+            return Err(format!(
+                "assigned Codex conversations exceed the {} byte aggregate repair limit",
+                MAX_CONVERSATION_REPAIR_BYTES
+            ));
+        }
+        let stale = inspect_codex_structural_cwds(
+            &original,
+            &issue.thread_id,
+            Path::new(&binding.canonical_project_root),
+        )?;
+        if stale.is_empty() {
+            return Err(format!(
+                "Codex conversation '{}' changed after the audit; refresh and try again",
+                issue.thread_id
+            ));
+        }
+        let repaired =
+            remap_codex_structural_cwds(&original, &issue.thread_id, &binding.project_root)?;
+        #[cfg(unix)]
+        let mode = {
+            use std::os::unix::fs::PermissionsExt;
+            metadata.permissions().mode() & 0o777
+        };
+        #[cfg(not(unix))]
+        let mode = 0o600;
+        pending.push(PendingRepair {
+            thread_id: issue.thread_id.clone(),
+            path,
+            original,
+            repaired,
+            mode,
+        });
+    }
+
+    let backup_root = repository.backups_dir()?;
+    let backup_dir = backup_root.join(generated_named_id("pathrepair")?);
+    fs::create_dir(&backup_dir).map_err(|error| {
+        format!(
+            "create conversation path backup '{}': {}",
+            backup_dir.display(),
+            error
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&backup_dir, fs::Permissions::from_mode(0o700)).map_err(|error| {
+            format!(
+                "secure conversation path backup '{}': {}",
+                backup_dir.display(),
+                error
+            )
+        })?;
+    }
+    for (index, repair) in pending.iter().enumerate() {
+        let backup_path = backup_dir.join(format!("{:04}-{}.jsonl", index + 1, repair.thread_id));
+        write_immutable_backup(&backup_path, &repair.original)?;
+    }
+    for repair in &pending {
+        let current = read_bounded_conversation(&repair.path)?;
+        if current != repair.original {
+            return Err(format!(
+                "Codex conversation '{}' changed while its backup was being prepared; no files were modified",
+                repair.thread_id
+            ));
+        }
+    }
+
+    let rollback = |count: usize| {
+        pending[..count]
+            .iter()
+            .filter_map(|completed| {
+                write_target_atomic(&completed.path, &completed.original, completed.mode)
+                    .err()
+                    .map(|error| format!("{}: {}", completed.thread_id, error))
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut applied = 0_usize;
+    for repair in &pending {
+        let current = match read_bounded_conversation(&repair.path) {
+            Ok(current) => current,
+            Err(error) => {
+                let rollback_errors = rollback(applied);
+                return Err(if rollback_errors.is_empty() {
+                    format!(
+                        "repair stopped before '{}': {}; earlier changes were rolled back",
+                        repair.thread_id, error
+                    )
+                } else {
+                    format!(
+                        "repair stopped before '{}': {}; rollback also failed for {}",
+                        repair.thread_id,
+                        error,
+                        rollback_errors.join("; ")
+                    )
+                });
+            }
+        };
+        if current != repair.original {
+            let rollback_errors = rollback(applied);
+            return Err(if rollback_errors.is_empty() {
+                format!(
+                    "Codex conversation '{}' changed during repair; earlier changes were rolled back",
+                    repair.thread_id
+                )
+            } else {
+                format!(
+                    "Codex conversation '{}' changed during repair and rollback failed for {}",
+                    repair.thread_id,
+                    rollback_errors.join("; ")
+                )
+            });
+        }
+        if let Err(error) = write_target_atomic(&repair.path, &repair.repaired, repair.mode) {
+            let rollback_errors = rollback(applied);
+            return Err(if rollback_errors.is_empty() {
+                format!(
+                    "repair failed for '{}': {}; earlier changes were rolled back",
+                    repair.thread_id, error
+                )
+            } else {
+                format!(
+                    "repair failed for '{}': {}; rollback also failed for {}",
+                    repair.thread_id,
+                    error,
+                    rollback_errors.join("; ")
+                )
+            });
+        }
+        applied = applied.saturating_add(1);
+    }
+
+    let repaired_thread_ids = pending
+        .iter()
+        .map(|repair| repair.thread_id.clone())
+        .collect::<Vec<_>>();
+    let final_audit =
+        match audit_codex_conversation_paths_with_repository(repository, local_project_id) {
+            Ok(audit) => audit,
+            Err(error) => {
+                let rollback_errors = rollback(pending.len());
+                return Err(if rollback_errors.is_empty() {
+                    format!(
+                        "conversation path verification failed: {}; changes were rolled back",
+                        error
+                    )
+                } else {
+                    format!(
+                        "conversation path verification failed: {}; rollback also failed for {}",
+                        error,
+                        rollback_errors.join("; ")
+                    )
+                });
+            }
+        };
+    if !final_audit.ready {
+        let rollback_errors = rollback(pending.len());
+        return Err(if rollback_errors.is_empty() {
+            "conversation paths did not pass verification; changes were rolled back".to_string()
+        } else {
+            format!(
+                "conversation paths did not pass verification and rollback failed for {}",
+                rollback_errors.join("; ")
+            )
+        });
+    }
+    Ok(CodexConversationPathRepairResult {
+        audit: final_audit,
+        repaired_thread_ids,
+        backup_dir: backup_dir.to_str().map(ToString::to_string),
+    })
+}
+
+fn require_codex_conversation_paths_ready(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+) -> Result<(), String> {
+    let audit = audit_codex_conversation_paths_with_repository(repository, local_project_id)?;
+    if audit.ready {
+        return Ok(());
+    }
+    if !audit.blockers.is_empty() {
+        return Err(format!(
+            "Push and Pull are paused because Codex conversation ownership could not be verified: {}",
+            audit.blockers.join("; ")
+        ));
+    }
+    Err(format!(
+        "{} Codex conversation path{} must be repaired before Push or Pull",
+        audit.issues.len(),
+        if audit.issues.len() == 1 { "" } else { "s" }
+    ))
+}
+
+fn finalize_conversation_path_audit(
+    mut audit: CodexConversationPathAudit,
+) -> CodexConversationPathAudit {
+    audit
+        .issues
+        .sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
+    audit.blockers.sort();
+    audit.blockers.dedup();
+    audit.warnings.sort();
+    audit.warnings.dedup();
+    audit.ready = audit.issues.is_empty() && audit.blockers.is_empty();
+    audit.can_repair = !audit.issues.is_empty() && audit.blockers.is_empty();
+    audit
+}
+
+fn state_object_maps<'a>(
+    state: &'a serde_json::Value,
+    key: &str,
+) -> Vec<&'a serde_json::Map<String, serde_json::Value>> {
+    let mut maps = Vec::new();
+    if let Some(map) = state.get(key).and_then(serde_json::Value::as_object) {
+        maps.push(map);
+    }
+    if let Some(map) = state
+        .get("electron-persisted-atom-state")
+        .and_then(|persisted| persisted.get(key))
+        .and_then(serde_json::Value::as_object)
+    {
+        maps.push(map);
+    }
+    maps
+}
+
+fn json_path_values<'a>(value: &'a serde_json::Value, keys: &[&str]) -> Vec<&'a str> {
+    let Some(object) = value.as_object() else {
+        return Vec::new();
+    };
+    keys.iter()
+        .filter_map(|key| object.get(*key))
+        .flat_map(json_direct_path_values)
+        .collect()
+}
+
+fn json_direct_path_values(value: &serde_json::Value) -> impl Iterator<Item = &str> {
+    let direct = value.as_str().into_iter();
+    let array = value
+        .as_array()
+        .into_iter()
+        .flat_map(|values| values.iter().filter_map(serde_json::Value::as_str));
+    direct.chain(array)
+}
+
+fn path_belongs_to_project(candidate: &Path, project_root: &Path) -> bool {
+    let Some(candidate_text) = candidate.to_str() else {
+        return false;
+    };
+    if validate_absolute_clean_path("Codex project path", candidate_text).is_err() {
+        return false;
+    }
+    let candidate = fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf());
+    let project_root =
+        fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_path_buf());
+    candidate == project_root || candidate.starts_with(&project_root)
+}
+
+fn insert_safe_assigned_thread(
+    thread_id: &str,
+    assigned: &mut BTreeSet<String>,
+    blockers: &mut Vec<String>,
+) {
+    if thread_id.is_empty()
+        || thread_id.len() > 128
+        || !thread_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        blockers.push("Codex Desktop contains an unsafe assigned thread ID".to_string());
+        return;
+    }
+    assigned.insert(thread_id.to_string());
+}
+
+fn read_bounded_conversation(path: &Path) -> Result<Vec<u8>, String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect '{}': {}", path.display(), error))?;
+    if !metadata.is_file() || metadata.file_type().is_symlink() {
+        return Err(format!("'{}' is not a regular file", path.display()));
+    }
+    if metadata.len() > MAX_CONVERSATION_REPAIR_BYTES {
+        return Err(format!(
+            "Codex conversation '{}' exceeds the {} byte repair limit",
+            path.display(),
+            MAX_CONVERSATION_REPAIR_BYTES
+        ));
+    }
+    fs::read(path).map_err(|error| format!("read '{}': {}", path.display(), error))
+}
+
+fn inspect_codex_structural_cwds(
+    source: &[u8],
+    expected_thread_id: &str,
+    project_root: &Path,
+) -> Result<BTreeSet<String>, String> {
+    let mut found_session_meta = false;
+    let mut stale_cwds = BTreeSet::new();
+    for line in source.split_inclusive(|byte| *byte == b'\n') {
+        let json = line
+            .strip_suffix(b"\r\n")
+            .or_else(|| line.strip_suffix(b"\n"))
+            .unwrap_or(line);
+        if !contains_byte_sequence(json, b"session_meta")
+            && !contains_byte_sequence(json, b"turn_context")
+        {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_slice(json) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let record_type = value.get("type").and_then(serde_json::Value::as_str);
+        if !matches!(record_type, Some("session_meta" | "turn_context")) {
+            continue;
+        }
+        let payload = value
+            .get("payload")
+            .and_then(serde_json::Value::as_object)
+            .ok_or_else(|| format!("{} row has no payload", record_type.unwrap_or("structural")))?;
+        if record_type == Some("session_meta") {
+            let recorded_id = payload
+                .get("id")
+                .or_else(|| payload.get("thread_id"))
+                .or_else(|| payload.get("threadId"))
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "session_meta row has no thread ID".to_string())?;
+            if recorded_id != expected_thread_id {
+                return Err(format!(
+                    "session_meta thread ID '{}' does not match assigned thread '{}'",
+                    recorded_id, expected_thread_id
+                ));
+            }
+            found_session_meta = true;
+        }
+        let Some(cwd) = payload.get("cwd").and_then(serde_json::Value::as_str) else {
+            if record_type == Some("session_meta") {
+                return Err("session_meta row has no cwd".to_string());
+            }
+            continue;
+        };
+        if !path_belongs_to_project(Path::new(cwd), project_root) {
+            stale_cwds.insert(cwd.to_string());
+        }
+    }
+    if !found_session_meta {
+        return Err("session_meta row was not found".to_string());
+    }
+    Ok(stale_cwds)
+}
+
+fn remap_codex_structural_cwds(
+    source: &[u8],
+    expected_thread_id: &str,
+    target_cwd: &str,
+) -> Result<Vec<u8>, String> {
+    validate_absolute_clean_path("target Codex conversation cwd", target_cwd)?;
+    let mut output = Vec::with_capacity(source.len());
+    let mut found_session_meta = false;
+    let mut changed = 0_usize;
+    for line in source.split_inclusive(|byte| *byte == b'\n') {
+        let (json, ending): (&[u8], &[u8]) = if let Some(json) = line.strip_suffix(b"\r\n") {
+            (json, b"\r\n")
+        } else if let Some(json) = line.strip_suffix(b"\n") {
+            (json, b"\n")
+        } else {
+            (line, b"")
+        };
+        if !contains_byte_sequence(json, b"session_meta")
+            && !contains_byte_sequence(json, b"turn_context")
+        {
+            output.extend_from_slice(line);
+            continue;
+        }
+        let mut value: serde_json::Value = match serde_json::from_slice(json) {
+            Ok(value) => value,
+            Err(_) => {
+                output.extend_from_slice(line);
+                continue;
+            }
+        };
+        let record_type = value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if !matches!(
+            record_type.as_deref(),
+            Some("session_meta" | "turn_context")
+        ) {
+            output.extend_from_slice(line);
+            continue;
+        }
+        if record_type.as_deref() == Some("session_meta") {
+            let recorded_id = value
+                .get("payload")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|payload| {
+                    payload
+                        .get("id")
+                        .or_else(|| payload.get("thread_id"))
+                        .or_else(|| payload.get("threadId"))
+                })
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| "session_meta row has no thread ID".to_string())?;
+            if recorded_id != expected_thread_id {
+                return Err(format!(
+                    "session_meta thread ID '{}' does not match assigned thread '{}'",
+                    recorded_id, expected_thread_id
+                ));
+            }
+            found_session_meta = true;
+        }
+        let Some(cwd) = value
+            .get_mut("payload")
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|payload| payload.get_mut("cwd"))
+            .filter(|cwd| cwd.is_string())
+        else {
+            if record_type.as_deref() == Some("session_meta") {
+                return Err("session_meta row has no cwd".to_string());
+            }
+            output.extend_from_slice(line);
+            continue;
+        };
+        if cwd.as_str() == Some(target_cwd) {
+            output.extend_from_slice(line);
+            continue;
+        }
+        *cwd = serde_json::Value::String(target_cwd.to_string());
+        changed = changed.saturating_add(1);
+        output.extend_from_slice(
+            &serde_json::to_vec(&value)
+                .map_err(|error| format!("serialize repaired Codex session row: {}", error))?,
+        );
+        output.extend_from_slice(ending);
+    }
+    if !found_session_meta {
+        return Err("session_meta row was not found".to_string());
+    }
+    if changed == 0 {
+        return Err("conversation no longer contains a stale structural cwd".to_string());
+    }
+    Ok(output)
+}
+
+fn contains_byte_sequence(haystack: &[u8], needle: &[u8]) -> bool {
+    !needle.is_empty()
+        && haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -5132,6 +6520,129 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn conversation_path_repair_only_rewrites_desktop_assigned_threads() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = V3Repository::from_home_dir(temp.path().join("agent-sync-home")).unwrap();
+        let project = register(&repo);
+        let project_root = temp.path().join("healthGame");
+        let stale_root = temp.path().join("game3");
+        let codex_home = temp.path().join(".codex");
+        let sessions = codex_home.join("sessions/2026/07/19");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(&stale_root).unwrap();
+        std::fs::create_dir_all(&sessions).unwrap();
+        let profile_id = add_profile(&repo, Provider::Codex, &codex_home);
+        let binding = save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: project.local_project_id.clone(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, profile_id)]),
+                expected_revision: None,
+            },
+        )
+        .unwrap();
+
+        let stale_thread = "019f7500-0000-7000-8000-000000000001";
+        let matching_thread = "019f7500-0000-7000-8000-000000000002";
+        let unrelated_thread = "019f7500-0000-7000-8000-000000000003";
+        let stale_path = sessions.join(format!("rollout-{}.jsonl", stale_thread));
+        let matching_path = sessions.join(format!("rollout-{}.jsonl", matching_thread));
+        let unrelated_path = sessions.join(format!("rollout-{}.jsonl", unrelated_thread));
+        let stale_root_json = serde_json::to_string(stale_root.to_str().unwrap()).unwrap();
+        let project_root_json = serde_json::to_string(project_root.to_str().unwrap()).unwrap();
+        let message_line = format!(
+            "{{\"type\":\"response_item\",\"payload\":{{\"text\":\"keep the literal {} unchanged\"}}}}\n",
+            stale_root.display()
+        );
+        let stale_source = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"cwd\":{}}}}}\n{}{{\"type\":\"turn_context\",\"payload\":{{\"cwd\":{}}}}}\n",
+            stale_thread, stale_root_json, message_line, stale_root_json
+        );
+        std::fs::write(&stale_path, stale_source.as_bytes()).unwrap();
+        std::fs::write(
+            &matching_path,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"cwd\":{}}}}}\n",
+                matching_thread, project_root_json
+            ),
+        )
+        .unwrap();
+        let unrelated_source = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"{}\",\"cwd\":{}}}}}\n",
+            unrelated_thread, stale_root_json
+        );
+        std::fs::write(&unrelated_path, unrelated_source.as_bytes()).unwrap();
+        std::fs::write(
+            codex_home.join(".codex-global-state.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "local-projects": {
+                    "local-health": {
+                        "id": "local-health",
+                        "name": "healthGame",
+                        "rootPaths": [project_root.to_str().unwrap()]
+                    }
+                },
+                "thread-project-assignments": {},
+                "thread-writable-roots": {
+                    (stale_thread): [project_root.to_str().unwrap()],
+                    (matching_thread): [project_root.to_str().unwrap()],
+                    (unrelated_thread): [stale_root.to_str().unwrap()]
+                },
+                "thread-workspace-root-hints": {}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let audit =
+            audit_codex_conversation_paths_with_repository(&repo, &project.local_project_id)
+                .unwrap();
+        assert_eq!(audit.assigned_thread_count, 2);
+        assert_eq!(audit.matching_thread_count, 1);
+        assert_eq!(audit.issues.len(), 1);
+        assert_eq!(audit.issues[0].thread_id, stale_thread);
+        assert!(audit.can_repair);
+        assert!(require_codex_conversation_paths_ready(&repo, &project.local_project_id).is_err());
+
+        let repaired =
+            repair_codex_conversation_paths_with_repository(&repo, &project.local_project_id)
+                .unwrap();
+        assert_eq!(repaired.repaired_thread_ids, vec![stale_thread]);
+        assert!(repaired.audit.ready);
+        assert_eq!(repaired.audit.matching_thread_count, 2);
+        let repaired_source = std::fs::read_to_string(&stale_path).unwrap();
+        assert!(repaired_source.contains(&message_line));
+        for line in repaired_source.lines() {
+            let value: serde_json::Value = serde_json::from_str(line).unwrap();
+            if matches!(
+                value.get("type").and_then(serde_json::Value::as_str),
+                Some("session_meta" | "turn_context")
+            ) {
+                assert_eq!(
+                    value["payload"]["cwd"].as_str(),
+                    Some(binding.project_root.as_str())
+                );
+            }
+        }
+        assert_eq!(
+            std::fs::read(&unrelated_path).unwrap(),
+            unrelated_source.as_bytes()
+        );
+        let backup_dir = PathBuf::from(repaired.backup_dir.unwrap());
+        let backups = std::fs::read_dir(backup_dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            std::fs::read(backups[0].path()).unwrap(),
+            stale_source.as_bytes()
+        );
+        require_codex_conversation_paths_ready(&repo, &project.local_project_id).unwrap();
     }
 
     #[test]
@@ -5270,7 +6781,37 @@ mod tests {
             .map(ToString::to_string)
             .collect::<BTreeSet<_>>();
         assert!(persisted.contains(&format!("codex:session:{}", third_id)));
+        // An explicit Push selection belongs to this destination and overrides
+        // the project defaults without rewriting them.
+        let pushed_empty = push_bundle_with_recipe_with_repository(
+            &repo,
+            &project.local_project_id,
+            &storage_id,
+            Some(BundleRecipe::default()),
+        )
+        .unwrap();
+        assert!(pushed_empty.results.is_empty());
         let config = repo.load_config().unwrap();
+        let link = config
+            .links
+            .iter()
+            .find(|link| {
+                link.local_project_id == project.local_project_id && link.storage_id == storage_id
+            })
+            .unwrap();
+        assert!(link.recipe.as_ref().unwrap().entries.is_empty());
+        assert!(config
+            .project(&project.local_project_id)
+            .unwrap()
+            .recipe
+            .entries
+            .contains_key(&ResourceId::parse(format!("codex:session:{}", third_id)).unwrap()));
+        assert!(
+            get_bundle_status_with_repository(&repo, &project.local_project_id, &storage_id,)
+                .unwrap()
+                .statuses
+                .is_empty()
+        );
         let base = config
             .project(&project.local_project_id)
             .unwrap()
@@ -5341,6 +6882,29 @@ mod tests {
         assert_eq!(
             third.local_alias.as_deref(),
             Some(format!("{base} 3").as_str())
+        );
+    }
+
+    #[test]
+    fn default_alias_prefers_the_config_name_over_the_hostname() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp);
+        let first = register(&repo);
+        let taken = first.local_alias.clone().unwrap();
+        let projects = repo.load_config().unwrap().projects;
+        // Generated config names abbreviate to their distinctive part.
+        assert_eq!(
+            default_local_alias("Project A", Some("conf2 · Codex"), &projects).as_deref(),
+            Some("Project A (conf2)")
+        );
+        assert_eq!(
+            default_local_alias("Project A", Some("Default Codex"), &projects).as_deref(),
+            Some("Project A (Codex)")
+        );
+        // Without a config the hostname fallback and counter still apply.
+        assert_eq!(
+            default_local_alias("Project A", None, &projects).as_deref(),
+            Some(format!("{taken} 2").as_str())
         );
     }
 
@@ -5434,6 +6998,86 @@ mod tests {
         )
         .unwrap();
         assert_eq!(link.bundle_id, project.bundle_id);
+    }
+
+    #[test]
+    fn unlink_removes_the_destination_base_without_deleting_storage_data() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp);
+        let project = register(&repo);
+        let storage_id = StorageId::parse("backup").unwrap();
+        let storage_root = temp.path().join("store");
+        std::fs::create_dir_all(&storage_root).unwrap();
+        let marker = storage_root.join("remote-object");
+        std::fs::write(&marker, b"keep").unwrap();
+
+        let mut config = repo.load_config().unwrap();
+        config.storages.push(StorageConfigV3 {
+            id: storage_id.clone(),
+            name: "Backup".to_string(),
+            kind: StorageKind::Local,
+            bucket: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            account_id: String::new(),
+            s3_endpoint: String::new(),
+            region: String::new(),
+            local_dir: storage_root.to_string_lossy().into_owned(),
+            included_default_exclusions: Vec::new(),
+            supports_conditional_writes: None,
+        });
+        repo.save_config(config).unwrap();
+        save_project_link_with_repository(
+            &repo,
+            SaveProjectLinkRequest {
+                local_project_id: project.local_project_id.clone(),
+                storage_id: storage_id.clone(),
+                pinned: true,
+            },
+        )
+        .unwrap();
+        repo.mutate_config(|config| {
+            config
+                .projects
+                .iter_mut()
+                .find(|candidate| candidate.local_project_id == project.local_project_id)
+                .unwrap()
+                .recipe_bases
+                .insert(
+                    storage_id.clone(),
+                    RecipeBase {
+                        generation: 1,
+                        manifest_sha256: "a".repeat(64),
+                        recipe_revision: 1,
+                        binding_revision: Some(1),
+                        last_pull_at: Some(1),
+                        last_push_at: None,
+                    },
+                );
+            Ok(())
+        })
+        .unwrap();
+
+        assert!(remove_project_link_with_repository(
+            &repo,
+            &project.local_project_id,
+            &storage_id,
+        )
+        .unwrap());
+        let mut config = repo.load_config().unwrap();
+        assert!(config.links.is_empty());
+        assert!(!config.projects[0].recipe_bases.contains_key(&storage_id));
+        assert!(marker.exists());
+
+        config.storages.retain(|storage| storage.id != storage_id);
+        repo.save_config(config).unwrap();
+        assert!(marker.exists());
+        assert!(!remove_project_link_with_repository(
+            &repo,
+            &project.local_project_id,
+            &storage_id,
+        )
+        .unwrap());
     }
 
     #[test]
@@ -5718,9 +7362,135 @@ mod tests {
             .active_for(&project.local_project_id)
             .cloned()
             .unwrap();
-        let plan = plan_dependencies_with_repository(&repo, &project.bundle_id, &binding).unwrap();
+        let restore =
+            plan_bundle_restore_with_repository(&repo, &storage_id, &project.bundle_id, &binding)
+                .unwrap();
+        let plan = plan_dependencies_with_repository(&repo, &restore.plan_id).unwrap();
         assert!(plan.plan_id.as_str().starts_with("plan-"));
         assert_eq!(repo.load_dependency_plan(&plan.plan_id).unwrap(), plan);
+    }
+
+    #[test]
+    fn pull_support_uses_the_restore_plans_storage_when_linked_generations_differ() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp);
+        let first_storage_id = StorageId::parse("first-linked-store").unwrap();
+        let selected_storage_id = StorageId::parse("selected-pull-store").unwrap();
+        let mut config = repo.load_config().unwrap();
+        config.storages.extend([
+            StorageConfigV3 {
+                id: first_storage_id.clone(),
+                name: "First linked store".to_string(),
+                kind: StorageKind::Local,
+                bucket: String::new(),
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+                account_id: String::new(),
+                s3_endpoint: String::new(),
+                region: String::new(),
+                local_dir: temp
+                    .path()
+                    .join("first-store")
+                    .to_string_lossy()
+                    .into_owned(),
+                included_default_exclusions: Vec::new(),
+                supports_conditional_writes: None,
+            },
+            StorageConfigV3 {
+                id: selected_storage_id.clone(),
+                name: "Selected Pull store".to_string(),
+                kind: StorageKind::Local,
+                bucket: String::new(),
+                access_key_id: String::new(),
+                secret_access_key: String::new(),
+                account_id: String::new(),
+                s3_endpoint: String::new(),
+                region: String::new(),
+                local_dir: temp
+                    .path()
+                    .join("selected-store")
+                    .to_string_lossy()
+                    .into_owned(),
+                included_default_exclusions: Vec::new(),
+                supports_conditional_writes: None,
+            },
+        ]);
+        repo.save_config(config).unwrap();
+
+        let project = register(&repo);
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let profile_id = add_profile(&repo, Provider::Codex, &temp.path().join("codex-home"));
+        save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: project.local_project_id.clone(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, profile_id)]),
+                expected_revision: None,
+            },
+        )
+        .unwrap();
+        for storage_id in [&first_storage_id, &selected_storage_id] {
+            save_project_link_with_repository(
+                &repo,
+                SaveProjectLinkRequest {
+                    local_project_id: project.local_project_id.clone(),
+                    storage_id: storage_id.clone(),
+                    pinned: true,
+                },
+            )
+            .unwrap();
+        }
+
+        for _ in 0..2 {
+            push_bundle_with_repository(&repo, &project.local_project_id, &first_storage_id)
+                .unwrap();
+        }
+        for _ in 0..3 {
+            push_bundle_with_repository(&repo, &project.local_project_id, &selected_storage_id)
+                .unwrap();
+        }
+
+        let binding = repo
+            .load_bindings()
+            .unwrap()
+            .active_for(&project.local_project_id)
+            .cloned()
+            .unwrap();
+        let restore = plan_bundle_restore_with_repository(
+            &repo,
+            &selected_storage_id,
+            &project.bundle_id,
+            &binding,
+        )
+        .unwrap();
+        let dependencies = plan_dependencies_with_repository(&repo, &restore.plan_id).unwrap();
+
+        assert_eq!(restore.storage_id, selected_storage_id);
+        assert_eq!(restore.generation, 3);
+        assert_eq!(dependencies.storage_id, restore.storage_id);
+        assert_eq!(dependencies.generation, restore.generation);
+        assert_eq!(dependencies.commit_id, restore.commit_id);
+        assert_eq!(dependencies.manifest_sha256, restore.manifest_sha256);
+        assert_eq!(dependencies.binding_revision, restore.binding_revision);
+        assert_eq!(
+            get_restore_readiness_with_repository(&repo, &restore.plan_id)
+                .unwrap()
+                .bundle_id,
+            restore.bundle_id
+        );
+
+        push_bundle_with_repository(&repo, &project.local_project_id, &selected_storage_id)
+            .unwrap();
+        assert!(plan_dependencies_with_repository(&repo, &restore.plan_id)
+            .unwrap_err()
+            .contains("bundle head changed after restore planning"));
+        assert!(
+            get_restore_readiness_with_repository(&repo, &restore.plan_id)
+                .unwrap_err()
+                .contains("bundle head changed after restore planning")
+        );
     }
 
     #[test]
@@ -5853,11 +7623,11 @@ mod tests {
             plan_bundle_restore_with_repository(&repo, &storage_id, &bundle_id, &target_binding)
                 .unwrap();
         assert_eq!(restore.actions.len(), 2, "session plus filtered index");
-        let dependencies =
-            plan_dependencies_with_repository(&repo, &bundle_id, &target_binding).unwrap();
+        let dependencies = plan_dependencies_with_repository(&repo, &restore.plan_id).unwrap();
         assert!(dependencies.actions.is_empty());
         let before =
-            get_bundle_readiness_with_repository(&repo, &bundle_id, &target_binding).unwrap();
+            get_bundle_readiness_with_repository(&repo, &storage_id, &bundle_id, &target_binding)
+                .unwrap();
         assert_eq!(before.state, "needs_setup");
 
         let approved = restore
@@ -5895,7 +7665,8 @@ mod tests {
         assert!(target_base.last_pull_at.is_some());
         assert_eq!(target_base.last_push_at, None);
         let after =
-            get_bundle_readiness_with_repository(&repo, &bundle_id, &target_binding).unwrap();
+            get_bundle_readiness_with_repository(&repo, &storage_id, &bundle_id, &target_binding)
+                .unwrap();
         assert_eq!(after.state, "ready");
     }
 
@@ -6069,8 +7840,7 @@ mod tests {
             .as_deref()
             .unwrap()
             .ends_with("skills/capture-lsservice-detail"));
-        let dependencies =
-            plan_dependencies_with_repository(&repo, &bundle_id, &target_binding).unwrap();
+        let dependencies = plan_dependencies_with_repository(&repo, &restore.plan_id).unwrap();
         assert!(dependencies.actions.is_empty());
 
         let applied = apply_bundle_restore_with_repository(
@@ -6088,7 +7858,8 @@ mod tests {
             .join("skills/get-real-hardware-rh-service")
             .exists());
         let readiness =
-            get_bundle_readiness_with_repository(&repo, &bundle_id, &target_binding).unwrap();
+            get_bundle_readiness_with_repository(&repo, &storage_id, &bundle_id, &target_binding)
+                .unwrap();
         assert_eq!(readiness.state, "ready");
     }
 
@@ -6228,6 +7999,53 @@ mod tests {
     }
 
     #[test]
+    fn configured_agent_home_cannot_change_without_re_setup() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let repo = V3Repository::from_home_dir(temp.path().join("home")).unwrap();
+        let project = register(&repo);
+        let first_profile = add_profile(&repo, Provider::Codex, &temp.path().join("codex-one"));
+        let second_profile = add_profile(&repo, Provider::Codex, &temp.path().join("codex-two"));
+        let first = save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: project.local_project_id.clone(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, first_profile.clone())]),
+                expected_revision: None,
+            },
+        )
+        .unwrap();
+
+        let error = save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: project.local_project_id.clone(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, second_profile)]),
+                expected_revision: Some(first.revision),
+            },
+        )
+        .unwrap_err();
+
+        assert!(
+            error.contains("agent home is fixed after project setup"),
+            "{error}"
+        );
+        let current = repo
+            .load_bindings()
+            .unwrap()
+            .active_for(&project.local_project_id)
+            .unwrap()
+            .clone();
+        assert_eq!(
+            current.profile_ids.get(&Provider::Codex),
+            Some(&first_profile)
+        );
+    }
+
+    #[test]
     fn binding_rejects_local_store_overlap() {
         let temp = tempfile::tempdir().unwrap();
         let project_root = temp.path().join("project");
@@ -6306,6 +8124,56 @@ mod tests {
         let persisted = repo.load_bindings().unwrap();
         assert_eq!(persisted.bindings[0].profile_ids, binding.profile_ids);
         assert!(persisted.bindings[0].codex_home.is_none());
+    }
+
+    #[test]
+    fn one_checkout_hosts_a_second_project_through_a_different_codex_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("healthGame");
+        std::fs::create_dir_all(&project_root).unwrap();
+        let repo = V3Repository::from_home_dir(temp.path().join("home")).unwrap();
+        let first = register(&repo);
+        let second = register(&repo);
+        let main_profile = add_profile(&repo, Provider::Codex, &temp.path().join(".codex"));
+        let alt_profile = add_profile(&repo, Provider::Codex, &temp.path().join("conf2/.codex"));
+        save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: first.local_project_id.clone(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, main_profile.clone())]),
+                expected_revision: None,
+            },
+        )
+        .unwrap();
+
+        // The composite key (folder, config) rejects a second claim on the
+        // same Codex config but welcomes a different config on the folder.
+        let error = save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: second.local_project_id.clone(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, main_profile)]),
+                expected_revision: None,
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("already uses this Codex config"), "{error}");
+
+        save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: second.local_project_id.clone(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, alt_profile)]),
+                expected_revision: None,
+            },
+        )
+        .unwrap();
+        let machine = repo.load_bindings().unwrap();
+        assert!(machine.active_for(&first.local_project_id).is_some());
+        assert!(machine.active_for(&second.local_project_id).is_some());
     }
 
     #[test]
@@ -6515,6 +8383,88 @@ mod tests {
             "unexpected error: {error}"
         );
         assert_eq!(fixture.repo.load_config().unwrap().projects.len(), 1);
+    }
+
+    #[test]
+    fn second_setup_on_one_folder_needs_a_different_codex_config() {
+        let fixture = setup_fixture();
+        let draft = draft_ready_to_finalize(&fixture);
+        finalize_project_setup_with_repository(&fixture.repo, &draft.draft_id, draft.revision)
+            .unwrap();
+        let claimed_profile_id = fixture
+            .repo
+            .load_bindings()
+            .unwrap()
+            .profiles
+            .iter()
+            .find(|profile| {
+                Path::new(&profile.canonical_path) == fs_canonicalize(&fixture.codex_home).unwrap()
+            })
+            .unwrap()
+            .profile_id
+            .clone();
+
+        // The folder can enter setup again, but the claimed config is never
+        // preselected for it.
+        let second = create_setup_draft_with_repository(
+            &fixture.repo,
+            &fixture.project_dir.to_string_lossy(),
+        )
+        .unwrap();
+        assert!(!second.resumed);
+        if let Some(DraftProfileSelection::Existing { profile_id }) =
+            second.draft.profiles.get(&Provider::Codex)
+        {
+            assert_ne!(profile_id, &claimed_profile_id);
+        }
+
+        let mut colliding = second.draft.clone();
+        colliding.profiles = BTreeMap::from([(
+            Provider::Codex,
+            DraftProfileSelection::Pending {
+                path: fixture.codex_home.to_string_lossy().into_owned(),
+                display_name: String::new(),
+            },
+        )]);
+        colliding.storage = Some(DraftStorageSelection::Existing {
+            storage_id: StorageId::parse("storage-setup-test").unwrap(),
+        });
+        let colliding = update_setup_draft_with_repository(&fixture.repo, colliding).unwrap();
+        let error = finalize_project_setup_with_repository(
+            &fixture.repo,
+            &colliding.draft_id,
+            colliding.revision,
+        )
+        .unwrap_err();
+        assert!(error.contains("already syncs this folder"), "{error}");
+
+        // A different Codex home is a separate project key: it finalizes, and
+        // the default alias carries the config name instead of a counter.
+        let alt_home = fixture._temp.path().join("conf2/.codex");
+        std::fs::create_dir_all(&alt_home).unwrap();
+        let mut retry = fixture
+            .repo
+            .load_setup_draft(&colliding.draft_id)
+            .unwrap()
+            .unwrap();
+        retry.profiles = BTreeMap::from([(
+            Provider::Codex,
+            DraftProfileSelection::Pending {
+                path: alt_home.to_string_lossy().into_owned(),
+                display_name: "conf2".to_string(),
+            },
+        )]);
+        let retry = update_setup_draft_with_repository(&fixture.repo, retry).unwrap();
+        let detail =
+            finalize_project_setup_with_repository(&fixture.repo, &retry.draft_id, retry.revision)
+                .unwrap();
+        assert_eq!(fixture.repo.load_config().unwrap().projects.len(), 2);
+        let alias = detail.project.local_alias.clone().unwrap();
+        assert_eq!(alias, "app (conf2)");
+        let machine = fixture.repo.load_bindings().unwrap();
+        assert!(machine
+            .active_for(&detail.project.local_project_id)
+            .is_some());
     }
 
     #[test]

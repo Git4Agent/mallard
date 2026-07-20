@@ -1,6 +1,6 @@
-# Agent Sync
+# Mallard
 
-Agent Sync is a Tauri 2 desktop app for moving the Codex and Claude resources
+Mallard is a Tauri 2 desktop app for moving the Codex and Claude resources
 that belong to a project between machines. It syncs a selected project bundle,
 not an entire `~/.codex` or `~/.claude` directory.
 
@@ -76,7 +76,7 @@ This example assumes the current checkout is at
    ```
 
 2. Start Codex with the custom home and complete one small task in the test
-   checkout. This gives Agent Sync a project-owned task to discover.
+   checkout. This gives Mallard a project-owned task to discover.
 
    ```sh
    CODEX_HOME="$HOME/agent-sync-takeover/codex-source" codex -C "$HOME/work/tauri-codex-sync"
@@ -97,22 +97,26 @@ This example assumes the current checkout is at
 6. Review the discovered task and config resources, choose what should sync,
    link the local storage, and click `Create project`. Open the project row and
    click `Push`. The Activity panel should show the published generation, and
-   the storage directory should contain `v3/bundles/<bundle-id>/`.
+   the storage directory should contain
+   `.mallard/v1/repositories/<repository-id>/`.
 7. Prepare a second checkout of the same Git repository at
    `$HOME/work/tauri-codex-sync-restore`. Add it as another project, choose
    `$HOME/agent-sync-takeover/codex-restore` as its Codex profile, and link
    `Takeover local`. Choose the matching remote repo, click
    `Connect and review Pull`, inspect the restore plan, then approve only the
    writes and dependency actions you expect. The task and selected agent
-   resources should appear under `codex-restore`; Agent Sync should not copy
+   resources should appear under `codex-restore`; Mallard should not copy
    the application's source files.
 
 Bundle IDs are opaque. Checkout paths, provider profile paths, credentials,
 trust decisions, and apply receipts stay on the local machine. Schema 3 uses
 the global `~/.mallard/` directory directly—not a nested Tauri app-data `v3/`
-directory—and cloud keys under `v3/bundles/<bundle-id>/`. It does not migrate
-or overwrite schema-2 state, and schema-3 files from the former Tauri app-data
-location are not imported automatically.
+directory—and portable storage keys under
+`.mallard/v1/repositories/<repository-id>/`. The repository ID is the existing
+portable bundle ID, not a machine-local project ID. The app does not discover
+or migrate the former `v3/bundles/` namespace, does not overwrite schema-2
+state, and does not import schema-3 files from the former Tauri app-data
+location automatically.
 
 ## Metadata layout
 
@@ -120,7 +124,7 @@ location are not imported automatically.
 
 ```text
 Machine                                              Portable storage
-checkout + selected provider home -- selected data -> v3/bundles/<bundle-id>/
+checkout + selected provider home -- selected data -> .mallard/v1/repositories/<repository-id>/
 sync_config: bundle ID + recipe ------ projection --> current manifest
 paths, profiles, credentials, plans ------- X         never uploaded
 ```
@@ -170,7 +174,7 @@ feature is used:
 These files are atomically replaced with revision checks and private file
 permissions on Unix. They contain machine paths and may contain storage
 credentials, so do not copy this directory into the shared storage folder.
-The selected Codex or Claude home is separate again: Agent Sync reads and
+The selected Codex or Claude home is separate again: Mallard reads and
 writes approved provider resources there, but it does not treat that whole
 directory as app metadata.
 
@@ -181,18 +185,24 @@ has a lock file used for compare-and-swap writes:
 
 ```text
 <local-storage>/
-|-- .bundle-store.lock                 # local-folder mode only
-`-- v3/bundles/<bundle-id>/
-    |-- _tag.json
-    |-- _head.json
-    |-- _manifests/
-    |   `-- <generation>-<commit-id>.json
-    |-- _commits/
-    |   `-- <generation>-<commit-id>.json
-    `-- _uploads/
-        `-- <upload-id>/files/<logical-path>
+`-- .mallard/
+    |-- .storage.lock                  # local-folder mode only
+    |-- _storage.json
+    `-- v1/repositories/<repository-id>/
+        |-- _tag.json
+        |-- _head.json
+        |-- _manifests/
+        |   `-- <generation>-<commit-id>.json
+        |-- _commits/
+        |   `-- <generation>-<commit-id>.json
+        `-- _uploads/
+            `-- <upload-id>/files/<logical-path>
 ```
 
+- `.mallard/_storage.json` identifies a Mallard storage root and its supported
+  layout version. A missing marker is created on first access; an invalid or
+  unsupported marker is rejected instead of guessed. Its initial contract is
+  `{"format":"mallard-storage","layout_version":1}`.
 - `_tag.json` is a replaceable discovery summary with the display name,
   bundle type, generation, update time, and resource and file counts. It is a
   convenience index, not the source of truth.
@@ -220,7 +230,7 @@ or script content receives only best-effort secret checks.
 
 ### Race protection and version history
 
-Agent Sync uses optimistic concurrency and immutable snapshots. This is bundle
+Mallard uses optimistic concurrency and immutable snapshots. This is bundle
 versioning, not a replacement for Git. Git remains responsible for the
 application's source files.
 
@@ -254,7 +264,7 @@ CAS E1 -> generation 8      ---> accepted
 Uploads, manifests, and commits are written before `_head.json`. If a process
 crashes or loses the CAS, its immutable objects may remain as unreachable
 orphans, but the current head never points to a partial generation. In
-local-folder mode, `.bundle-store.lock` serializes the immutable writes and
+local-folder mode, `.mallard/.storage.lock` serializes the immutable writes and
 head CAS on one filesystem. In S3/R2 mode, conditional requests use the head
 object's ETag.
 

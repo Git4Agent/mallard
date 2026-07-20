@@ -113,13 +113,13 @@ export default function BundleConnectionDialog({
           {selectedFingerprintUnknown && (
             <div className="v3-callout warning">
               <Icon name="alert-triangle" size={15} />
-              <span>This repo has no Git fingerprint, so Agent Sync cannot verify that it belongs to this checkout.</span>
+              <span>This repo has no Git fingerprint, so Mallard cannot verify that it belongs to this checkout.</span>
             </div>
           )}
 
           <div className="v3-callout warning">
             <Icon name="alert-triangle" size={15} />
-            <span>Connecting changes only Agent Sync metadata. It does not move or delete the checkout or provider profile.</span>
+            <span>Connecting changes only Mallard metadata. It does not move or delete the checkout or provider profile.</span>
           </div>
           {error && <div className="v3-callout error"><Icon name="alert-triangle" size={15} /> {error}</div>}
         </div>

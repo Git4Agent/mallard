@@ -16,7 +16,10 @@ type IconName =
   | "folder"
   | "external-link"
   | "git-branch"
+  | "help-circle"
+  | "info"
   | "link"
+  | "lock"
   | "more"
   | "pause"
   | "play"
@@ -87,6 +90,13 @@ export default function Icon({ name, size = 14, ...props }: IconProps) {
           <path d="m8 12 2.5 2.5L16 9" />
         </>
       )}
+      {name === "info" && (
+        <>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M12 11v5" />
+          <path d="M12 8h.01" />
+        </>
+      )}
       {name === "chevron-down" && <path d="m6 9 6 6 6-6" />}
       {name === "chevron-left" && <path d="m15 18-6-6 6-6" />}
       {name === "chevron-right" && <path d="m9 6 6 6-6 6" />}
@@ -94,6 +104,12 @@ export default function Icon({ name, size = 14, ...props }: IconProps) {
         <>
           <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
           <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+        </>
+      )}
+      {name === "lock" && (
+        <>
+          <rect x="5" y="10" width="14" height="10" rx="2" />
+          <path d="M8 10V7a4 4 0 0 1 8 0v3" />
         </>
       )}
       {name === "download" && (
@@ -137,6 +153,13 @@ export default function Icon({ name, size = 14, ...props }: IconProps) {
           <circle cx="6" cy="19" r="2" />
           <path d="M6 7v10" />
           <path d="M8 13h4a6 6 0 0 0 6-5" />
+        </>
+      )}
+      {name === "help-circle" && (
+        <>
+          <circle cx="12" cy="12" r="9" />
+          <path d="M9.8 9a2.3 2.3 0 0 1 4.4 1c0 1.7-2.2 2-2.2 3.7" />
+          <path d="M12 17h.01" />
         </>
       )}
       {name === "more" && (

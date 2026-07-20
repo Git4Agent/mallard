@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "agent-sync",
+  "productName": "Mallard",
   "version": "0.1.0",
   "identifier": "com.hequ.agent-sync",
   "build": {
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "Agent Sync",
+        "title": "Mallard",
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
         "width": 1100,
