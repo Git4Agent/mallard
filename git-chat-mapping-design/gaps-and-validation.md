@@ -8,7 +8,7 @@
 - Recorded SHA is context only and never proves authorship or controls attachment.
 - First-parent history is intentionally not the full Git DAG. Rebases, amended/cherry-picked commits, shallow clones, deleted branches, clock skew, and active sessions can alter or remove temporal relationships.
 - Commit correlation remains bounded to the newest 10,000 first-parent commits to prevent an unbounded Git subprocess result. Rollout files and session counts themselves are not capped.
-- A single JSONL record over 1 MiB is skipped so corrupted input cannot allocate without bound; the rest of that session is still streamed and marked partial.
+- The implemented reader currently skips a JSONL record over 1 MiB and marks the session partial. An approved pending update will preserve the 1 MiB fast path but selectively stream metadata and visible text from oversized records while discarding image data and other large irrelevant fields.
 - The session index still has a defensive 16 MiB cap. It affects preferred titles only, not rollout discovery, dates, metrics, details, or pagination.
 - Token totals are maximum Codex-reported cumulative usage, not billing estimates.
 - Restored sessions may be visible before Codex rebuilds its own index.
@@ -20,6 +20,20 @@
 - macOS is the only implemented automated launch platform.
 - The Superdesign CLI was validated at version 0.6.0 but was not authenticated. An interactive `superdesign login` is required before generating the one approved remote export. `assets/` intentionally contains no fabricated design.
 - Manual Tauri verification is still required for real long rollouts, a profile path/project path containing quotes and spaces, both themes, launch actions, shallow/worktree repositories, and a Pull-restored task.
+
+## Planned oversized-record recovery validation
+
+The pending parser update must demonstrate that:
+
+- an oversized User record containing small input text plus a multi-megabyte image returns the text without retaining the image;
+- an oversized assistant record returns eligible Codex output text while ignoring image or attachment data;
+- oversized compaction snapshots and tool-output bodies create no visible turns or warnings;
+- oversized tool calls still contribute their counter without retaining arguments;
+- a malformed oversized record produces one deduplicated warning, marks metrics partial, and does not hide later valid messages;
+- recovered turns preserve chronological pagination, stable ordinals, duplicate suppression, and the 240-character preview cap; and
+- the ordinary line buffer remains bounded to 1 MiB while ignored oversized strings are streamed without allocation proportional to their payload size.
+
+These are acceptance criteria for future implementation and are not included in the verified results below.
 
 ## Automated evidence
 

@@ -44,6 +44,12 @@ The initial response is the latest exclusive 30-day window. `Load previous 30 da
 
 `Show chat details` lazily loads genuine User and Codex message previews, 50 at a time, chronologically. Each preview is normalized and capped at 240 characters. System/developer content, injected context, reasoning, and raw tool payloads are excluded. Full chat text and derived metadata stay local and never enter bundle manifests. The on-disk cache under `~/.mallard/chat_history_cache.json` contains only parsed metadata/metrics, keyed by profile, rollout path, size, and modification time.
 
+## Approved parser update (pending implementation)
+
+The rollout reader will retain its 1 MiB bounded fast path for ordinary JSONL records. When a record exceeds that limit, Mallard will seek back to the record boundary and stream-deserialize only the fields needed for session discovery, metrics, and chat details. Visible User and Codex text will remain recoverable without retaining embedded image data, compaction bodies, reasoning, or raw tool payloads.
+
+This update does not add image display or change the chat-details contract. Details will remain chronological, paginated 50 at a time, and normalized to 240-character previews. Successfully parsed oversized records that contain no relevant metadata or visible text will be ignored silently; malformed oversized records may still make the session partial and produce a deduplicated diagnostic. This section describes an approved future implementation, not current runtime behavior.
+
 ## Main-branch compatibility
 
 The work preserves the main changes already merged through `2edc284`, including the relevant `826d890`, `60e0ea5`, and `d4d794a` work: global `~/.mallard` persistence, resumable setup, optimistic revisions, resizable sidebar, local aliases, and dedicated settings layouts. The landed `Git Info` fallback is replaced in place; no parallel `links | chat-history` state is introduced.

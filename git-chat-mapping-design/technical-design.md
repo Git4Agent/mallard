@@ -50,6 +50,16 @@ The history response contains `codex_home`, window bounds, `next_before`, storag
 
 The rollout parser uses `BufReader::read_until` and never retains the whole session. There is no 256-record, 16 MiB rollout, or 10,000-session stop. It retains only metadata and counters. A malformed or over-1-MiB individual JSONL record is skipped and marks metrics partial; later records are still read.
 
+### Approved oversized-record recovery (pending implementation)
+
+The existing 1 MiB bounded reader remains the fast path. Before each read, the parser records the JSONL record's file offset. If the bounded reader reports an oversized record, the parser seeks back to that offset and gives a newline-limited view of the record to `serde_json` for streaming deserialization. After success or failure, it advances to the next record boundary so one bad record cannot stop the session.
+
+The streaming projection retains only the fields used by existing behavior: top-level and payload timestamps, session ID, working directory, Git branch/SHA metadata, payload type and role, tool-call and user/agent counters, cumulative token totals, and visible user/assistant text from `message`, `text`, `input_text`, and `output_text`. Large or irrelevant values use `serde::de::IgnoredAny`, allowing image URLs/base64, compaction snapshots, reasoning, tool arguments/results, and unknown fields to be scanned without being retained. The projection is converted into the same minimal record shape consumed by the current summary and detail parsers so normal and oversized records keep identical filtering rules.
+
+Filtered `event_msg.user_message` remains the authoritative source for User previews; user-role `response_item` content is not exposed because it can include injected context. Codex previews continue to accept visible `event_msg.agent_message` and assistant `response_item.message` text and deduplicate paired copies. Successfully projected records, including irrelevant compaction and tool-output records, do not emit oversized-line warnings. A malformed oversized record produces at most one warning per rollout scan, marks metrics partial, and does not prevent later records from loading.
+
+The cache schema will be incremented when this behavior lands so previously cached partial scans are discarded and reparsed. No Tauri command signature, Rust response DTO, TypeScript type, pagination rule, preview length, or frontend rendering contract changes as part of this update. This subsection is an approved design and is not yet implemented.
+
 Timestamp priority is:
 
 1. first and last valid timestamped records in the complete rollout;
@@ -70,6 +80,8 @@ The response normally exposes commits in the requested 30-day window, plus any b
 ## Lazy details
 
 Every detail request validates UUID, registered project, active binding, canonical project/profile paths, and rollout ownership. Duplicate IDs consistently select the complete rollout before the latest partial rollout for both summaries and details. The detail parser streams the winner and returns at most 50 genuine user/assistant previews from the cursor. User previews come only from filtered `event_msg.user_message`; agent previews accept visible `event_msg.agent_message` and assistant `response_item.message`, deduplicating paired copies. Injected tags and non-user roles, reasoning, system/developer messages, tool data, and raw payloads are excluded.
+
+After the approved recovery update, the same filtering and pagination rules will apply to text projected from oversized records. Images remain excluded; an image-bearing record contributes only its eligible text and metadata.
 
 The frontend holds message pages once per thread ID and expansion state once per visual occurrence. Thus expanding one occurrence loads shared data without expanding every repeated card. Per-occurrence `aria-controls` IDs and keys use commit SHA plus thread ID.
 
