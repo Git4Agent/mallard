@@ -8,7 +8,10 @@ import {
   storageConfigReady,
   StorageEditor,
 } from "../../src/components/project-sync/StorageSettingsV3";
-import { StorageRepositoryRow } from "../../src/components/project-sync/ProjectLinksWorkspace";
+import {
+  StorageRepositoryRow,
+  StorageSettingsMeta,
+} from "../../src/components/project-sync/ProjectLinksWorkspace";
 import type { RemoteBundleSummary, StorageConfigV3 } from "../../src/types";
 
 function r2Storage(patch: Partial<StorageConfigV3> = {}): StorageConfigV3 {
@@ -106,4 +109,26 @@ test("repository rows keep metadata behind an icon disclosure", () => {
   assert.match(html, />Resources</);
   assert.match(html, />Updated</);
   assert.doesNotMatch(html, /Generation 3/);
+});
+
+test("storage settings identify the destination with its storage icon", () => {
+  const localHtml = renderToStaticMarkup(
+    <StorageSettingsMeta
+      storage={{
+        ...r2Storage(),
+        id: "storage-local",
+        name: "Local storage 1",
+        kind: "local",
+        local_dir: "/Users/test/storage",
+      }}
+    />,
+  );
+  const cloudHtml = renderToStaticMarkup(
+    <StorageSettingsMeta storage={r2Storage()} />,
+  );
+
+  assert.match(localHtml, /v3-storage-settings-meta/);
+  assert.match(localHtml, /title="Local folder: Local storage 1"/);
+  assert.match(localHtml, />Local storage 1</);
+  assert.match(cloudHtml, /title="Cloudflare R2: R2 storage"/);
 });

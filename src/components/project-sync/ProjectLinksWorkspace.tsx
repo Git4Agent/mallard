@@ -110,6 +110,24 @@ export function StorageRepositoryRow({ bundle }: { bundle: RemoteBundleSummary }
   );
 }
 
+export function StorageSettingsMeta({
+  storage,
+  creating = false,
+}: {
+  storage: StorageConfigV3;
+  creating?: boolean;
+}) {
+  const kindLabel = storage.kind === "local" ? "Local folder" : "Cloudflare R2";
+  const label = creating ? kindLabel : storage.name || "Unnamed storage";
+
+  return (
+    <div className="v3-storage-settings-meta" title={`${kindLabel}: ${label}`}>
+      <Icon name={storage.kind === "local" ? "drive" : "cloud"} size={12} />
+      <span>{label}</span>
+    </div>
+  );
+}
+
 export function conversationPathsBlockSync(
   hasBinding: boolean,
   audit: CodexConversationPathAudit | undefined,
@@ -164,6 +182,7 @@ export default function ProjectLinksWorkspace({
   const [projectAliasDraft, setProjectAliasDraft] = useState("");
   const bundleRequestRef = useRef(0);
   const storageSettingsRef = useRef<HTMLDivElement>(null);
+  const projectSettingsRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!editingStorage) return;
@@ -176,6 +195,14 @@ export default function ProjectLinksWorkspace({
   useEffect(() => {
     onStorageEditorChange?.(editingStorage?.storageId ?? null);
   }, [editingStorage?.storageId, onStorageEditorChange]);
+
+  useEffect(() => {
+    if (!editingProjectId) return;
+    const frame = window.requestAnimationFrame(() => {
+      projectSettingsRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [editingProjectId]);
 
   const linkedByProject = useMemo(() => new Map(projects.map((project) => [
     project.local_project_id,
@@ -319,13 +346,15 @@ export default function ProjectLinksWorkspace({
   const settingsProject = focusedProjectId
     ? projects.find((project) => project.local_project_id === focusedProjectId) ?? null
     : null;
-  const proposedProjectAlias = settingsProject
-    ? projectAliasDraft.trim() && projectAliasDraft.trim() !== settingsProject.display_name
+  const activeProject = projects.find((project) => project.local_project_id === activeProjectId) ?? null;
+  const workspaceProject = newProjectSetup ? null : settingsProject ?? activeProject;
+  const proposedProjectAlias = workspaceProject
+    ? projectAliasDraft.trim() && projectAliasDraft.trim() !== workspaceProject.display_name
       ? projectAliasDraft.trim()
       : null
     : null;
-  const projectNameChanged = !!settingsProject
-    && proposedProjectAlias !== (settingsProject.local_alias ?? null);
+  const projectNameChanged = !!workspaceProject
+    && proposedProjectAlias !== (workspaceProject.local_alias ?? null);
 
   const closeProjectSettings = () => {
     inlineStorageReview?.onClose();
@@ -334,12 +363,12 @@ export default function ProjectLinksWorkspace({
   };
 
   const saveProjectName = async () => {
-    if (!settingsProject || !projectNameChanged) return;
+    if (!workspaceProject || !projectNameChanged) return;
     let saved = false;
     await run(
-      `rename:${settingsProject.local_project_id}`,
+      `rename:${workspaceProject.local_project_id}`,
       async () => {
-        saved = await onRenameProject(settingsProject.local_project_id, proposedProjectAlias);
+        saved = await onRenameProject(workspaceProject.local_project_id, proposedProjectAlias);
       },
     );
     if (saved) setRenamingProjectId(null);
@@ -355,11 +384,7 @@ export default function ProjectLinksWorkspace({
               <h1 id="storage-settings-heading" className="settings-section-title">
                 {creatingStorage ? "New storage" : "Storage settings"}
               </h1>
-              <div className="profile-links-subtitle">
-                {creatingStorage
-                  ? "Connect Cloudflare R2 or choose a local folder."
-                  : editedStorageConfig.name || "Unnamed storage"}
-              </div>
+              <StorageSettingsMeta storage={storageDraft} creating={creatingStorage} />
             </div>
             <button
               type="button"
@@ -440,19 +465,7 @@ export default function ProjectLinksWorkspace({
     );
   }
 
-  if (!settingsProject && !editingStorage && !newProjectSetup) {
-    const activeProject = projects.find((project) => project.local_project_id === activeProjectId) ?? null;
-    const activeBinding = activeProject ? bindingByProject.get(activeProject.local_project_id) ?? null : null;
-    if (activeProject) {
-      return (
-        <ProjectChatHistoryPage
-          project={activeProject}
-          binding={activeBinding}
-          refreshEpoch={historyRefreshEpoch}
-          onOpenProjectSettings={() => void openProjectSettings(activeProject.local_project_id)}
-        />
-      );
-    }
+  if (!workspaceProject && !editingStorage && !newProjectSetup) {
     return (
       <main className="v3-main v3-project-links-page v3-git-info-page">
         <section className="profile-links-section" aria-labelledby="git-info-heading">
@@ -468,22 +481,22 @@ export default function ProjectLinksWorkspace({
   }
 
   return (
-    <main className={`v3-main v3-project-links-page${settingsProject ? " v3-project-settings-page" : ""}${newProjectSetup ? " v3-project-setup-page" : ""}`}>
+    <main className={`v3-main v3-project-links-page${workspaceProject ? " v3-project-settings-page" : ""}${activeProject && !newProjectSetup ? " v3-project-combined-page" : ""}${settingsProject ? " v3-project-settings-expanded" : ""}${newProjectSetup ? " v3-project-setup-page" : ""}`}>
       <section
         className="profile-links-section"
         aria-label={newProjectSetup
           ? "Project setup"
-          : settingsProject
-            ? `${projectLabel(settingsProject)} settings`
+          : workspaceProject
+            ? projectLabel(workspaceProject)
             : undefined}
-        aria-labelledby={newProjectSetup || settingsProject ? undefined : "project-links-heading"}
+        aria-labelledby={newProjectSetup || workspaceProject ? undefined : "project-links-heading"}
       >
         {!newProjectSetup && (
-          <div className="profile-links-heading">
+          <div className="profile-links-heading v3-combined-project-heading">
             <div className="profile-links-copy">
-              {settingsProject ? (
+              {workspaceProject ? (
                 <div className="v3-project-heading-identity">
-                  {renamingProjectId === settingsProject.local_project_id ? (
+                  {renamingProjectId === workspaceProject.local_project_id ? (
                     <form
                       className="v3-project-heading-rename"
                       onSubmit={(event) => {
@@ -499,30 +512,30 @@ export default function ProjectLinksWorkspace({
                         autoFocus
                       />
                       <button type="submit" className="btn btn-primary" disabled={busy || !projectNameChanged}>
-                        {runningAction === `rename:${settingsProject.local_project_id}` ? "Saving…" : "Save"}
+                        {runningAction === `rename:${workspaceProject.local_project_id}` ? "Saving…" : "Save"}
                       </button>
                       <button
                         type="button"
                         className="btn btn-ghost"
                         disabled={busy}
                         onClick={() => {
-                          setProjectAliasDraft(settingsProject.local_alias ?? settingsProject.display_name);
+                          setProjectAliasDraft(workspaceProject.local_alias ?? workspaceProject.display_name);
                           setRenamingProjectId(null);
                         }}
                       >
                         Cancel
                       </button>
-                      {settingsProject.local_alias && (
+                      {workspaceProject.local_alias && (
                         <button
                           type="button"
                           className="btn btn-ghost"
                           disabled={busy}
                           onClick={() => void run(
-                            `rename:${settingsProject.local_project_id}`,
+                            `rename:${workspaceProject.local_project_id}`,
                             async () => {
-                              const saved = await onRenameProject(settingsProject.local_project_id, null);
+                              const saved = await onRenameProject(workspaceProject.local_project_id, null);
                               if (!saved) return;
-                              setProjectAliasDraft(settingsProject.display_name);
+                              setProjectAliasDraft(workspaceProject.display_name);
                               setRenamingProjectId(null);
                             },
                           )}
@@ -533,14 +546,14 @@ export default function ProjectLinksWorkspace({
                     </form>
                   ) : (
                     <div className="v3-project-heading-name">
-                      <h1>{projectLabel(settingsProject)}</h1>
+                      <h1>{projectLabel(workspaceProject)}</h1>
                       <button
                         type="button"
                         className="btn btn-ghost"
                         disabled={busy}
                         onClick={() => {
-                          setProjectAliasDraft(settingsProject.local_alias ?? settingsProject.display_name);
-                          setRenamingProjectId(settingsProject.local_project_id);
+                          setProjectAliasDraft(workspaceProject.local_alias ?? workspaceProject.display_name);
+                          setRenamingProjectId(workspaceProject.local_project_id);
                         }}
                       >
                         Rename
@@ -548,26 +561,26 @@ export default function ProjectLinksWorkspace({
                     </div>
                   )}
                   <div className="v3-project-heading-meta">
-                    {settingsProject.local_alias && (
+                    {workspaceProject.local_alias && (
                       <span
                         className="v3-project-heading-meta-item"
-                        title={`Repository: ${settingsProject.display_name}`}
-                        aria-label={`Repository ${settingsProject.display_name}`}
+                        title={`Repository: ${workspaceProject.display_name}`}
+                        aria-label={`Repository ${workspaceProject.display_name}`}
                       >
-                        <Icon name={settingsProject.is_git_repository ? "git-branch" : "folder"} size={12} />
-                        <span>{settingsProject.display_name}</span>
+                        <Icon name={workspaceProject.is_git_repository ? "git-branch" : "folder"} size={12} />
+                        <span>{workspaceProject.display_name}</span>
                       </span>
                     )}
                     <span
                       className="v3-project-heading-meta-item"
-                      title={settingsProject.project_root ?? undefined}
-                      aria-label={`Project folder ${settingsProject.project_root ?? "not configured"}`}
+                      title={workspaceProject.project_root ?? undefined}
+                      aria-label={`Project folder ${workspaceProject.project_root ?? "not configured"}`}
                     >
                       <Icon name="folder" size={12} />
-                      <span>{compactProjectPath(settingsProject.project_root)}</span>
+                      <span>{compactProjectPath(workspaceProject.project_root)}</span>
                     </span>
                   </div>
-                  {renamingProjectId === settingsProject.local_project_id && error && (
+                  {renamingProjectId === workspaceProject.local_project_id && error && (
                     <div className="v3-project-heading-error"><Icon name="alert-triangle" size={13} /> {error}</div>
                   )}
                 </div>
@@ -578,15 +591,25 @@ export default function ProjectLinksWorkspace({
                 </>
               )}
             </div>
-            {settingsProject ? (
+            {workspaceProject ? (
               <button
                 type="button"
-                className="btn btn-ghost v3-project-settings-close"
-                onClick={closeProjectSettings}
+                className={`btn btn-ghost v3-project-settings-toggle${settingsProject ? " active" : ""}`}
+                onClick={() => {
+                  if (settingsProject) {
+                    closeProjectSettings();
+                  } else {
+                    void openProjectSettings(workspaceProject.local_project_id);
+                  }
+                }}
                 disabled={busy}
-                aria-label="Close project settings"
+                aria-label={settingsProject ? "Hide project settings" : "Show project settings"}
+                aria-expanded={!!settingsProject}
+                aria-controls="project-configuration-panel"
               >
-                <Icon name="x" size={15} />
+                <Icon name="settings" size={15} />
+                <span>Settings</span>
+                <Icon name="chevron-down" size={13} className="v3-project-settings-chevron" />
               </button>
             ) : (
               <div className="profile-links-heading-actions">
@@ -617,8 +640,12 @@ export default function ProjectLinksWorkspace({
               <Icon name="plus" size={15} /> Add project
             </button>
           </div>
-        ) : (
-          <div className="profile-links-list">
+        ) : (!activeProject || settingsProject) ? (
+          <div
+            id={settingsProject ? "project-configuration-panel" : undefined}
+            ref={settingsProject ? projectSettingsRef : undefined}
+            className={`profile-links-list${settingsProject ? " v3-combined-settings-panel" : ""}`}
+          >
             {(settingsProject ? [settingsProject] : projects).map((project) => {
               const projectLinks = linkedByProject.get(project.local_project_id) ?? [];
               const availableStorages = storages.filter((storage) => (
@@ -901,7 +928,17 @@ export default function ProjectLinksWorkspace({
               );
             })}
           </div>
-        ))}
+        ) : null)}
+
+        {activeProject && !newProjectSetup && (
+          <ProjectChatHistoryPage
+            embedded
+            project={activeProject}
+            binding={bindingByProject.get(activeProject.local_project_id) ?? null}
+            refreshEpoch={historyRefreshEpoch}
+            onOpenProjectSettings={() => void openProjectSettings(activeProject.local_project_id)}
+          />
+        )}
       </section>
 
     </main>

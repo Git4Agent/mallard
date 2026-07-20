@@ -3,6 +3,7 @@ import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import ProjectChatHistoryPage, {
   ProjectChatHistoryContent,
+  ThreadMetrics,
 } from "../../src/components/project-sync/ProjectChatHistoryPage";
 import ProjectSidebar from "../../src/components/project-sync/ProjectSidebar";
 
@@ -105,8 +106,11 @@ test("history content uses the local alias and renders commit/thread actions", (
   assert.match(html, /aria-label="Last push:/);
   assert.match(html, /Repository: mallard/);
   assert.match(html, /Add project-scoped history/);
+  assert.match(html, /class="v3-history-thread-updated"/);
+  assert.match(html, /aria-label="Updated [^"]+"/);
   assert.match(html, /aria-label="Show session details"/);
   assert.doesNotMatch(html, /aria-label="User rounds: 3"/);
+  assert.doesNotMatch(html, /data-tooltip="User turns/);
   assert.doesNotMatch(html, /24\.8K/);
   assert.doesNotMatch(html, /Appears under 2 commits/);
   assert.doesNotMatch(html, /during session|after session|started from/);
@@ -118,6 +122,51 @@ test("history content uses the local alias and renders commit/thread actions", (
   assert.match(html, />Open in Codex</);
   assert.match(html, /> Open in Terminal</);
   assert.doesNotMatch(html, /Show chat details/);
+});
+
+test("expanded session details label every metric icon", () => {
+  const html = renderToStaticMarkup(<ThreadMetrics thread={history.threads[0]} />);
+
+  assert.match(html, /data-tooltip="User turns · 3"/);
+  assert.match(html, /data-tooltip="Total tokens · 24\.8K"/);
+  assert.match(html, /data-tooltip="Agent messages · 5"/);
+  assert.match(html, /data-tooltip="Tool calls · 8"/);
+});
+
+test("embedded history follows project settings without repeating project controls", () => {
+  const html = renderToStaticMarkup(
+    <ProjectChatHistoryContent
+      embedded
+      project={project}
+      binding={{
+        replica_id: "replica",
+        local_project_id: project.local_project_id,
+        bundle_id: project.bundle_id,
+        project_root: project.project_root,
+        canonical_project_root: project.project_root,
+        profile_ids: { codex: "profile-codex" },
+        state: "active",
+        revision: 1,
+        updated_at: 2,
+      }}
+      history={history}
+      loading={false}
+      loadingMore={false}
+      actionError={null}
+      actionBusyThreadId={null}
+      onBranchChange={() => undefined}
+      onRefresh={() => undefined}
+      onLoadMore={() => undefined}
+      onOpenSettings={() => undefined}
+      onOpenCodex={() => undefined}
+      onOpenTerminal={() => undefined}
+    />,
+  );
+
+  assert.match(html, /v3-history-embedded/);
+  assert.match(html, /<h2[^>]*v3-history-embedded-title[^>]*>.*Activity/s);
+  assert.doesNotMatch(html, /<main/);
+  assert.doesNotMatch(html, /aria-label="Project settings"/);
 });
 
 test("non-Git history renders a flat Codex thread list", () => {
@@ -148,7 +197,14 @@ test("non-Git history renders a flat Codex thread list", () => {
       onOpenTerminal={() => undefined}
     />,
   );
+  const headingIndex = html.indexOf('id="codex-sessions-heading"');
+  const headingEndIndex = html.indexOf("</h2>", headingIndex);
+  const openAiIconIndex = html.indexOf("v3-openai-icon", headingIndex);
+
   assert.match(html, /Codex threads/);
+  assert.ok(headingIndex >= 0);
+  assert.ok(openAiIconIndex > headingIndex);
+  assert.ok(openAiIconIndex < headingEndIndex);
   assert.doesNotMatch(html, /Branch/);
 });
 

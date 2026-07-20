@@ -8,13 +8,14 @@ import type {
 } from "../../types";
 import Icon from "../Icons";
 import { projectSyncApi } from "./api";
-import { compactProjectPath, errorMessage, projectLabel } from "./model";
+import { compactProjectPath, errorMessage, formatRelativeTime, projectLabel } from "./model";
 
 interface PageProps {
   project: LocalProjectSummary;
   binding: ProjectBinding | null;
   refreshEpoch: number;
   onOpenProjectSettings: () => void;
+  embedded?: boolean;
 }
 
 interface ThreadDetailsState {
@@ -41,6 +42,7 @@ interface ContentProps {
   onOpenTerminal: (threadId: string) => void;
   onToggleDetails?: (threadId: string, occurrenceKey: string) => void;
   onLoadMoreDetails?: (threadId: string) => void;
+  embedded?: boolean;
 }
 
 const THREAD_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
@@ -55,6 +57,24 @@ function formatDate(value?: number | null): string {
 function formatCount(value?: number | null): string {
   if (value == null) return "Not reported";
   return new Intl.NumberFormat(undefined, { notation: value >= 1_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value);
+}
+
+export function ThreadMetrics({ thread, id }: { thread: CodexThreadSummary; id?: string }) {
+  const startedLabel = `Started ${formatDate(thread.started_at)}`;
+  const endedLabel = `${thread.is_active ? "Last activity" : "Ended"} ${formatDate(thread.ended_at)}${thread.is_active ? ", active" : ""}`;
+
+  return <div id={id} className="v3-history-thread-meta" aria-label="Session details">
+    <span className="v3-history-thread-metric" data-tooltip={startedLabel} aria-label={startedLabel} tabIndex={0}><Icon name="play" size={12} /><time>{formatDate(thread.started_at)}</time></span>
+    <span className="v3-history-thread-metric" data-tooltip={endedLabel} aria-label={endedLabel} tabIndex={0}><Icon name={thread.is_active ? "activity" : "check-circle"} size={12} /><time>{formatDate(thread.ended_at)}</time></span>
+    <span className="v3-history-thread-metric" data-tooltip={`User turns · ${thread.user_round_count}`} aria-label={`User turns: ${thread.user_round_count}`} tabIndex={0}><Icon name="user" size={12} /><b>{thread.user_round_count}</b></span>
+    <span className="v3-history-thread-metric" data-tooltip={`Total tokens · ${formatCount(thread.total_tokens)}`} aria-label={`Total tokens: ${formatCount(thread.total_tokens)}`} tabIndex={0}><Icon name="token" size={12} /><b>{formatCount(thread.total_tokens)}</b></span>
+    <span className="v3-history-thread-metric" data-tooltip={`Agent messages · ${thread.agent_message_count}`} aria-label={`Agent messages: ${thread.agent_message_count}`} tabIndex={0}><Icon name="message" size={12} /><b>{thread.agent_message_count}</b></span>
+    <span className="v3-history-thread-metric" data-tooltip={`Tool calls · ${thread.tool_call_count}`} aria-label={`Tool calls: ${thread.tool_call_count}`} tabIndex={0}><Icon name="tool" size={12} /><b>{thread.tool_call_count}</b></span>
+    {thread.commit_occurrence_count > 1 && (
+      <span className="v3-history-thread-metric" data-tooltip={`Commit appearances · ${thread.commit_occurrence_count}`} aria-label={`Appears under ${thread.commit_occurrence_count} commits`} tabIndex={0}><Icon name="git-branch" size={12} /><b>{thread.commit_occurrence_count}</b></span>
+    )}
+    {!thread.metrics_complete && <span className="v3-history-thread-metric v3-history-partial" data-tooltip="Some session metrics are unavailable" aria-label="Some session metrics are unavailable" tabIndex={0}><Icon name="alert-triangle" size={12} /></span>}
+  </div>;
 }
 
 interface ThreadCardProps {
@@ -76,14 +96,23 @@ function ThreadCard({
   const launchable = THREAD_UUID.test(thread.thread_id);
   const detailsId = `thread-details-${occurrenceKey.replace(/[^a-z0-9_-]/gi, "-")}`;
   const metadataId = `thread-metadata-${occurrenceKey.replace(/[^a-z0-9_-]/gi, "-")}`;
-  const startedLabel = `Started ${formatDate(thread.started_at)}`;
-  const endedLabel = `${thread.is_active ? "Last activity" : "Ended"} ${formatDate(thread.ended_at)}${thread.is_active ? ", active" : ""}`;
+  const updatedLabel = `Updated ${formatDate(thread.ended_at)}`;
   const detailsLabel = detailsOpen ? "Hide conversation details" : "Show conversation details";
   const metadataLabel = metadataOpen ? "Hide session details" : "Show session details";
   return (
     <article className="v3-history-thread-card">
       <div className="v3-history-thread-topline">
-        <strong>{thread.title || "Untitled Codex session"}</strong>
+        <div className="v3-history-thread-title">
+          <strong>{thread.title || "Untitled Codex session"}</strong>
+          <time
+            className="v3-history-thread-updated"
+            dateTime={new Date(thread.ended_at * 1_000).toISOString()}
+            title={updatedLabel}
+            aria-label={updatedLabel}
+          >
+            {formatRelativeTime(thread.ended_at)}
+          </time>
+        </div>
         <div className="v3-history-thread-actions">
           <button type="button" className={`v3-history-icon-action${metadataOpen ? " active" : ""}`}
             aria-label={metadataLabel} title={metadataLabel} aria-expanded={metadataOpen} aria-controls={metadataId}
@@ -110,18 +139,7 @@ function ThreadCard({
         </div>
       </div>
 
-      {metadataOpen && <div id={metadataId} className="v3-history-thread-meta" aria-label="Session details">
-        <span title={startedLabel} aria-label={startedLabel}><Icon name="play" size={12} /><time>{formatDate(thread.started_at)}</time></span>
-        <span title={endedLabel} aria-label={endedLabel}><Icon name={thread.is_active ? "activity" : "check-circle"} size={12} /><time>{formatDate(thread.ended_at)}</time></span>
-        <span title={`User rounds: ${thread.user_round_count}`} aria-label={`User rounds: ${thread.user_round_count}`}><Icon name="user" size={12} /><b>{thread.user_round_count}</b></span>
-        <span title={`Tokens: ${formatCount(thread.total_tokens)}`} aria-label={`Tokens: ${formatCount(thread.total_tokens)}`}><Icon name="token" size={12} /><b>{formatCount(thread.total_tokens)}</b></span>
-        <span title={`Agent messages: ${thread.agent_message_count}`} aria-label={`Agent messages: ${thread.agent_message_count}`}><Icon name="message" size={12} /><b>{thread.agent_message_count}</b></span>
-        <span title={`Tool calls: ${thread.tool_call_count}`} aria-label={`Tool calls: ${thread.tool_call_count}`}><Icon name="tool" size={12} /><b>{thread.tool_call_count}</b></span>
-        {thread.commit_occurrence_count > 1 && (
-          <span title={`Appears under ${thread.commit_occurrence_count} commits`} aria-label={`Appears under ${thread.commit_occurrence_count} commits`}><Icon name="git-branch" size={12} /><b>{thread.commit_occurrence_count}</b></span>
-        )}
-        {!thread.metrics_complete && <span className="v3-history-partial" title="Some session metrics are unavailable" aria-label="Some session metrics are unavailable"><Icon name="alert-triangle" size={12} /></span>}
-      </div>}
+      {metadataOpen && <ThreadMetrics id={metadataId} thread={thread} />}
       {detailsOpen && (
         <div id={detailsId} className="v3-history-chat-details" aria-live="polite">
           {details?.loading && !details.page ? <div className="v3-history-detail-state"><span className="status-loader" /> Loading messages…</div> : null}
@@ -148,7 +166,7 @@ function ThreadCard({
 export function ProjectChatHistoryContent({
   project, binding, history, loading, loadingMore, actionError, actionBusyThreadId,
   detailsByThread = {}, openDetailOccurrences = new Set(), onBranchChange, onRefresh, onLoadMore, onOpenSettings, onOpenCodex,
-  onOpenTerminal, onToggleDetails, onLoadMoreDetails,
+  onOpenTerminal, onToggleDetails, onLoadMoreDetails, embedded = false,
 }: ContentProps) {
   const label = projectLabel(project);
   const aliased = label !== project.display_name;
@@ -169,12 +187,18 @@ export function ProjectChatHistoryContent({
       || left.thread_id.localeCompare(right.thread_id);
   });
 
-  return (
-    <main className="v3-main v3-project-links-page v3-git-info-page v3-history-page">
-      <section className="profile-links-section" aria-labelledby="project-activity-heading">
+  const content = (
+      <section className={embedded ? "v3-history-content" : "profile-links-section"} aria-labelledby="project-activity-heading">
         <header className="profile-links-heading v3-history-header">
           <div className="profile-links-copy">
-            <h1 id="project-activity-heading" className="settings-section-title">{label}</h1>
+            {embedded ? (
+              <h2 id="project-activity-heading" className="v3-history-embedded-title">
+                <Icon name={history?.git ? "git-branch" : "openai"} size={15} className={history?.git ? undefined : "v3-openai-icon"} />
+                Activity
+              </h2>
+            ) : (
+              <h1 id="project-activity-heading" className="settings-section-title">{label}</h1>
+            )}
           </div>
           <div className="v3-history-toolbar">
             {history?.git && (
@@ -210,8 +234,10 @@ export function ProjectChatHistoryContent({
                   <span className={storage.last_push_at ? "recorded" : undefined} title={`Last push: ${formatDate(storage.last_push_at)}`} aria-label={`Last push: ${formatDate(storage.last_push_at)}`}><Icon name="upload" size={13} /></span>
                 </span>
               )) : <span className="v3-history-context-item muted" title="No storage linked"><Icon name="cloud" size={14} /><span>No storage</span></span>}
-              <button type="button" className="v3-history-icon-action v3-history-settings" onClick={onOpenSettings}
-                title="Project settings" aria-label="Project settings"><Icon name="settings" size={15} /></button>
+              {!embedded && (
+                <button type="button" className="v3-history-icon-action v3-history-settings" onClick={onOpenSettings}
+                  title="Project settings" aria-label="Project settings"><Icon name="settings" size={15} /></button>
+              )}
             </section>
 
             {history.git ? (
@@ -235,14 +261,18 @@ export function ProjectChatHistoryContent({
                 </section>
               </>
             ) : (
-              <section aria-labelledby="codex-sessions-heading"><div className="v3-history-section-heading"><h2 id="codex-sessions-heading">Codex threads</h2><span className="v3-history-heading-count" title={`${history.threads.length} threads`}><Icon name="message" size={12} />{history.threads.length}</span></div><div className="v3-history-thread-list flat">{history.threads.length ? history.threads.map((thread) => renderThread(thread, thread.thread_id)) : <div className="v3-history-state">No project-owned Codex sessions were found in this 30-day window.</div>}</div></section>
+              <section aria-labelledby="codex-sessions-heading"><div className="v3-history-section-heading"><h2 id="codex-sessions-heading" className="v3-history-codex-heading"><Icon name="openai" size={14} className="v3-openai-icon" />Codex threads</h2><span className="v3-history-heading-count" title={`${history.threads.length} threads`}><Icon name="message" size={12} />{history.threads.length}</span></div><div className="v3-history-thread-list flat">{history.threads.length ? history.threads.map((thread) => renderThread(thread, thread.thread_id)) : <div className="v3-history-state">No project-owned Codex sessions were found in this 30-day window.</div>}</div></section>
             )}
             {history.next_before != null && <button type="button" className="btn v3-history-load-more" disabled={loadingMore} onClick={onLoadMore}>{loadingMore ? "Loading…" : "Load previous 30 days"}</button>}
           </>
         )}
       </section>
-    </main>
   );
+
+  if (embedded) {
+    return <div className="v3-history-page v3-history-embedded">{content}</div>;
+  }
+  return <main className="v3-main v3-project-links-page v3-git-info-page v3-history-page">{content}</main>;
 }
 
 function mergePages(previous: ProjectChatHistory | null, next: ProjectChatHistory): ProjectChatHistory {
@@ -269,7 +299,7 @@ function mergePages(previous: ProjectChatHistory | null, next: ProjectChatHistor
   return { ...next, threads: mergedThreads, unmapped: [...unmapped.values()], git: { ...next.git, commits: mergedCommits, reference_count: references, unique_thread_count: unique } };
 }
 
-export default function ProjectChatHistoryPage({ project, binding, refreshEpoch, onOpenProjectSettings }: PageProps) {
+export default function ProjectChatHistoryPage({ project, binding, refreshEpoch, onOpenProjectSettings, embedded = false }: PageProps) {
   const [history, setHistory] = useState<ProjectChatHistory | null>(null);
   const [branch, setBranch] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -353,5 +383,5 @@ export default function ProjectChatHistoryPage({ project, binding, refreshEpoch,
     if (!wasOpen && !detailsByThread[threadId]?.page && !detailsByThread[threadId]?.loading) void loadDetails(threadId);
   };
 
-  return <ProjectChatHistoryContent project={project} binding={binding} history={history} loading={loading} loadingMore={loadingMore} actionError={actionError} actionBusyThreadId={actionBusyThreadId} detailsByThread={detailsByThread} openDetailOccurrences={openDetailOccurrences} onBranchChange={changeBranch} onRefresh={() => void load(null, branch, true)} onLoadMore={() => void load(history?.next_before ?? null, branch)} onOpenSettings={onOpenProjectSettings} onOpenCodex={(id) => void openCodex(id)} onOpenTerminal={(id) => void openTerminal(id)} onToggleDetails={toggleDetails} onLoadMoreDetails={(id) => void loadDetails(id, detailsByThread[id]?.page?.next_cursor)} />;
+  return <ProjectChatHistoryContent project={project} binding={binding} history={history} loading={loading} loadingMore={loadingMore} actionError={actionError} actionBusyThreadId={actionBusyThreadId} detailsByThread={detailsByThread} openDetailOccurrences={openDetailOccurrences} onBranchChange={changeBranch} onRefresh={() => void load(null, branch, true)} onLoadMore={() => void load(history?.next_before ?? null, branch)} onOpenSettings={onOpenProjectSettings} onOpenCodex={(id) => void openCodex(id)} onOpenTerminal={(id) => void openTerminal(id)} onToggleDetails={toggleDetails} onLoadMoreDetails={(id) => void loadDetails(id, detailsByThread[id]?.page?.next_cursor)} embedded={embedded} />;
 }

@@ -198,6 +198,8 @@ test("the configured profile keeps a repair action inline above simple storage r
   const storageHeadingIndex = html.indexOf("project-profile-storage-heading");
   const addStorageIndex = html.indexOf(">Add storage<", storageHeadingIndex);
   const storageIndex = html.indexOf("storage-link-block");
+  const settingsIndex = html.indexOf('aria-label="Hide project settings"');
+  const activityIndex = html.indexOf(">Activity<");
 
   assert.ok(profileIndex >= 0);
   assert.ok(profileEndIndex > profileIndex);
@@ -207,6 +209,11 @@ test("the configured profile keeps a repair action inline above simple storage r
   assert.ok(addStorageIndex > storageHeadingIndex);
   assert.ok(addStorageIndex < storageIndex);
   assert.ok(storageIndex > warningIndex);
+  assert.ok(settingsIndex >= 0);
+  assert.ok(settingsIndex < storageHeadingIndex);
+  assert.ok(activityIndex > storageIndex);
+  assert.match(html, /aria-expanded="true" aria-controls="project-configuration-panel"/);
+  assert.doesNotMatch(html, /Close project settings/);
   assert.equal(html.match(/conversation-path-repair-notice/g)?.length, 1);
   assert.equal(html.match(/class="storage-link-block/g)?.length, 2);
   assert.equal(html.match(/class="storage-link-unlink"/g)?.length, 2);
