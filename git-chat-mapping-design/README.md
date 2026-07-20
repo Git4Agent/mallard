@@ -28,7 +28,7 @@ The `Uncommitted Changes` label means no overlapping commit and no qualifying fo
 
 ## Session and mapping semantics
 
-Each rollout JSONL file is one Codex session. Mallard streams the complete file and derives authoritative start/end dates from its first and last timestamped records. It counts genuine `user_message` rounds, visible `agent_message` events, tool calls, and the maximum reported cumulative token total. Malformed or individually oversized lines are skipped without stopping the file; the session becomes partial and diagnostics go to Sync Log.
+Each rollout JSONL file is one Codex session. Mallard streams the complete file and derives authoritative start/end dates from its first and last timestamped records. It counts genuine `user_message` rounds, visible `agent_message` events, tool calls, and the maximum reported cumulative token total. Oversized records are selectively projected for relevant metadata and visible text; malformed records are skipped without stopping the file, make the session partial, and produce diagnostics in Sync Log.
 
 For a selected first-parent branch:
 
@@ -43,6 +43,12 @@ The initial response is the latest exclusive 30-day window. `Load previous 30 da
 ## Chat details and privacy
 
 `Show chat details` lazily loads genuine User and Codex message previews, 50 at a time, chronologically. Each preview is normalized and capped at 240 characters. System/developer content, injected context, reasoning, and raw tool payloads are excluded. Full chat text and derived metadata stay local and never enter bundle manifests. The on-disk cache under `~/.mallard/chat_history_cache.json` contains only parsed metadata/metrics, keyed by profile, rollout path, size, and modification time.
+
+## Oversized-record recovery
+
+The rollout reader retains its 1 MiB bounded fast path for ordinary JSONL records. When a record exceeds that limit, Mallard seeks back to the record boundary and stream-deserializes only the fields needed for session discovery, metrics, and chat details. Visible User and Codex text remains recoverable without retaining embedded image data, compaction bodies, reasoning, or raw tool payloads.
+
+This behavior does not add image display or change the chat-details contract. Details remain chronological, paginated 50 at a time, and normalized to 240-character previews. Successfully parsed oversized records that contain no relevant metadata or visible text are ignored silently; malformed oversized records may still make the session partial and produce a deduplicated diagnostic.
 
 ## Main-branch compatibility
 
