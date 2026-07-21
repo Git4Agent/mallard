@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 
 const args = process.argv.slice(2);
+const tauriCliScript = resolve("node_modules", "@tauri-apps", "cli", "tauri.js");
 
 function run(command, commandArgs) {
   return new Promise((resolveRun, rejectRun) => {
@@ -28,7 +29,7 @@ function macosAppPath(buildArgs) {
   );
 }
 
-const exitCode = await run(process.platform === "win32" ? "tauri.cmd" : "tauri", args);
+const exitCode = await run(process.execPath, [tauriCliScript, ...args]);
 if (exitCode !== 0) process.exit(exitCode);
 
 if (process.env.MALLARD_VERIFY_MACOS_BUNDLE === "1") {

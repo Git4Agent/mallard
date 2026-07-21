@@ -6,12 +6,13 @@ const projectUrl = new URL("../", import.meta.url);
 const read = (path) => readFile(new URL(path, projectUrl), "utf8");
 
 test("desktop releases and updates use the public GitHub repository", async () => {
-  const [tauriConfigSource, workflow, releaseGuide, packageSource, packageLockSource] = await Promise.all([
+  const [tauriConfigSource, workflow, releaseGuide, packageSource, packageLockSource, tauriBuildScript] = await Promise.all([
     read("src-tauri/tauri.conf.json"),
     read(".github/workflows/release.yml"),
     read("docs/RELEASING.md"),
     read("package.json"),
     read("package-lock.json"),
+    read("scripts/tauri-build.mjs"),
   ]);
   const tauriConfig = JSON.parse(tauriConfigSource);
   const packageConfig = JSON.parse(packageSource);
@@ -39,6 +40,9 @@ test("desktop releases and updates use the public GitHub repository", async () =
   assert.match(workflow, /MALLARD_VERIFY_MACOS_BUNDLE: \$\{\{ runner\.os == 'macOS' && '1' \|\| '' \}\}/);
   assert.doesNotMatch(workflow, /name: Verify macOS app signature/);
   assert.equal(packageConfig.scripts.tauri, "node scripts/tauri-build.mjs");
+  assert.match(tauriBuildScript, /process\.execPath/);
+  assert.match(tauriBuildScript, /"@tauri-apps", "cli", "tauri\.js"/);
+  assert.doesNotMatch(tauriBuildScript, /tauri\.cmd/);
   assert.doesNotMatch(workflow, /Cloudflare|CLOUDFLARE|\bR2\b|r2 object|api\.mallard-ai\.com/);
 
   assert.match(releaseGuide, /GitHub Releases is the public source of truth/);
