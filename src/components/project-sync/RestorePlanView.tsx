@@ -360,6 +360,9 @@ export default function RestorePlanView({
     !selected.has(item.resourceId) && !completedResourceIds.has(item.resourceId)
   )).length;
   const finalReady = hasResult && !error && failureCount === 0 && skippedTools === 0 && readiness?.state === "ready";
+  const reviewCanClose = hasResult && (
+    finalReady || (selectedCount === 0 && pendingProjectContentDecisionCount === 0)
+  );
   const completedProjectItems = projectItems.filter((item) => completedResourceIds.has(item.resourceId));
   const completedSkills = globalItems.filter((item) => (
     item.toolKind === "custom_skill" && completedResourceIds.has(item.resourceId)
@@ -386,8 +389,8 @@ export default function RestorePlanView({
         : "Restoring selected changes…"
     : hasResult && failedTools.length > 0 && selectedCount === failedResourceIds.size
       ? `Retry failed installation${failedTools.length === 1 ? "" : "s"}`
-      : finalReady
-        ? "Pull complete"
+      : reviewCanClose
+        ? "Done"
         : hasResult && selectedCount > 0
           ? `Apply ${selectedCount} remaining change${selectedCount === 1 ? "" : "s"}`
           : hasResult
@@ -424,6 +427,7 @@ export default function RestorePlanView({
   const pendingStepItems = stepItems.filter((item) => (
     pendingIds(item, completedActionIds).length > 0 && !completedResourceIds.has(item.resourceId)
   ));
+  const pendingRecommendedCount = pendingStepItems.filter((item) => recommendedIds.has(item.resourceId)).length;
   const stepMatchesRecommended = pendingStepItems.every((item) => (
     selected.has(item.resourceId) === recommendedIds.has(item.resourceId)
   ));
@@ -533,7 +537,7 @@ export default function RestorePlanView({
             disabled={busy || finalReady || pendingStepItems.length === 0 || stepMatchesRecommended}
             title="Restore the recommended safe selection"
           >
-            Recommended ({activeStep === "review" ? recommendedIds.size : stepItems.filter((item) => recommendedIds.has(item.resourceId)).length})
+            Recommended ({pendingRecommendedCount})
           </button>
           <button
             type="button"
@@ -738,7 +742,7 @@ export default function RestorePlanView({
               {approvalItems.length > 0 && (
                 <div className="v3-callout v3-sync-review-blocker">
                   <Icon name="alert-triangle" size={15} />
-                  <span><strong>Needs approval</strong>{approvalItems.length} optional setup change{approvalItems.length === 1 ? " is" : "s are"} not selected.</span>
+                  <span><strong>{hasResult ? "Optional setup not applied" : "Needs approval"}</strong>{approvalItems.length} optional setup change{approvalItems.length === 1 ? " is" : "s are"} not selected.</span>
                 </div>
               )}
 
@@ -789,7 +793,12 @@ export default function RestorePlanView({
         ) : (
           <>
             {stepIndex > 0 && <button type="button" className="btn btn-ghost" onClick={goBack} disabled={busy}>Back</button>}
-            <button type="button" className="btn btn-primary v3-pull-apply-button" disabled={busy || (selectedCount === 0 && pendingProjectContentDecisionCount === 0) || finalReady} onClick={() => onApply(selection)}>
+            <button
+              type="button"
+              className="btn btn-primary v3-pull-apply-button"
+              disabled={busy || (!reviewCanClose && selectedCount === 0 && pendingProjectContentDecisionCount === 0)}
+              onClick={reviewCanClose ? onBack : () => onApply(selection)}
+            >
               {busy && <Icon name="refresh" size={16} className="icon-spin" />}
               {buttonLabel}
             </button>

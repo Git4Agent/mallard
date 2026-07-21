@@ -1483,6 +1483,10 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
     if (!restorePlan || !restoreBinding) return;
     const currentRestorePlan = restorePlan;
     const currentDependencyPlan = dependencyPlan;
+    // The review-ready notice describes the pre-Apply state. Clear it before
+    // execution so a completed Pull can never still claim that nothing was
+    // applied.
+    setNotice(null);
     setFailedPullResourceIds((current) => {
       const next = new Set(current);
       for (const resourceId of selection.resourceIds) next.delete(resourceId);
@@ -1533,6 +1537,12 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
           : [];
       for (const actionId of interruptedActionIds) {
         if (!appliedActionIds.has(actionId)) failedActionIds.add(actionId);
+      }
+      if (appliedActionIds.size > 0 && !result.error && failedActionIds.size === 0) {
+        const appliedLabel = `${appliedActionIds.size} approved change${appliedActionIds.size === 1 ? "" : "s"}`;
+        setNotice(result.readiness?.state === "ready"
+          ? `Pull finished for ${restoreProjectName}: applied ${appliedLabel}.`
+          : `Pull finished for ${restoreProjectName}: applied ${appliedLabel}. Optional setup remains.`);
       }
       const failedResources = new Set(
         [...failedActionIds]

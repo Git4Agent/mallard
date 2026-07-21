@@ -331,8 +331,14 @@ test("skipping a required global tool cannot produce a ready Pull outcome", () =
   );
   assert.match(html, /Project restored; 1 setup item skipped/);
   assert.doesNotMatch(html, />Pull complete</);
-  assert.match(html, /Needs approval/);
+  assert.match(html, /Optional setup not applied/);
   assert.match(html, /Readiness is not confirmed/);
+  assert.match(html, />Recommended \(0\)</);
+  const doneText = html.lastIndexOf(">Done<");
+  assert.notEqual(doneText, -1, "a completed data restore can be dismissed even when optional setup was skipped");
+  const doneTagStart = html.lastIndexOf("<button", doneText);
+  const doneTagEnd = html.indexOf(">", doneTagStart);
+  assert.doesNotMatch(html.slice(doneTagStart, doneTagEnd), /disabled/);
 });
 
 test("dependency failures show the plugin name instead of its hashed action id", () => {
