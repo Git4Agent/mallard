@@ -91,6 +91,13 @@ pulled onto a new machine.
    - session metrics for activity time, turns, tokens, messages, and tools;
    - expandable conversation previews.
 
+   ![Mallard project history after pulling the public demo project](./docs/images/test-flow-1-pulled-project-history.png)
+
+7. Click **Open ChatGPT Desktop** for a session and verify that the restored
+   conversation opens in the desktop app.
+
+   ![Restored conversation open in ChatGPT Desktop](./docs/images/test-flow-1-open-chatgpt-desktop.png)
+
 ### Test Flow 2: Push and transfer your own project
 
 This flow works with a new or existing Git project, or with a non-Git folder.
