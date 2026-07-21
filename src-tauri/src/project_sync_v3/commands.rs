@@ -4757,14 +4757,21 @@ fn plan_dependencies_with_repository(
     Ok(plan)
 }
 
-async fn apply_dependency_actions_with_repository(
+struct PreparedDependencyApplication {
+    plan: DependencyPlan,
+    binding: ProjectBinding,
+    selected: BTreeSet<ActionId>,
+    applied_at: u64,
+}
+
+fn prepare_dependency_application(
     repository: &V3Repository,
     plan_id: &PlanId,
     action_ids: Vec<ActionId>,
-) -> Result<DependencyResult, String> {
+) -> Result<PreparedDependencyApplication, String> {
     let plan = repository.load_dependency_plan(plan_id)?;
-    let now = now_secs();
-    if now < plan.created_at || now > plan.expires_at {
+    let applied_at = now_secs();
+    if applied_at < plan.created_at || applied_at > plan.expires_at {
         return Err("dependency plan has expired or is not active yet".to_string());
     }
     if repository
@@ -4794,18 +4801,39 @@ async fn apply_dependency_actions_with_repository(
     let (_, fetched) = fetch_from_storage(repository, &plan.storage_id, &plan.bundle_id)?;
     validate_dependency_plan_pin(&plan, &fetched, &binding)?;
     let selected = unique_dependency_actions(&action_ids, &plan.actions)?;
-    let mut receipts = Vec::with_capacity(plan.actions.len());
-    for action in &plan.actions {
-        if !selected.contains(&action.action_id) {
+
+    Ok(PreparedDependencyApplication {
+        plan,
+        binding,
+        selected,
+        applied_at,
+    })
+}
+
+async fn apply_dependency_actions_with_repository(
+    repository: &V3Repository,
+    plan_id: &PlanId,
+    action_ids: Vec<ActionId>,
+) -> Result<DependencyResult, String> {
+    let prepare_repository = repository.clone();
+    let prepare_plan_id = plan_id.clone();
+    let prepared = run_blocking(move || {
+        prepare_dependency_application(&prepare_repository, &prepare_plan_id, action_ids)
+    })
+    .await?;
+    let mut receipts = Vec::with_capacity(prepared.plan.actions.len());
+    for action in &prepared.plan.actions {
+        if !prepared.selected.contains(&action.action_id) {
             receipts.push(DependencyApplyReceipt {
                 action_id: action.action_id.clone(),
                 status: ActionStatus::Skipped,
-                applied_at: now,
+                applied_at: prepared.applied_at,
                 error: None,
             });
             continue;
         }
-        let result = execute_dependency_action(repository, &plan, &binding, action).await;
+        let result =
+            execute_dependency_action(repository, &prepared.plan, &prepared.binding, action).await;
         receipts.push(DependencyApplyReceipt {
             action_id: action.action_id.clone(),
             status: if result.is_ok() {
@@ -4813,10 +4841,27 @@ async fn apply_dependency_actions_with_repository(
             } else {
                 ActionStatus::Failed
             },
-            applied_at: now,
+            applied_at: prepared.applied_at,
             error: result.err(),
         });
     }
+
+    let finalize_repository = repository.clone();
+    run_blocking(move || finalize_dependency_application(&finalize_repository, prepared, receipts))
+        .await
+}
+
+fn finalize_dependency_application(
+    repository: &V3Repository,
+    prepared: PreparedDependencyApplication,
+    receipts: Vec<DependencyApplyReceipt>,
+) -> Result<DependencyResult, String> {
+    let PreparedDependencyApplication {
+        plan,
+        binding,
+        applied_at,
+        ..
+    } = prepared;
     let record = DependencyApplicationRecord {
         plan_id: plan.plan_id.clone(),
         local_project_id: binding.local_project_id,
@@ -4827,7 +4872,7 @@ async fn apply_dependency_actions_with_repository(
         commit_id: plan.commit_id.clone(),
         manifest_sha256: plan.manifest_sha256.clone(),
         binding_revision: plan.binding_revision,
-        applied_at: now,
+        applied_at,
         receipts: receipts.clone(),
     };
     repository.mutate_dependency_applications(|_, applications| {
@@ -8355,6 +8400,7 @@ mod tests {
     use crate::project_sync_v3::domain::{
         RestoreActionKind, StorageConfigV3, StorageKind, TombstoneTarget,
     };
+    use crate::sync_tests::stub_s3::StubS3;
 
     #[test]
     fn routine_history_scan_logs_are_throttled_per_project() {
@@ -10104,6 +10150,82 @@ mod tests {
         let plan = plan_dependencies_with_repository(&repo, &restore.plan_id).unwrap();
         assert!(plan.plan_id.as_str().starts_with("plan-"));
         assert_eq!(repo.load_dependency_plan(&plan.plan_id).unwrap(), plan);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dependency_application_fetches_s3_bundle_off_runtime_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let cloud_root = temp.path().join("cloud");
+        std::fs::create_dir_all(cloud_root.join("bundle-tests")).unwrap();
+        let server = StubS3::start(cloud_root).await;
+        let repo = repository(&temp);
+        let storage_id = StorageId::parse("dependency-s3-store").unwrap();
+        let mut config = repo.load_config().unwrap();
+        config.storages.push(StorageConfigV3 {
+            id: storage_id.clone(),
+            name: "Dependency S3 store".to_string(),
+            kind: StorageKind::S3,
+            bucket: "bundle-tests".to_string(),
+            access_key_id: "test-access-key".to_string(),
+            secret_access_key: "test-secret".to_string(),
+            account_id: String::new(),
+            s3_endpoint: server.endpoint.clone(),
+            region: "auto".to_string(),
+            local_dir: String::new(),
+            included_default_exclusions: Vec::new(),
+            supports_conditional_writes: None,
+        });
+        repo.save_config(config).unwrap();
+
+        let project = register(&repo);
+        let binding = bind_and_link_test_replica(
+            &repo,
+            &project,
+            &storage_id,
+            &temp.path().join("project"),
+            &temp.path().join("codex-home"),
+        );
+
+        let push_repo = repo.clone();
+        let push_project_id = project.local_project_id.clone();
+        let push_storage_id = storage_id.clone();
+        run_blocking(move || {
+            push_bundle_with_repository(&push_repo, &push_project_id, &push_storage_id)
+        })
+        .await
+        .unwrap();
+
+        let restore_repo = repo.clone();
+        let restore_storage_id = storage_id.clone();
+        let restore_bundle_id = project.bundle_id.clone();
+        let restore = run_blocking(move || {
+            plan_bundle_restore_with_repository(
+                &restore_repo,
+                &restore_storage_id,
+                &restore_bundle_id,
+                &binding,
+            )
+        })
+        .await
+        .unwrap();
+        let dependency_repo = repo.clone();
+        let restore_plan_id = restore.plan_id;
+        let plan = run_blocking(move || {
+            plan_dependencies_with_repository(&dependency_repo, &restore_plan_id)
+        })
+        .await
+        .unwrap();
+
+        let result =
+            apply_dependency_actions_with_repository(&repo, &plan.plan_id, Vec::new()).await;
+        assert!(
+            result.is_ok(),
+            "S3 dependency application failed: {result:?}"
+        );
+        assert_eq!(
+            repo.load_dependency_applications().unwrap().records.len(),
+            1
+        );
     }
 
     #[test]

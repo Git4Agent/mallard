@@ -14,7 +14,7 @@
 //! directories after a run (paths are printed on drop).
 
 mod harness;
-mod stub_s3;
+pub(crate) mod stub_s3;
 
 use harness::{publish_external_commit, Machine, TestCloud};
 use std::sync::atomic::Ordering;
