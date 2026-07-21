@@ -720,11 +720,13 @@ fn within_approved_path(actual: &Path, expected_root: &Path) -> bool {
     }
 }
 
-fn managed_marketplace_home_is_allowed(name: &str, source: &Path, target_home: &Path) -> bool {
-    let Some(machine_home) = dirs::home_dir() else {
-        return false;
-    };
-    let default_home = machine_home.join(".codex");
+fn managed_marketplace_home_is_allowed_for_default(
+    name: &str,
+    source: &Path,
+    target_home: &Path,
+    default_home: &Path,
+) -> bool {
+    let machine_home = default_home.parent().unwrap_or(default_home);
     match name {
         "openai-curated" => [
             target_home.join(".tmp/plugins"),
@@ -743,6 +745,19 @@ fn managed_marketplace_home_is_allowed(name: &str, source: &Path, target_home: &
         }
         _ => false,
     }
+}
+
+fn managed_marketplace_home_is_allowed(name: &str, source: &Path, target_home: &Path) -> bool {
+    dirs::home_dir()
+        .map(|home| home.join(".codex"))
+        .is_some_and(|default_home| {
+            managed_marketplace_home_is_allowed_for_default(
+                name,
+                source,
+                target_home,
+                &default_home,
+            )
+        })
 }
 
 fn inspect_runtime_path(issues: &mut Vec<ConfigIssue>, id: String, raw: &str, target_home: &Path) {
@@ -775,6 +790,23 @@ fn inspect_runtime_path(issues: &mut Vec<ConfigIssue>, id: String, raw: &str, ta
 }
 
 pub fn inspect_managed_config(config_path: &Path, target_home: &Path) -> Vec<ConfigIssue> {
+    let default_home = dirs::home_dir().map(|home| home.join(".codex"));
+    inspect_managed_config_inner(config_path, target_home, default_home.as_deref())
+}
+
+pub fn inspect_managed_config_with_default(
+    config_path: &Path,
+    target_home: &Path,
+    default_home: &Path,
+) -> Vec<ConfigIssue> {
+    inspect_managed_config_inner(config_path, target_home, Some(default_home))
+}
+
+fn inspect_managed_config_inner(
+    config_path: &Path,
+    target_home: &Path,
+    default_home: Option<&Path>,
+) -> Vec<ConfigIssue> {
     if !config_path.exists() {
         return Vec::new();
     }
@@ -828,7 +860,14 @@ pub fn inspect_managed_config(config_path: &Path, target_home: &Path) -> Vec<Con
                 ));
                 continue;
             }
-            if !managed_marketplace_home_is_allowed(name, path, target_home) {
+            if !default_home.is_some_and(|default_home| {
+                managed_marketplace_home_is_allowed_for_default(
+                    name,
+                    path,
+                    target_home,
+                    default_home,
+                )
+            }) {
                 issues.push(issue(
                     id,
                     "managed_marketplace_wrong_home",

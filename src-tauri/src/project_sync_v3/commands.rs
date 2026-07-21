@@ -33,6 +33,7 @@ use super::provider_capture::{
 };
 use super::s3_store::S3BundleObjectStore;
 use crate::activity_log::{emit_typed_log, ActivityLogScope, ActivityLogType};
+use crate::codex_plugins;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -516,6 +517,8 @@ pub struct BundleSnapshotSummary {
 #[derive(Serialize, Clone, Debug)]
 pub struct FailedAction {
     pub action_id: ActionId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
     pub message: String,
 }
 
@@ -4663,6 +4666,7 @@ fn apply_bundle_restore_with_repository(
         .filter(|receipt| matches!(receipt.status, ActionStatus::Failed | ActionStatus::Blocked))
         .map(|receipt| FailedAction {
             action_id: receipt.action_id.clone(),
+            display_name: None,
             message: receipt
                 .error
                 .clone()
@@ -4761,6 +4765,8 @@ struct PreparedDependencyApplication {
     plan: DependencyPlan,
     binding: ProjectBinding,
     selected: BTreeSet<ActionId>,
+    previous: Option<DependencyApplicationRecord>,
+    resources: BTreeMap<ResourceId, ResourceDescriptor>,
     applied_at: u64,
 }
 
@@ -4774,17 +4780,11 @@ fn prepare_dependency_application(
     if applied_at < plan.created_at || applied_at > plan.expires_at {
         return Err("dependency plan has expired or is not active yet".to_string());
     }
-    if repository
+    let previous = repository
         .load_dependency_applications()?
         .records
-        .iter()
-        .any(|record| record.plan_id == plan.plan_id)
-    {
-        return Err(format!(
-            "dependency plan '{}' was already applied",
-            plan.plan_id
-        ));
-    }
+        .into_iter()
+        .find(|record| record.plan_id == plan.plan_id);
     let bindings = repository.load_bindings()?;
     let binding = bindings
         .bindings
@@ -4806,6 +4806,8 @@ fn prepare_dependency_application(
         plan,
         binding,
         selected,
+        previous,
+        resources: fetched.snapshot.manifest.resources,
         applied_at,
     })
 }
@@ -4823,6 +4825,16 @@ async fn apply_dependency_actions_with_repository(
     .await?;
     let mut receipts = Vec::with_capacity(prepared.plan.actions.len());
     for action in &prepared.plan.actions {
+        if let Some(applied) = prepared.previous.as_ref().and_then(|record| {
+            record.receipts.iter().find(|receipt| {
+                receipt.action_id == action.action_id && receipt.status == ActionStatus::Applied
+            })
+        }) {
+            // A retry never re-runs an action that this exact pinned plan
+            // already applied successfully.
+            receipts.push(applied.clone());
+            continue;
+        }
         if !prepared.selected.contains(&action.action_id) {
             receipts.push(DependencyApplyReceipt {
                 action_id: action.action_id.clone(),
@@ -4832,8 +4844,20 @@ async fn apply_dependency_actions_with_repository(
             });
             continue;
         }
-        let result =
-            execute_dependency_action(repository, &prepared.plan, &prepared.binding, action).await;
+        let resource = prepared.resources.get(&action.resource_id).ok_or_else(|| {
+            format!(
+                "dependency action '{}' references a missing bundle resource",
+                action.action_id
+            )
+        })?;
+        let result = execute_dependency_action(
+            repository,
+            &prepared.plan,
+            &prepared.binding,
+            action,
+            resource,
+        )
+        .await;
         receipts.push(DependencyApplyReceipt {
             action_id: action.action_id.clone(),
             status: if result.is_ok() {
@@ -4876,17 +4900,15 @@ fn finalize_dependency_application(
         receipts: receipts.clone(),
     };
     repository.mutate_dependency_applications(|_, applications| {
-        if applications
+        if let Some(current) = applications
             .records
-            .iter()
-            .any(|current| current.plan_id == record.plan_id)
+            .iter_mut()
+            .find(|current| current.plan_id == record.plan_id)
         {
-            return Err(format!(
-                "dependency plan '{}' was already recorded",
-                record.plan_id
-            ));
+            *current = record;
+        } else {
+            applications.records.push(record);
         }
-        applications.records.push(record);
         Ok(())
     })?;
     let applied_action_ids = receipts
@@ -4899,6 +4921,11 @@ fn finalize_dependency_application(
         .filter(|receipt| receipt.status == ActionStatus::Failed)
         .map(|receipt| FailedAction {
             action_id: receipt.action_id.clone(),
+            display_name: plan
+                .actions
+                .iter()
+                .find(|action| action.action_id == receipt.action_id)
+                .map(|action| action.display_name.clone()),
             message: receipt
                 .error
                 .clone()
@@ -5208,6 +5235,7 @@ async fn execute_dependency_action(
     plan: &DependencyPlan,
     binding: &ProjectBinding,
     action: &DependencyAction,
+    resource: &ResourceDescriptor,
 ) -> Result<(), String> {
     action.validate()?;
     match action.kind {
@@ -5234,7 +5262,7 @@ async fn execute_dependency_action(
             }
         }
         DependencyActionKind::InstallCodexPlugin => {
-            run_plugin_install("codex", action, binding).await
+            run_codex_plugin_install(action, binding, resource).await
         }
         DependencyActionKind::InstallClaudePlugin => {
             run_plugin_install("claude", action, binding).await
@@ -5247,11 +5275,7 @@ async fn execute_dependency_action(
     }
 }
 
-async fn run_plugin_install(
-    program: &str,
-    action: &DependencyAction,
-    binding: &ProjectBinding,
-) -> Result<(), String> {
+fn validate_plugin_install_intent(action: &DependencyAction) -> Result<(), String> {
     if !portable_plugin_id(&action.display_name) {
         return Err("plugin identifier is not safe for native installation".to_string());
     }
@@ -5283,13 +5307,183 @@ async fn run_plugin_install(
     if !supported_argument_sets.contains(&action.argv) {
         return Err("plugin install arguments differ from the supported intent".to_string());
     }
+    Ok(())
+}
+
+fn codex_plugin_lock_for_action(
+    action: &DependencyAction,
+    resource: &ResourceDescriptor,
+) -> Result<codex_plugins::CodexPluginLock, String> {
+    validate_plugin_install_intent(action)?;
+    if action.kind != DependencyActionKind::InstallCodexPlugin
+        || resource.resource_id != action.resource_id
+        || resource.kind != ResourceKind::Plugin
+        || resource.provider != Some(Provider::Codex)
+    {
+        return Err("Codex plugin dependency does not match its bundle resource".to_string());
+    }
+    let (_, marketplace) = action
+        .display_name
+        .rsplit_once('@')
+        .ok_or_else(|| "Codex plugin identifier has no marketplace".to_string())?;
+    if resource
+        .metadata
+        .get("plugin_marketplace")
+        .is_some_and(|captured| captured != marketplace)
+    {
+        return Err("Codex plugin marketplace metadata does not match its identifier".to_string());
+    }
+
+    let mut lock = codex_plugins::empty_lock();
+    lock.plugins.push(codex_plugins::CodexPluginIntent {
+        id: action.display_name.clone(),
+        observed_version: resource.metadata.get("plugin_observed_version").cloned(),
+    });
+    match resource
+        .metadata
+        .get("plugin_source_type")
+        .map(String::as_str)
+    {
+        Some("git") => {
+            let source = resource.metadata.get("plugin_source").ok_or_else(|| {
+                format!(
+                    "Codex plugin '{}' is missing its portable marketplace source",
+                    action.display_name
+                )
+            })?;
+            lock.marketplaces
+                .push(codex_plugins::CodexMarketplaceIntent {
+                    name: marketplace.to_string(),
+                    repository: source.clone(),
+                    git_ref: None,
+                });
+        }
+        Some("local") | None => {}
+        Some(source_type) => {
+            return Err(format!(
+                "Codex plugin '{}' has unsupported marketplace source type '{}'",
+                action.display_name, source_type
+            ));
+        }
+    }
+    codex_plugins::validate_lock(&lock)?;
+    Ok(lock)
+}
+
+// Dependency receipt errors are capped at 8 KiB. Reserve room for the plugin
+// identifier and the stable error prefix wrapped around these diagnostics.
+const MAX_PLUGIN_DIAGNOSTIC_BYTES: usize = 7 * 1024;
+
+fn append_plugin_diagnostic(diagnostics: &mut String, level: &str, message: &str) {
+    if diagnostics.len() >= MAX_PLUGIN_DIAGNOSTIC_BYTES {
+        return;
+    }
+    let message = codex_plugins::redact(message.trim());
+    if message.is_empty() {
+        return;
+    }
+    let line = format!("{}: {}\n", level, message);
+    let remaining = MAX_PLUGIN_DIAGNOSTIC_BYTES - diagnostics.len();
+    let mut end = line.len().min(remaining);
+    while !line.is_char_boundary(end) {
+        end -= 1;
+    }
+    diagnostics.push_str(&line[..end]);
+}
+
+fn plugin_failure_detail(stdout: &[u8], stderr: &[u8]) -> String {
+    let mut diagnostics = String::new();
+    for line in String::from_utf8_lossy(stderr)
+        .lines()
+        .chain(String::from_utf8_lossy(stdout).lines())
+    {
+        append_plugin_diagnostic(&mut diagnostics, "installer", line);
+    }
+    diagnostics.trim().to_string()
+}
+
+async fn run_codex_plugin_install(
+    action: &DependencyAction,
+    binding: &ProjectBinding,
+    resource: &ResourceDescriptor,
+) -> Result<(), String> {
+    let lock = codex_plugin_lock_for_action(action, resource)?;
+    let plugin_id = action.display_name.clone();
+    let target_home = binding
+        .codex_home
+        .as_deref()
+        .map(PathBuf::from)
+        .ok_or_else(|| "Codex plugin installation requires a configured Codex home".to_string())?;
+    let default_home = dirs::home_dir()
+        .map(|home| home.join(".codex"))
+        .ok_or_else(|| "could not resolve the default Codex home".to_string())?;
+
+    tokio::task::spawn_blocking(move || {
+        let codex = codex_plugins::find_binary("codex")?;
+        let target_runner = codex_plugins::ProcessRunner::for_binary(codex.clone())
+            .with_codex_home(Some(target_home.clone()));
+        let default_runner = codex_plugins::ProcessRunner::for_binary(codex)
+            .with_codex_home(Some(default_home.clone()));
+        let mut diagnostics = String::new();
+        let mut log =
+            |level: &str, message: &str| append_plugin_diagnostic(&mut diagnostics, level, message);
+        let repair = codex_plugins::apply_approved_managed_plan(
+            &target_runner,
+            &default_runner,
+            &lock,
+            &target_home,
+            &default_home,
+            &mut log,
+        );
+        drop(log);
+        let report = repair.map_err(|error| {
+            append_plugin_diagnostic(&mut diagnostics, "error", &error);
+            format!(
+                "codex plugin '{}' setup failed: {}",
+                plugin_id,
+                diagnostics.trim()
+            )
+        })?;
+        let satisfied = report
+            .plugins_installed
+            .iter()
+            .chain(&report.already_present)
+            .any(|installed| installed == &plugin_id);
+        let failed = report.failed.iter().any(|failed| failed == &plugin_id);
+        let blocked = report
+            .blocked_plugins
+            .iter()
+            .any(|blocked| blocked.id == plugin_id);
+        if satisfied && !failed && !blocked {
+            return Ok(());
+        }
+        let detail = diagnostics.trim();
+        Err(if detail.is_empty() {
+            format!(
+                "codex plugin '{}' was not present after installation",
+                plugin_id
+            )
+        } else {
+            format!("codex plugin '{}' was not installed: {}", plugin_id, detail)
+        })
+    })
+    .await
+    .map_err(|error| format!("Codex plugin installer task failed: {}", error))?
+}
+
+async fn run_plugin_install(
+    program: &str,
+    action: &DependencyAction,
+    binding: &ProjectBinding,
+) -> Result<(), String> {
+    validate_plugin_install_intent(action)?;
     let mut command = Command::new(program);
     command
         .args(&action.argv)
         .current_dir(&binding.project_root)
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .kill_on_drop(true);
     if let Some(codex_home) = &binding.codex_home {
         command.env("CODEX_HOME", codex_home);
@@ -5297,21 +5491,27 @@ async fn run_plugin_install(
     if let Some(claude_home) = &binding.claude_home {
         command.env("CLAUDE_CONFIG_DIR", claude_home);
     }
-    let output = timeout(DEFAULT_OPERATION_TIMEOUT, command.status())
+    let output = timeout(DEFAULT_OPERATION_TIMEOUT, command.output())
         .await
         .map_err(|_| format!("{} plugin installation timed out", program))?
         .map_err(|error| format!("start {} plugin installer: {}", program, error))?;
-    if output.success() {
+    if output.status.success() {
         Ok(())
     } else {
-        Err(format!(
-            "{} plugin installer exited with status {}",
-            program,
-            output
-                .code()
-                .map(|code| code.to_string())
-                .unwrap_or_else(|| "terminated".to_string())
-        ))
+        let detail = plugin_failure_detail(&output.stdout, &output.stderr);
+        let status = output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "terminated".to_string());
+        Err(if detail.is_empty() {
+            format!("{} plugin installer exited with status {}", program, status)
+        } else {
+            format!(
+                "{} plugin installer exited with status {}: {}",
+                program, status, detail
+            )
+        })
     }
 }
 
@@ -8563,6 +8763,75 @@ mod tests {
         );
     }
 
+    #[test]
+    fn codex_dependency_builds_a_portable_managed_or_git_lock() {
+        let resource_id = ResourceId::parse("codex:plugin:documents").unwrap();
+        let action = DependencyAction {
+            action_id: ActionId::parse("dependency:codex:plugin:documents").unwrap(),
+            resource_id: resource_id.clone(),
+            kind: DependencyActionKind::InstallCodexPlugin,
+            display_name: "documents@openai-primary-runtime".to_string(),
+            provider: Some(Provider::Codex),
+            argv: vec![
+                "plugin".to_string(),
+                "add".to_string(),
+                "documents@openai-primary-runtime".to_string(),
+            ],
+            requires_explicit_approval: true,
+        };
+        let mut descriptor = ResourceDescriptor {
+            resource_id,
+            kind: ResourceKind::Plugin,
+            provider: Some(Provider::Codex),
+            scope: ResourceScope::Dependency,
+            display_name: action.display_name.clone(),
+            provenance: Provenance::Plugin {
+                provider: Provider::Codex,
+                plugin_id: action.display_name.clone(),
+            },
+            apply_policy: ApplyPolicy::ExplicitInstall,
+            relative_cwd: None,
+            codec_version: 1,
+            metadata: BTreeMap::from([
+                (
+                    "plugin_marketplace".to_string(),
+                    "openai-primary-runtime".to_string(),
+                ),
+                ("plugin_source_type".to_string(), "local".to_string()),
+            ]),
+        };
+
+        let managed = codex_plugin_lock_for_action(&action, &descriptor).unwrap();
+        assert_eq!(managed.plugins[0].id, "documents@openai-primary-runtime");
+        assert!(managed.marketplaces.is_empty());
+
+        let mut git_action = action.clone();
+        git_action.display_name = "documents@team-tools".to_string();
+        git_action.argv[2] = git_action.display_name.clone();
+        descriptor.display_name = git_action.display_name.clone();
+        descriptor.metadata = BTreeMap::from([
+            ("plugin_marketplace".to_string(), "team-tools".to_string()),
+            ("plugin_source_type".to_string(), "git".to_string()),
+            ("plugin_source".to_string(), "owner/repo".to_string()),
+        ]);
+        let git = codex_plugin_lock_for_action(&git_action, &descriptor).unwrap();
+        assert_eq!(git.marketplaces[0].name, "team-tools");
+        assert_eq!(git.marketplaces[0].repository, "owner/repo");
+    }
+
+    #[test]
+    fn plugin_failure_diagnostics_are_redacted_and_bounded() {
+        let noisy = format!(
+            "Authorization: Bearer do-not-log\nactual catalog error\n{}",
+            "x".repeat(MAX_PLUGIN_DIAGNOSTIC_BYTES * 2)
+        );
+        let detail = plugin_failure_detail(&[], noisy.as_bytes());
+        assert!(detail.contains("[redacted]"));
+        assert!(detail.contains("actual catalog error"));
+        assert!(!detail.contains("do-not-log"));
+        assert!(detail.len() <= MAX_PLUGIN_DIAGNOSTIC_BYTES);
+    }
+
     fn repository(temp: &tempfile::TempDir) -> V3Repository {
         V3Repository::from_home_dir(temp.path()).unwrap()
     }
@@ -10091,8 +10360,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn dependency_plan_generation_uses_a_valid_persisted_plan_id() {
+    #[tokio::test]
+    async fn dependency_plan_generation_uses_a_valid_id_and_supports_retry() {
         let temp = tempfile::tempdir().unwrap();
         let repo = repository(&temp);
         let storage_id = StorageId::parse("dependency-store").unwrap();
@@ -10150,6 +10419,19 @@ mod tests {
         let plan = plan_dependencies_with_repository(&repo, &restore.plan_id).unwrap();
         assert!(plan.plan_id.as_str().starts_with("plan-"));
         assert_eq!(repo.load_dependency_plan(&plan.plan_id).unwrap(), plan);
+
+        let first = apply_dependency_actions_with_repository(&repo, &plan.plan_id, Vec::new())
+            .await
+            .unwrap();
+        let retry = apply_dependency_actions_with_repository(&repo, &plan.plan_id, Vec::new())
+            .await
+            .unwrap();
+        assert!(first.success);
+        assert!(retry.success);
+        assert_eq!(
+            repo.load_dependency_applications().unwrap().records.len(),
+            1
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

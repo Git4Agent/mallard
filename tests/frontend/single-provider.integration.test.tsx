@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import ProjectBindingEditor from "../../src/components/project-sync/ProjectBindingEditor";
@@ -56,6 +57,13 @@ test("the project Push action describes its workflow state", () => {
   assert.equal(projectPushActionLabel({ reviewOpen: false, preparing: true, publishing: false }), "Preparing…");
   assert.equal(projectPushActionLabel({ reviewOpen: true, preparing: false, publishing: false }), "Continue push");
   assert.equal(projectPushActionLabel({ reviewOpen: true, preparing: false, publishing: true }), "Pushing…");
+
+  const workspaceSource = readFileSync("src/components/project-sync/ProjectLinksWorkspace.tsx", "utf8");
+  assert.match(
+    workspaceSource,
+    /key=\{pushProgress \? "push-progress" : "push-idle"\}/,
+    "the idle upload icon must replace the animated SVG instead of reusing it",
+  );
 });
 
 test("an open sync review locks storage controls and the opposite sync action", () => {

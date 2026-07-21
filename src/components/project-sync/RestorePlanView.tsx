@@ -135,7 +135,7 @@ function ResultDetails({
         <div key={`${result.message}-${index}`}>
           <strong>{result.message}</strong>
           {(result.failed_actions ?? []).map((failure) => (
-            <span key={failure.action_id}><code>{failure.action_id}</code>{failure.message}</span>
+            <span key={failure.action_id}><code>{failure.display_name ?? failure.action_id}</code>{failure.message}</span>
           ))}
         </div>
       ))}
