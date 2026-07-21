@@ -39,6 +39,7 @@ test("desktop releases and updates use the public GitHub repository", async () =
   assert.match(workflow, /uploadUpdaterJson: true/);
   assert.match(workflow, /MALLARD_VERIFY_MACOS_BUNDLE: \$\{\{ runner\.os == 'macOS' && '1' \|\| '' \}\}/);
   assert.doesNotMatch(workflow, /name: Verify macOS app signature/);
+  assert.doesNotMatch(workflow, /^\s+APPLE_[A-Z_]+:/m);
   assert.equal(packageConfig.scripts.tauri, "node scripts/tauri-build.mjs");
   assert.match(tauriBuildScript, /process\.execPath/);
   assert.match(tauriBuildScript, /"@tauri-apps", "cli", "tauri\.js"/);
