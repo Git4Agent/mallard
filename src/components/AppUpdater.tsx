@@ -6,6 +6,7 @@ import { relaunch } from "@tauri-apps/plugin-process";
 import { check, type Update } from "@tauri-apps/plugin-updater";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { APP_UPDATE_CHECK_EVENT } from "./AppUpdateControl";
 import Icon from "./Icons";
 
 const UPDATE_DEFERRED_KEY = "mallard.update.deferred";
@@ -14,6 +15,7 @@ const LAST_SEEN_CHANGELOG_KEY = "mallard.update.last-seen-changelog";
 const AUTO_CHECK_DELAY_MS = 8_000;
 const AUTO_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1_000;
 const DEFER_UPDATE_MS = 24 * 60 * 60 * 1_000;
+const LATEST_NOTICE_MS = 3_000;
 
 export interface UpdateSummary {
   version: string;
@@ -27,7 +29,14 @@ interface DeferredUpdate {
   until: number;
 }
 
-type UpdatePhase = "idle" | "available" | "downloading" | "installing" | "error";
+type UpdatePhase =
+  | "idle"
+  | "checking"
+  | "latest"
+  | "available"
+  | "downloading"
+  | "installing"
+  | "error";
 
 function readJson<T>(key: string): T | null {
   try {
@@ -75,6 +84,18 @@ export function releaseNotePreview(notes: string): string {
   return firstContentLine || "This release includes improvements and fixes.";
 }
 
+export function describeUpdateError(reason: unknown): string {
+  if (reason instanceof Error && reason.message.trim()) return reason.message.trim();
+  if (typeof reason === "string" && reason.trim()) return reason.trim();
+  try {
+    const serialized = JSON.stringify(reason);
+    if (serialized && serialized !== "{}") return serialized;
+  } catch {
+    // Host-owned errors may not be serializable.
+  }
+  return "Mallard could not complete the update. Check your connection and try again.";
+}
+
 interface UpdatePromptProps {
   summary: UpdateSummary;
   busy: boolean;
@@ -112,6 +133,44 @@ export function UpdatePrompt({
           </button>
         )}
       </div>
+    </aside>
+  );
+}
+
+interface UpdateCheckNoticeProps {
+  phase: "checking" | "latest" | "error";
+  error: string | null;
+  onDismiss: () => void;
+  onRetry: () => void;
+}
+
+export function UpdateCheckNotice({
+  phase,
+  error,
+  onDismiss,
+  onRetry,
+}: UpdateCheckNoticeProps) {
+  const failed = phase === "error";
+  const latest = phase === "latest";
+  return (
+    <aside className={`app-update-notice app-update-check-notice${failed ? " error" : ""}`} role="status" aria-live="polite">
+      <div className="app-update-notice-icon" aria-hidden="true">
+        <Icon
+          name={failed ? "alert-triangle" : latest ? "check-circle" : "refresh"}
+          size={17}
+          className={phase === "checking" ? "icon-spin" : undefined}
+        />
+      </div>
+      <div className="app-update-notice-copy">
+        <strong>{failed ? "Couldn’t check for updates" : latest ? "Mallard is up to date" : "Checking for updates…"}</strong>
+        <span>{failed ? error : latest ? "You already have the newest available version." : "Looking for a newer signed release on GitHub."}</span>
+      </div>
+      {phase !== "checking" && (
+        <div className="app-update-notice-actions">
+          <button type="button" className="btn btn-ghost" onClick={onDismiss}>Dismiss</button>
+          {failed && <button type="button" className="btn btn-primary" onClick={onRetry}>Try again</button>}
+        </div>
+      )}
     </aside>
   );
 }
@@ -206,8 +265,16 @@ export default function AppUpdater({ busy }: AppUpdaterProps) {
   const checkingRef = useRef(false);
   const installingRef = useRef(false);
   const lastCheckRef = useRef(0);
+  const latestNoticeTimerRef = useRef<number | null>(null);
   const busyRef = useRef(busy);
   busyRef.current = busy;
+
+  const clearLatestNoticeTimer = useCallback(() => {
+    if (latestNoticeTimerRef.current !== null) {
+      window.clearTimeout(latestNoticeTimerRef.current);
+      latestNoticeTimerRef.current = null;
+    }
+  }, []);
 
   const closeUpdateHandle = useCallback(async () => {
     const current = updateRef.current;
@@ -221,10 +288,15 @@ export default function AppUpdater({ busy }: AppUpdaterProps) {
     }
   }, []);
 
-  const checkForUpdates = useCallback(async (showErrors = false) => {
+  const checkForUpdates = useCallback(async (interactive = false) => {
     if (!isTauri() || checkingRef.current || installingRef.current) return;
     checkingRef.current = true;
     lastCheckRef.current = Date.now();
+    clearLatestNoticeTimer();
+    if (interactive) {
+      setError(null);
+      setPhase("checking");
+    }
     try {
       const update = await check({ timeout: 30_000 });
       if (!mountedRef.current) {
@@ -233,10 +305,18 @@ export default function AppUpdater({ busy }: AppUpdaterProps) {
       }
       if (!update) {
         await closeUpdateHandle();
-        setPhase("idle");
         summaryRef.current = null;
         setSummary(null);
         setError(null);
+        if (interactive) {
+          setPhase("latest");
+          latestNoticeTimerRef.current = window.setTimeout(() => {
+            latestNoticeTimerRef.current = null;
+            if (mountedRef.current) setPhase((current) => current === "latest" ? "idle" : current);
+          }, LATEST_NOTICE_MS);
+        } else {
+          setPhase("idle");
+        }
         return;
       }
 
@@ -247,7 +327,7 @@ export default function AppUpdater({ busy }: AppUpdaterProps) {
         date: update.date ?? null,
       };
       const deferred = readJson<DeferredUpdate>(UPDATE_DEFERRED_KEY);
-      if (!showErrors && shouldDeferUpdate(deferred, nextSummary.version)) {
+      if (!interactive && shouldDeferUpdate(deferred, nextSummary.version)) {
         await update.close();
         return;
       }
@@ -259,14 +339,14 @@ export default function AppUpdater({ busy }: AppUpdaterProps) {
       setError(null);
       setPhase("available");
     } catch (reason) {
-      if (showErrors && mountedRef.current) {
-        setError(String(reason));
-        setPhase(summaryRef.current ? "error" : "idle");
+      if (interactive && mountedRef.current) {
+        setError(describeUpdateError(reason));
+        setPhase("error");
       }
     } finally {
       checkingRef.current = false;
     }
-  }, [closeUpdateHandle]);
+  }, [clearLatestNoticeTimer, closeUpdateHandle]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -297,16 +377,20 @@ export default function AppUpdater({ busy }: AppUpdaterProps) {
     const handleFocus = () => {
       if (Date.now() - lastCheckRef.current >= AUTO_CHECK_INTERVAL_MS) void checkForUpdates();
     };
+    const handleManualCheck = () => void checkForUpdates(true);
     window.addEventListener("focus", handleFocus);
+    window.addEventListener(APP_UPDATE_CHECK_EVENT, handleManualCheck);
 
     return () => {
       mountedRef.current = false;
       window.clearTimeout(initialTimer);
       window.clearInterval(interval);
+      clearLatestNoticeTimer();
       window.removeEventListener("focus", handleFocus);
+      window.removeEventListener(APP_UPDATE_CHECK_EVENT, handleManualCheck);
       void closeUpdateHandle();
     };
-  }, [checkForUpdates, closeUpdateHandle]);
+  }, [checkForUpdates, clearLatestNoticeTimer, closeUpdateHandle]);
 
   const deferCurrentUpdate = useCallback(() => {
     if (summary) {
@@ -354,7 +438,7 @@ export default function AppUpdater({ busy }: AppUpdaterProps) {
     } catch (reason) {
       installingRef.current = false;
       await closeUpdateHandle();
-      setError(String(reason));
+      setError(describeUpdateError(reason));
       setPhase("error");
     }
   }, [busy, closeUpdateHandle, summary]);
@@ -364,6 +448,12 @@ export default function AppUpdater({ busy }: AppUpdaterProps) {
     setPhase("idle");
     void closeUpdateHandle().then(() => checkForUpdates(true));
   }, [checkForUpdates, closeUpdateHandle]);
+
+  const dismissCheckNotice = useCallback(() => {
+    clearLatestNoticeTimer();
+    setError(null);
+    setPhase("idle");
+  }, [clearLatestNoticeTimer]);
 
   const closeChangelog = useCallback(() => {
     if (changelog) {
@@ -379,6 +469,14 @@ export default function AppUpdater({ busy }: AppUpdaterProps) {
 
   return (
     <>
+      {(phase === "checking" || phase === "latest" || (!summary && phase === "error")) && (
+        <UpdateCheckNotice
+          phase={phase}
+          error={error}
+          onDismiss={dismissCheckNotice}
+          onRetry={retryUpdate}
+        />
+      )}
       {summary && (phase === "available" || phase === "error") && (
         <UpdatePrompt
           summary={summary}

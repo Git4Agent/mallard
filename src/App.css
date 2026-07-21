@@ -3191,6 +3191,22 @@ summary:focus-visible {
 }
 .v3-sidebar-footer button:hover:not(:disabled) { color: var(--text-0); background: var(--bg-hover); }
 
+.app-update-control button > span {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-update-control button > small {
+  flex-shrink: 0;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 9.5px;
+}
+
 .v3-workspace {
   position: relative;
   flex: 1;
