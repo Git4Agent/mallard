@@ -5,10 +5,16 @@ GitHub Release. A pushed `v*` tag starts `.github/workflows/release.yml`, which
 builds Apple Silicon and Intel macOS packages plus a Windows x64 NSIS package.
 The release remains a draft until it has been installed and verified.
 
-The source repository and its GitHub Releases are private. After all native
-builds finish, the workflow copies the public installer and updater artifacts
-to the `releases/` prefix of the existing `mallard-cloud-prod-demo` R2 bucket.
-The public Worker serves them from `https://api.mallard-ai.com/v1/releases/`.
+GitHub Releases is the public source of truth for installers and updates. The
+stable updater manifest is always available at:
+
+```text
+https://github.com/Git4Agent/mallard/releases/latest/download/latest.json
+```
+
+The download website reads the repository's public latest-release API and uses
+the returned `browser_download_url` values. No Cloudflare credential, R2
+mirror, or GitHub token is required for public downloads.
 
 ## Updater signing key
 
@@ -34,11 +40,6 @@ gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/mallard.key
 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` may be omitted for the current key. If the
 key is replaced with a password-protected key, create that secret as well.
 
-The public R2 publication job also requires:
-
-- `CLOUDFLARE_API_TOKEN`, scoped to write objects to the production demo bucket;
-- `CLOUDFLARE_ACCOUNT_ID`.
-
 Updater signing proves that a release came from Mallard. It does not replace
 Apple Developer ID signing/notarization or Windows Authenticode signing.
 
@@ -60,9 +61,8 @@ credentials are available, but operating-system warnings will remain.
 
 ## Prepare a release
 
-Merge both release workflow files into the repository's default branch before
-creating a tag. GitHub evaluates the `release: published` workflow from the
-default branch when the draft is published.
+Merge the release workflow into the repository's default branch before
+creating a tag.
 
 1. Update the version in all three files:
    - `package.json`
@@ -83,17 +83,14 @@ default branch when the draft is published.
    git push origin v0.2.0
    ```
 
-4. Wait for all three release jobs and the public-artifact job. This uploads
-   immutable objects under `/v1/releases/v0.2.0/`, but does not change the
-   updater's stable `latest.json` endpoint.
+4. Wait for all three release jobs. `tauri-action` attaches the installers,
+   updater bundles, signatures, and generated `latest.json` to one draft
+   GitHub Release.
 5. Inspect the draft GitHub Release, edit its release notes, install each
-   first-install package, and verify the versioned R2 manifest and downloads.
-6. Publish the draft. The `Promote published update` workflow validates the
-   versioned manifest and only then replaces `/v1/releases/latest.json`.
-
-Deploy the release routes in `mallardInternal/cloudflare/api` before the first
-release. Until that Worker version is live, the public manifest URL returns
-404 even when the R2 objects have been uploaded.
+   first-install package, and verify every attached artifact.
+6. Publish the draft. GitHub's release URLs immediately expose the versioned
+   assets, while `/releases/latest/download/latest.json` resolves to the newly
+   published release. The website discovers the same release independently.
 
 Do not replace artifacts under an existing version. Fix the problem, increment
 the semantic version, and publish a new signed release.
@@ -111,10 +108,8 @@ TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
 The normal DMG is the first-install package. The updater consumes the generated
 `.app.tar.gz` and `.sig` artifacts. On Windows it consumes the NSIS setup
 executable and its `.sig` file. `tauri-action` uploads these files and generates
-the multi-platform `latest.json` file automatically. The publication step also
-adds a `downloads` map with the DMG and NSIS installer URLs, sizes, and SHA-256
-digests. The website reads that map, while Tauri ignores the extra field and
-continues to use the signed `platforms` entries.
+the multi-platform `latest.json` file automatically. The website independently
+discovers the DMG and NSIS installers from the latest GitHub Release API.
 
 ## Upgrade verification
 

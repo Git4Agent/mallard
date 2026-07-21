@@ -37,13 +37,13 @@ The repository is already close to macOS packaging readiness:
 
 This implementation adds:
 
-- tag-triggered GitHub Actions release and guarded promotion workflows;
+- a tag-triggered GitHub Actions draft-release workflow;
 - Tauri updater signing, runtime integration, and update UI;
-- public release delivery through the existing Cloudflare Worker and R2; and
+- public release delivery directly through GitHub Releases; and
 - a safe Windows fallback for the Unix-only Claude alias operation.
 
-Production still requires Apple and Windows publisher credentials, deployment
-of the Worker release routes, and clean-machine validation on every target.
+Production still requires Apple and Windows publisher credentials and
+clean-machine validation on every target.
 
 ### 2.1 Windows validation gaps
 
@@ -187,10 +187,10 @@ automated artifact production and public distribution.
 
 `.github/workflows/release.yml` builds the two macOS updater applications and
 DMGs plus the Windows NSIS package, creates one draft release, validates the
-generated multi-platform updater manifest, and mirrors immutable public files
-to R2. `.github/workflows/promote-release.yml` runs only after the draft is
-published and promotes the reviewed release notes and manifest to the stable
-updater endpoint. Detailed operator steps are in `docs/RELEASING.md`.
+generated multi-platform updater manifest, and attaches every artifact directly
+to the GitHub Release. Publishing the draft makes GitHub's stable latest-release
+URLs resolve to the reviewed release. Detailed operator steps are in
+`docs/RELEASING.md`.
 
 ## 7. Signing and Trust
 
@@ -262,18 +262,18 @@ on clean installations of those versions.
 
 ### 8.2 Artifact resolution
 
-The source repository and its GitHub Releases are private. The download page
-must resolve stable metadata from the public Worker and link to immutable R2
-objects under `/v1/releases/{version}/`, using the same artifact names as the
-updater manifest.
+The repository and its GitHub Releases are public. The download page resolves
+metadata from GitHub's public latest-release API and uses each matching asset's
+`browser_download_url`. Download URLs must be accepted only when they use the
+exact `github.com` origin and the repository's `/releases/download/` path.
 
 The UI should treat operating-system detection as a recommendation, not an
 access restriction. Browser architecture detection is imperfect, so all
 downloads must remain visible.
 
-If bandwidth, analytics, or regional performance later becomes a problem, put
-a CDN cache in front of the immutable Worker routes without changing client
-URLs.
+GitHub serves release assets through its download infrastructure. A separate
+CDN or mirror should be introduced only if future bandwidth, analytics, or
+regional-performance requirements justify the added release-state complexity.
 
 ## 9. Automatic Updates
 
@@ -288,17 +288,16 @@ The implementation includes:
 - `tauri-plugin-updater` and `tauri-plugin-process` in Rust and the frontend;
 - a dedicated Tauri updater signing keypair, with only its public key committed;
 - `bundle.createUpdaterArtifacts` and the required Tauri capabilities;
-- the HTTPS endpoint `https://api.mallard-ai.com/v1/releases/latest.json`;
-- a tag-triggered native build matrix that creates a draft private GitHub
-  Release and copies its public artifacts to versioned R2 keys;
-- a separate release-published workflow that promotes the validated versioned
-  manifest to `latest.json`; and
-- public Worker routes for the manifest and immutable assets in the internal
-  Cloudflare service repository.
+- the HTTPS endpoint
+  `https://github.com/Git4Agent/mallard/releases/latest/download/latest.json`;
+- a tag-triggered native build matrix that creates a draft public GitHub
+  Release and attaches the installers, updater bundles, signatures, and
+  `latest.json`; and
+- a public website that discovers installers through GitHub's latest-release
+  REST API.
 
-The GitHub source repository is private, so clients never use private GitHub
-asset URLs or receive a GitHub token. Release files are copied to the public
-`releases/` prefix of the existing demo R2 bucket and streamed by the Worker.
+The public desktop app and website need no GitHub token to read release
+metadata or download release assets.
 
 Updater signing is separate from macOS and Windows publisher signing. The
 updater private key must be backed up securely: losing it prevents existing
@@ -361,9 +360,9 @@ the developer's real `~/.codex`, `~/.claude`, or `~/.mallard` data.
 ### Phase 5: updates
 
 - [x] add the Tauri updater and restart flow;
-- [x] publish signed update metadata through versioned R2 objects;
-- [x] add guarded promotion of `latest.json` when a draft release is published;
-- [x] deploy the Worker release routes; and
+- [x] publish signed update metadata as GitHub Release assets;
+- [x] point the updater at GitHub's stable latest-release manifest URL;
+- [x] resolve website downloads from GitHub's public release API; and
 - [ ] test real upgrades and rollback/error behavior on all release targets.
 
 ## 12. Acceptance Criteria

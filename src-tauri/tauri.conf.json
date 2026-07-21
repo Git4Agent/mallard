@@ -41,7 +41,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDM0RkM2MjJCRTkwRjIyNjEKUldSaElnL3BLMkw4TktGNW1zQ05yN2FHaUxJZFRzNWJMcmtOM3FYbWVQMGxEZXVCbmE0UXVmdm0K",
       "endpoints": [
-        "https://api.mallard-ai.com/v1/releases/latest.json"
+        "https://github.com/Git4Agent/mallard/releases/latest/download/latest.json"
       ],
       "windows": {
         "installMode": "passive"

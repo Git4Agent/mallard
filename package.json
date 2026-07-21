@@ -10,9 +10,9 @@
     "check:release-version": "node scripts/check-release-version.mjs",
     "preview": "vite preview",
     "test:frontend-integration": "node scripts/run-frontend-integration-tests.mjs",
-    "test:release-scripts": "node --test tests/release-scripts.test.mjs",
+    "test:release-config": "node --test tests/release-config.test.mjs",
     "test:backend-integration": "cargo test --manifest-path src-tauri/Cargo.toml --lib project_sync_v3::commands::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib project_sync_v3::chat_history::tests && cargo test --manifest-path src-tauri/Cargo.toml --lib sync_tests",
-    "test:integration": "npm run test:frontend-integration && npm run test:release-scripts && npm run test:backend-integration",
+    "test:integration": "npm run test:frontend-integration && npm run test:release-config && npm run test:backend-integration",
     "tauri": "tauri"
   },
   "dependencies": {
