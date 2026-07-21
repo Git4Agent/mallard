@@ -33,6 +33,7 @@ test("application contains no automatic updater", async () => {
     packageLockSource,
     appSource,
     projectSyncSource,
+    projectSidebarSource,
     testRunnerSource,
   ] = await Promise.all([
     read("src-tauri/tauri.conf.json"),
@@ -43,11 +44,24 @@ test("application contains no automatic updater", async () => {
     read("package-lock.json"),
     read("src/App.tsx"),
     read("src/components/project-sync/ProjectSyncV3.tsx"),
+    read("src/components/project-sync/ProjectSidebar.tsx"),
     read("scripts/run-frontend-integration-tests.mjs"),
   ]);
   const tauriConfig = JSON.parse(tauriConfigSource);
   const packageConfig = JSON.parse(packageSource);
 
+  await assert.rejects(
+    access(new URL("src/components/AppUpdater.tsx", projectUrl)),
+    (error) => error?.code === "ENOENT",
+  );
+  await assert.rejects(
+    access(new URL("src/components/AppUpdateControl.tsx", projectUrl)),
+    (error) => error?.code === "ENOENT",
+  );
+  await assert.rejects(
+    access(new URL("tests/frontend/app-updater.integration.test.tsx", projectUrl)),
+    (error) => error?.code === "ENOENT",
+  );
   assert.equal(tauriConfig.bundle.createUpdaterArtifacts, undefined);
   assert.equal(tauriConfig.plugins?.updater, undefined);
   assert.equal(packageConfig.dependencies["@tauri-apps/plugin-updater"], undefined);
@@ -59,21 +73,14 @@ test("application contains no automatic updater", async () => {
     packageLockSource,
     appSource,
     projectSyncSource,
+    projectSidebarSource,
     testRunnerSource,
   ]) {
     assert.doesNotMatch(
       source,
-      /updater|AppUpdater|onBusyChange|tauri-plugin-process|plugin-process|allow-restart/i,
+      /updater|AppUpdater|AppUpdateControl|check-for-updates|onBusyChange|tauri-plugin-process|plugin-process|allow-restart/i,
     );
   }
-  await assert.rejects(
-    access(new URL("src/components/AppUpdater.tsx", projectUrl)),
-    (error) => error?.code === "ENOENT",
-  );
-  await assert.rejects(
-    access(new URL("tests/frontend/app-updater.integration.test.tsx", projectUrl)),
-    (error) => error?.code === "ENOENT",
-  );
 });
 
 test("desktop release builds one verified Apple Silicon DMG", async () => {

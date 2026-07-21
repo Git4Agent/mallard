@@ -135,9 +135,11 @@ git commit -m "Test manual Apple Silicon releases"
 **Files:**
 - Modify: `src/App.tsx`
 - Modify: `src/components/project-sync/ProjectSyncV3.tsx`
+- Modify: `src/components/project-sync/ProjectSidebar.tsx`
 - Modify: `src/App.css`
 - Modify: `scripts/run-frontend-integration-tests.mjs`
 - Delete: `src/components/AppUpdater.tsx`
+- Delete: `src/components/AppUpdateControl.tsx`
 - Delete: `tests/frontend/app-updater.integration.test.tsx`
 
 **Interfaces:**
@@ -160,7 +162,8 @@ Remove `onBusyChange` from `ProjectSyncV3`'s props, parameters, and its two busy
 
 - [ ] **Step 2: Delete updater-owned frontend artifacts**
 
-Delete `AppUpdater.tsx` and its integration test. Remove its test-runner entry.
+Delete `AppUpdater.tsx`, `AppUpdateControl.tsx`, and the updater integration
+test. Remove the sidebar control import/render and the test-runner entry.
 Remove the two `.app-update-control` rules and the complete
 `/* Signed application updates */` section from `src/App.css`.
 

@@ -73,7 +73,6 @@ import {
 interface Props {
   theme: AppTheme;
   onThemeChange: (theme: AppTheme) => void;
-  onBusyChange: (busy: boolean) => void;
 }
 
 const EMPTY_CONFIG: SyncConfigV3 = {
@@ -211,7 +210,7 @@ function mergeLogLines(...groups: LogLine[][]): LogLine[] {
   ));
 }
 
-export default function ProjectSyncV3({ theme, onThemeChange, onBusyChange }: Props) {
+export default function ProjectSyncV3({ theme, onThemeChange }: Props) {
   const [config, setConfig] = useState<SyncConfigV3>(EMPTY_CONFIG);
   const [registrations, setRegistrations] = useState<LocalProjectRegistration[]>([]);
   const [repositoryKinds, setRepositoryKinds] = useState<Record<string, boolean>>({});
@@ -286,9 +285,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onBusyChange }: Pr
   const [completedPullResourceIds, setCompletedPullResourceIds] = useState<Set<string>>(new Set());
   const [failedPullResourceIds, setFailedPullResourceIds] = useState<Set<string>>(new Set());
   const restoreRequest = useRef(0);
-
-  useEffect(() => onBusyChange(busy), [busy, onBusyChange]);
-  useEffect(() => () => onBusyChange(false), [onBusyChange]);
 
   useEffect(() => {
     activityOpenRef.current = activityOpen;

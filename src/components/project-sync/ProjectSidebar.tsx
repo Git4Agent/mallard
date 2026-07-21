@@ -4,7 +4,6 @@ import type {
   PointerEvent as ReactPointerEvent,
 } from "react";
 import type { LocalProjectSummary, SetupDraftSummary, StorageConfigV3 } from "../../types";
-import AppUpdateControl from "../AppUpdateControl";
 import Icon from "../Icons";
 import { projectLabel } from "./model";
 
@@ -373,7 +372,6 @@ export default function ProjectSidebar({
         </section>
       </div>
 
-      <AppUpdateControl />
     </aside>
   );
 }
