@@ -21,8 +21,6 @@
         { "url": "codex://threads/*" }
       ]
     },
-    "dialog:default",
-    "updater:default",
-    "process:allow-restart"
+    "dialog:default"
   ]
 }
