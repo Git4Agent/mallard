@@ -5,7 +5,14 @@ resources between machines. It syncs project-owned conversations, settings,
 skills, plugins, and—when the project is not inside a Git work tree—optional
 ordinary files and folders. It never mirrors an entire provider home.
 
-Current contracts: app `0.1.0`, machine-local config schema 3, portable bundle
+## Download
+
+Download the packaged Apple Silicon DMG from the
+[v0.1.2 release](https://github.com/Git4Agent/mallard/releases/tag/v0.1.2).
+The app is ad-hoc signed and unnotarized, so macOS may require approval under
+**System Settings → Privacy & Security** before the first launch.
+
+Current contracts: app `0.1.2`, machine-local config schema 3, portable bundle
 schema 4, and storage layout 1. Unsupported schemas are rejected; there is no
 migration or compatibility path in the current implementation.
 
