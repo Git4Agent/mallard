@@ -1,56 +1,105 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 
 const projectUrl = new URL("../", import.meta.url);
 const read = (path) => readFile(new URL(path, projectUrl), "utf8");
 
-test("desktop releases and updates use the public GitHub repository", async () => {
-  const [tauriConfigSource, workflow, releaseGuide, packageSource, packageLockSource, tauriBuildScript] = await Promise.all([
+test("release version is 0.1.2 in every source", async () => {
+  const [tauriConfigSource, cargoSource, packageSource, packageLockSource] = await Promise.all([
     read("src-tauri/tauri.conf.json"),
-    read(".github/workflows/release.yml"),
-    read("docs/RELEASING.md"),
+    read("src-tauri/Cargo.toml"),
     read("package.json"),
     read("package-lock.json"),
-    read("scripts/tauri-build.mjs"),
   ]);
   const tauriConfig = JSON.parse(tauriConfigSource);
   const packageConfig = JSON.parse(packageSource);
   const packageLock = JSON.parse(packageLockSource);
 
-  assert.equal(packageLock.version, packageConfig.version);
-  assert.equal(packageLock.packages[""].version, packageConfig.version);
+  assert.equal(tauriConfig.version, "0.1.2");
+  assert.match(cargoSource, /^version = "0\.1\.2"$/m);
+  assert.equal(packageConfig.version, "0.1.2");
+  assert.equal(packageLock.version, "0.1.2");
+  assert.equal(packageLock.packages[""].version, "0.1.2");
+});
 
-  assert.deepEqual(tauriConfig.plugins.updater.endpoints, [
-    "https://github.com/Git4Agent/mallard/releases/latest/download/latest.json",
+test("application contains no automatic updater", async () => {
+  const [
+    tauriConfigSource,
+    cargoSource,
+    libSource,
+    capabilitySource,
+    packageSource,
+    packageLockSource,
+    appSource,
+    projectSyncSource,
+    testRunnerSource,
+  ] = await Promise.all([
+    read("src-tauri/tauri.conf.json"),
+    read("src-tauri/Cargo.toml"),
+    read("src-tauri/src/lib.rs"),
+    read("src-tauri/capabilities/default.json"),
+    read("package.json"),
+    read("package-lock.json"),
+    read("src/App.tsx"),
+    read("src/components/project-sync/ProjectSyncV3.tsx"),
+    read("scripts/run-frontend-integration-tests.mjs"),
   ]);
-  assert.equal(tauriConfig.bundle.createUpdaterArtifacts, true);
-  assert.deepEqual(tauriConfig.bundle.macOS, {
-    signingIdentity: "-",
-  });
+  const tauriConfig = JSON.parse(tauriConfigSource);
+  const packageConfig = JSON.parse(packageSource);
 
-  for (const target of [
-    "aarch64-apple-darwin",
-    "x86_64-apple-darwin",
-    "x86_64-pc-windows-msvc",
-  ]) assert.match(workflow, new RegExp(target));
-  assert.match(workflow, /tauri-apps\/tauri-action@v1/);
+  assert.equal(tauriConfig.bundle.createUpdaterArtifacts, undefined);
+  assert.equal(tauriConfig.plugins?.updater, undefined);
+  assert.equal(packageConfig.dependencies["@tauri-apps/plugin-updater"], undefined);
+  assert.equal(packageConfig.dependencies["@tauri-apps/plugin-process"], undefined);
+  for (const source of [
+    cargoSource,
+    libSource,
+    capabilitySource,
+    packageLockSource,
+    appSource,
+    projectSyncSource,
+    testRunnerSource,
+  ]) {
+    assert.doesNotMatch(
+      source,
+      /updater|AppUpdater|onBusyChange|tauri-plugin-process|plugin-process|allow-restart/i,
+    );
+  }
+  await assert.rejects(
+    access(new URL("src/components/AppUpdater.tsx", projectUrl)),
+    (error) => error?.code === "ENOENT",
+  );
+  await assert.rejects(
+    access(new URL("tests/frontend/app-updater.integration.test.tsx", projectUrl)),
+    (error) => error?.code === "ENOENT",
+  );
+});
+
+test("desktop release builds one verified Apple Silicon DMG", async () => {
+  const [tauriConfigSource, workflow, releaseGuide, packageSource, tauriBuildScript] = await Promise.all([
+    read("src-tauri/tauri.conf.json"),
+    read(".github/workflows/release.yml"),
+    read("docs/RELEASING.md"),
+    read("package.json"),
+    read("scripts/tauri-build.mjs"),
+  ]);
+  const tauriConfig = JSON.parse(tauriConfigSource);
+  const packageConfig = JSON.parse(packageSource);
+
+  assert.deepEqual(tauriConfig.bundle.macOS, { signingIdentity: "-" });
+  assert.match(workflow, /target: aarch64-apple-darwin/);
+  assert.doesNotMatch(workflow, /x86_64-apple-darwin|windows-latest|x86_64-pc-windows-msvc/);
+  assert.match(workflow, /bundles: dmg/);
   assert.match(workflow, /releaseDraft: true/);
-  assert.match(workflow, /uploadUpdaterJson: true/);
-  assert.match(workflow, /MALLARD_VERIFY_MACOS_BUNDLE: \$\{\{ runner\.os == 'macOS' && '1' \|\| '' \}\}/);
-  assert.doesNotMatch(workflow, /name: Verify macOS app signature/);
-  assert.doesNotMatch(workflow, /^\s+APPLE_[A-Z_]+:/m);
-  assert.doesNotMatch(workflow, /TAURI_SIGNING_PRIVATE_KEY_PASSWORD/);
+  assert.match(workflow, /MALLARD_VERIFY_MACOS_BUNDLE: "1"/);
+  assert.doesNotMatch(workflow, /TAURI_SIGNING|uploadUpdater|updaterJson|APPLE_[A-Z_]+/);
   assert.equal(packageConfig.scripts.tauri, "node scripts/tauri-build.mjs");
-  assert.match(tauriBuildScript, /process\.execPath/);
-  assert.match(tauriBuildScript, /"@tauri-apps", "cli", "tauri\.js"/);
-  assert.doesNotMatch(tauriBuildScript, /tauri\.cmd/);
-  assert.doesNotMatch(workflow, /Cloudflare|CLOUDFLARE|\bR2\b|r2 object|api\.mallard-ai\.com/);
-
-  assert.match(releaseGuide, /GitHub Releases is the public source of truth/);
-  assert.match(releaseGuide, /releases\/latest\/download\/latest\.json/);
-  assert.match(releaseGuide, /ad-hoc tester build/i);
-  assert.match(releaseGuide, /manual Gatekeeper approval/i);
-  assert.doesNotMatch(releaseGuide, /TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""/);
-  assert.doesNotMatch(releaseGuide, /CLOUDFLARE_API_TOKEN|CLOUDFLARE_ACCOUNT_ID/);
+  assert.match(
+    tauriBuildScript,
+    /"codesign", \["--verify", "--deep", "--strict", "--verbose=4"/,
+  );
+  assert.match(releaseGuide, /Apple Silicon/i);
+  assert.match(releaseGuide, /Privacy & Security/i);
+  assert.doesNotMatch(releaseGuide, /updater|TAURI_SIGNING|latest\.json/i);
 });
