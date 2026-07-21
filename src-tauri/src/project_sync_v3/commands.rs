@@ -3229,6 +3229,15 @@ struct LocalThreadDescriptor {
     blocked_reason: Option<String>,
 }
 
+#[derive(Clone, Debug)]
+struct MaterializedThreadBase {
+    generation: u64,
+    manifest_sha256: String,
+    applied_at: u64,
+    storage_digest: String,
+    local_digest: String,
+}
+
 fn is_codex_thread_resource(resource_id: &ResourceId, kind: ResourceKind) -> bool {
     kind == ResourceKind::CodexConversation && resource_id.as_str().starts_with("codex:session:")
 }
@@ -3282,46 +3291,71 @@ fn single_captured_resource_file_digest(
     files.next().is_none().then_some(digest)
 }
 
-fn materialized_thread_base_digests(
+fn materialized_thread_bases(
     repository: &V3Repository,
     project: &LocalProjectRegistration,
     storage_id: &StorageId,
     binding: &ProjectBinding,
-    base: &RecipeBase,
-) -> Result<BTreeMap<ResourceId, String>, String> {
+) -> Result<BTreeMap<ResourceId, MaterializedThreadBase>, String> {
     let materializations = repository.load_materializations()?;
-    let record = materializations.records.iter().rev().find(|record| {
+    let mut bases = BTreeMap::<ResourceId, MaterializedThreadBase>::new();
+    for record in materializations.records.iter().filter(|record| {
         record.replica_id == binding.replica_id
             && record.local_project_id == project.local_project_id
             && record.storage_id == *storage_id
             && record.bundle_id == project.bundle_id
-            && record.generation == base.generation
-            && record.manifest_sha256 == base.manifest_sha256
             && record.binding_revision == binding.revision
-            && record.status == MaterializationStatus::Complete
-            && base
-                .commit_id
-                .as_ref()
-                .is_none_or(|commit_id| record.commit_id == *commit_id)
-    });
-    let Some(record) = record else {
-        return Ok(BTreeMap::new());
-    };
-    Ok(record
-        .receipts
-        .iter()
-        .filter(|receipt| {
+            && record.status != MaterializationStatus::Detached
+    }) {
+        for receipt in record.receipts.iter().filter(|receipt| {
             receipt.action_type == RestoreActionType::MaterializeConversation
                 && receipt.status == ActionStatus::Applied
                 && receipt.resource_id.as_str().starts_with("codex:session:")
-        })
-        .filter_map(|receipt| {
-            receipt
-                .target_sha256_after
-                .as_ref()
-                .map(|digest| (receipt.resource_id.clone(), digest.clone()))
-        })
-        .collect())
+        }) {
+            let (Some(storage_digest), Some(local_digest)) = (
+                receipt.source_sha256.as_ref(),
+                receipt.target_sha256_after.as_ref(),
+            ) else {
+                continue;
+            };
+            let candidate = MaterializedThreadBase {
+                generation: record.generation,
+                manifest_sha256: record.manifest_sha256.clone(),
+                applied_at: record.applied_at,
+                storage_digest: storage_digest.clone(),
+                local_digest: local_digest.clone(),
+            };
+            let replace = bases
+                .get(&receipt.resource_id)
+                .is_none_or(|current| candidate.applied_at >= current.applied_at);
+            if replace {
+                bases.insert(receipt.resource_id.clone(), candidate);
+            }
+        }
+    }
+    Ok(bases)
+}
+
+fn materialized_thread_base_supersedes_recipe_base(
+    materialized: &MaterializedThreadBase,
+    base: Option<&RecipeBase>,
+) -> bool {
+    let Some(base) = base else {
+        return true;
+    };
+    if materialized.generation != base.generation {
+        return materialized.generation > base.generation;
+    }
+    if materialized.manifest_sha256 != base.manifest_sha256 {
+        return false;
+    }
+    let base_applied_at = base
+        .last_pull_at
+        .into_iter()
+        .chain(base.last_push_at)
+        .max()
+        .unwrap_or(0);
+    materialized.applied_at >= base_applied_at
 }
 
 fn classify_thread_sync_state(
@@ -3538,17 +3572,31 @@ fn get_project_thread_sync_comparison_with_repository(
         .as_ref()
         .map(manifest_thread_versions)
         .unwrap_or_default();
-    let materialized_base_digests = match base {
-        Some(base) => {
-            materialized_thread_base_digests(repository, &project, storage_id, &binding, base)?
-        }
-        None => BTreeMap::new(),
-    };
+    // A Pull may intentionally leave an optional global tool unapplied. That
+    // keeps the whole-bundle materialization partial (and must not authorize a
+    // later Push), but each applied conversation receipt is still a precise,
+    // two-sided comparison base. Use those per-thread receipts independently
+    // from the project recipe base so History reflects the successful part of
+    // the Pull without weakening Push safety.
+    let materialized_bases = materialized_thread_bases(repository, &project, storage_id, &binding)?;
+    let comparison_base_generation = base
+        .map(|base| base.generation)
+        .into_iter()
+        .chain(
+            materialized_bases
+                .values()
+                .filter(|materialized| {
+                    materialized_thread_base_supersedes_recipe_base(materialized, base)
+                })
+                .map(|materialized| materialized.generation),
+        )
+        .max();
 
     let resource_ids = local_descriptors
         .keys()
         .chain(remote_versions.keys())
         .chain(base_versions.keys())
+        .chain(materialized_bases.keys())
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut entries = Vec::new();
@@ -3564,11 +3612,15 @@ fn get_project_thread_sync_comparison_with_repository(
         }
         let local_digest = local.and_then(|version| version.digest.as_deref());
         let storage_digest = remote.and_then(|version| version.digest.as_deref());
-        let base_resource_known = base_manifest.is_some()
-            && (base_version.is_none()
-                || base_version
-                    .and_then(|version| version.digest.as_deref())
-                    .is_some());
+        let materialized_base = materialized_bases.get(&resource_id).filter(|materialized| {
+            materialized_thread_base_supersedes_recipe_base(materialized, base)
+        });
+        let base_resource_known = materialized_base.is_some()
+            || (base_manifest.is_some()
+                && (base_version.is_none()
+                    || base_version
+                        .and_then(|version| version.digest.as_deref())
+                        .is_some()));
         let local_descriptor = local_descriptors.get(&resource_id);
         let local_unavailable =
             unavailable.contains(&resource_id) || (local_present && local_digest.is_none());
@@ -3585,10 +3637,11 @@ fn get_project_thread_sync_comparison_with_repository(
         let state = if status_detail.is_some() {
             ThreadSyncState::Unavailable
         } else {
-            let storage_base_digest = base_version.and_then(|version| version.digest.as_deref());
-            let local_base_digest = materialized_base_digests
-                .get(&resource_id)
-                .map(String::as_str)
+            let storage_base_digest = materialized_base
+                .map(|materialized| materialized.storage_digest.as_str())
+                .or_else(|| base_version.and_then(|version| version.digest.as_deref()));
+            let local_base_digest = materialized_base
+                .map(|materialized| materialized.local_digest.as_str())
                 .or(storage_base_digest);
             classify_thread_sync_state_with_side_bases(
                 local_digest,
@@ -3642,7 +3695,7 @@ fn get_project_thread_sync_comparison_with_repository(
         storage_id: storage_id.clone(),
         storage_name,
         generation,
-        base_generation: base.map(|base| base.generation),
+        base_generation: comparison_base_generation,
         compared_at: now_secs(),
         entries,
         counts,
@@ -10918,6 +10971,44 @@ mod tests {
             restored_thread.state,
             ThreadSyncState::Synced,
             "replica-specific cwd rewriting must not look like a local edit"
+        );
+
+        // Skipping an unrelated optional tool keeps the whole materialization
+        // partial, so it deliberately does not create a recipe base that can
+        // authorize Push. The applied conversation receipt must still provide
+        // its own directional History baseline.
+        repo.mutate_config(|config| {
+            config
+                .projects
+                .iter_mut()
+                .find(|project| project.local_project_id == target.local_project_id)
+                .ok_or_else(|| "target project disappeared".to_string())?
+                .recipe_bases
+                .remove(&storage_id);
+            Ok(())
+        })
+        .unwrap();
+        repo.mutate_materializations(|_, materializations| {
+            materializations.records[0].status = MaterializationStatus::Partial;
+            Ok(())
+        })
+        .unwrap();
+        let partial_comparison = get_project_thread_sync_comparison_with_repository(
+            &repo,
+            &target.local_project_id,
+            &storage_id,
+        )
+        .unwrap();
+        assert_eq!(partial_comparison.base_generation, Some(1));
+        assert_eq!(
+            partial_comparison
+                .entries
+                .iter()
+                .find(|entry| entry.thread_id == session_id)
+                .unwrap()
+                .state,
+            ThreadSyncState::Synced,
+            "an applied conversation from a partial Pull establishes its own comparison base"
         );
 
         let mut locally_extended = restored_session;
