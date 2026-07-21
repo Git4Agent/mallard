@@ -120,7 +120,6 @@ On macOS, a local signed updater bundle can be built with:
 
 ```bash
 TAURI_SIGNING_PRIVATE_KEY="$HOME/.tauri/mallard.key" \
-TAURI_SIGNING_PRIVATE_KEY_PASSWORD="" \
   npm run tauri build -- --bundles app,dmg
 ```
 

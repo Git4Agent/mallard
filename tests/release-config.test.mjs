@@ -40,6 +40,7 @@ test("desktop releases and updates use the public GitHub repository", async () =
   assert.match(workflow, /MALLARD_VERIFY_MACOS_BUNDLE: \$\{\{ runner\.os == 'macOS' && '1' \|\| '' \}\}/);
   assert.doesNotMatch(workflow, /name: Verify macOS app signature/);
   assert.doesNotMatch(workflow, /^\s+APPLE_[A-Z_]+:/m);
+  assert.doesNotMatch(workflow, /TAURI_SIGNING_PRIVATE_KEY_PASSWORD/);
   assert.equal(packageConfig.scripts.tauri, "node scripts/tauri-build.mjs");
   assert.match(tauriBuildScript, /process\.execPath/);
   assert.match(tauriBuildScript, /"@tauri-apps", "cli", "tauri\.js"/);
@@ -50,5 +51,6 @@ test("desktop releases and updates use the public GitHub repository", async () =
   assert.match(releaseGuide, /releases\/latest\/download\/latest\.json/);
   assert.match(releaseGuide, /ad-hoc tester build/i);
   assert.match(releaseGuide, /manual Gatekeeper approval/i);
+  assert.doesNotMatch(releaseGuide, /TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""/);
   assert.doesNotMatch(releaseGuide, /CLOUDFLARE_API_TOKEN|CLOUDFLARE_ACCOUNT_ID/);
 });
