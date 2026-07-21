@@ -27,7 +27,7 @@ const AFTER_SESSION_WINDOW_SECS: u64 = 24 * 60 * 60;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
 const DEFAULT_HISTORY_WINDOW_DAYS: u64 = 30;
 const DAY_SECS: u64 = 24 * 60 * 60;
-const CHAT_CACHE_SCHEMA: u32 = 2;
+const CHAT_CACHE_SCHEMA: u32 = 3;
 const MAX_CHAT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CHAT_CACHE_ENTRIES: usize = 50_000;
 
@@ -148,6 +148,8 @@ struct ParsedRollout {
     cwd: PathBuf,
     #[serde(default)]
     has_record_endpoints: bool,
+    #[serde(default)]
+    is_internal_subagent: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -684,6 +686,9 @@ fn scan_codex_threads(
                     }
                 },
             };
+            if !rollout_is_user_visible(&parsed) {
+                continue;
+            }
             if !cwd_belongs_to_project(&parsed.cwd, project_root) {
                 continue;
             }
@@ -948,6 +953,7 @@ struct RolloutParser {
     tool_call_count: usize,
     total_tokens: Option<u64>,
     metrics_complete: bool,
+    is_internal_subagent: bool,
 }
 
 impl RolloutParser {
@@ -968,6 +974,7 @@ impl RolloutParser {
             tool_call_count: 0,
             total_tokens: None,
             metrics_complete: true,
+            is_internal_subagent: false,
         }
     }
 
@@ -989,6 +996,12 @@ impl RolloutParser {
             self.last_timestamp = Some(timestamp);
         }
         if event_type == "session_meta" || payload_type == "session_meta" {
+            self.is_internal_subagent |= payload.get("thread_source").and_then(Value::as_str)
+                == Some("subagent")
+                || payload
+                    .get("source")
+                    .and_then(|source| source.get("subagent"))
+                    .is_some();
             if self.thread_id.is_none() {
                 self.thread_id = string_alias(payload, &["id", "thread_id", "session_id"])
                     .map(ToOwned::to_owned);
@@ -1085,8 +1098,13 @@ impl RolloutParser {
             },
             cwd,
             has_record_endpoints: self.first_timestamp.is_some() && self.last_timestamp.is_some(),
+            is_internal_subagent: self.is_internal_subagent,
         })
     }
+}
+
+fn rollout_is_user_visible(rollout: &ParsedRollout) -> bool {
+    !rollout.is_internal_subagent
 }
 
 fn event_message_text(payload: &Value) -> Option<String> {
@@ -2269,6 +2287,37 @@ mod tests {
     }
 
     #[test]
+    fn guardian_subagent_rollouts_are_not_user_visible_chats() {
+        let lines = vec![
+            json!({
+                "timestamp": 100,
+                "type": "session_meta",
+                "payload": {
+                    "id": "guardian-thread",
+                    "cwd": "/tmp/project",
+                    "thread_source": "subagent",
+                    "source": {"subagent": {"other": "guardian"}},
+                    "parent_thread_id": "user-thread"
+                }
+            })
+            .to_string(),
+            json!({
+                "timestamp": 101,
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "The following is the Codex agent history whose request action you are assessing."
+                }
+            })
+            .to_string(),
+        ];
+
+        let parsed = parse_rollout_lines(lines.iter().map(String::as_str), 99).unwrap();
+
+        assert!(!rollout_is_user_visible(&parsed));
+    }
+
+    #[test]
     fn rollout_stream_reads_past_256_records_and_uses_first_and_last_timestamps() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("rollout.jsonl");
@@ -2519,8 +2568,8 @@ mod tests {
     }
 
     #[test]
-    fn chat_cache_schema_invalidates_pre_recovery_entries() {
-        assert_eq!(CHAT_CACHE_SCHEMA, 2);
+    fn chat_cache_schema_invalidates_entries_without_subagent_metadata() {
+        assert_eq!(CHAT_CACHE_SCHEMA, 3);
     }
 
     #[test]
