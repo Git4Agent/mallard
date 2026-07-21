@@ -1517,7 +1517,7 @@ pub async fn plan_bundle_restore(
                 &app,
                 "info",
                 "pull.awaiting_approval",
-                "   Nothing has been applied yet — use “Apply approved changes” in the Pull review.",
+                "   Nothing has been applied yet — use the Apply button in the Pull review.",
             );
         }
         Err(error) => log.emit(

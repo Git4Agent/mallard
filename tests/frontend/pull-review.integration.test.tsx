@@ -166,6 +166,34 @@ test("a valid Pull plan renders an enabled non-modal Apply workspace while suppo
   ]);
 });
 
+test("a Pull review opens on the Apply summary by default", () => {
+  const html = renderToStaticMarkup(
+    <RestorePlanView
+      projectName="gam2"
+      profileLabel="myconf2"
+      plan={restorePlan}
+      binding={binding}
+      dependencyPlan={null}
+      readiness={null}
+      restoreResult={null}
+      dependencyResult={null}
+      phase="idle"
+      supportLoading={false}
+      completedActionIds={new Set()}
+      completedResourceIds={new Set()}
+      failedResourceIds={new Set()}
+      busy={false}
+      error={null}
+      onApply={() => undefined}
+      onRefresh={() => undefined}
+      onBack={() => undefined}
+    />,
+  );
+
+  assert.match(html, /aria-selected="true"[^>]*aria-label="Review, 1 selected"/);
+  assert.match(html, />Apply 1 change</);
+});
+
 function dependencyPlan(actions: DependencyPlan["actions"]): DependencyPlan {
   return {
     schema_version: 1,

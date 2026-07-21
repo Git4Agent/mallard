@@ -287,7 +287,7 @@ export default function RestorePlanView({
   busy,
   error,
   embedded = false,
-  initialStep = "history",
+  initialStep = "review",
   onApply,
   onRefresh,
   onBack,

@@ -1947,6 +1947,29 @@ fn discover_codex(
             let resource_id = format!("codex:session:{}", session_id);
             let state_relative = normalized_relative(&state_root, entry.path())?;
             let logical_path = format!("state/codex/{}/{}", directory, state_relative);
+
+            // Codex can briefly leave the same transcript in both `sessions`
+            // and `archived_sessions` while an archive operation settles. A
+            // session ID is the stable resource identity, so keep the active
+            // `sessions` copy discovered first and ignore later copies. This
+            // must not make an otherwise valid Pull review unusable.
+            if directory == "archived_sessions" {
+                if let Some(existing_path) = discovery
+                    .resources
+                    .get(&resource_id)
+                    .and_then(|resource| resource.files.first())
+                    .map(|file| file.physical_path.display().to_string())
+                {
+                    discovery.warnings.push(format!(
+                        "ignored duplicate Codex session '{}' at '{}'; using '{}'",
+                        meta.session_id,
+                        entry.path().display(),
+                        existing_path,
+                    ));
+                    continue;
+                }
+            }
+
             insert_resource(
                 discovery,
                 DiscoveredResource {
@@ -3516,6 +3539,52 @@ mod tests {
 
         assert!(conversation_ids.contains("codex:session:parent-thread"));
         assert!(conversation_ids.contains("codex:session:child-thread"));
+    }
+
+    #[test]
+    fn duplicate_codex_session_in_active_and_archive_is_ignored() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let codex = temp.path().join("codex");
+        fs::create_dir_all(&project).unwrap();
+        fs::create_dir_all(&codex).unwrap();
+        let cwd = serde_json::to_string(project.to_str().unwrap()).unwrap();
+        let transcript = format!(
+            "{{\"type\":\"session_meta\",\"payload\":{{\"id\":\"duplicate-thread\",\"cwd\":{cwd}}}}}\n"
+        );
+        write(
+            &codex.join("sessions/2026/07/20/rollout-duplicate.jsonl"),
+            transcript.as_bytes(),
+        );
+        write(
+            &codex.join("archived_sessions/rollout-duplicate.jsonl"),
+            transcript.as_bytes(),
+        );
+
+        let request = CaptureRequest {
+            project_root: project,
+            codex_home: Some(codex),
+            claude_home: None,
+            excluded_project_roots: Vec::new(),
+            standalone_skills: Vec::new(),
+            global_plugins: Vec::new(),
+            blocked_global_skills: Vec::new(),
+            include_project_content: false,
+            excluded_content_roots: Vec::new(),
+        };
+        let inventory = discover_project(&request).unwrap();
+        let matching = inventory
+            .resources
+            .iter()
+            .filter(|resource| resource.resource_id == "codex:session:duplicate-thread")
+            .collect::<Vec<_>>();
+
+        assert_eq!(matching.len(), 1);
+        assert!(matching[0].logical_paths[0].starts_with("state/codex/sessions/"));
+        assert!(inventory
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("ignored duplicate Codex session 'duplicate-thread'")));
     }
 
     #[test]

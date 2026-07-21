@@ -1194,7 +1194,10 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
     displayName: string,
   ) => {
     const requestId = ++restoreRequest.current;
-    openActivity();
+    // Pull review owns the workspace. Keep the activity drawer from covering
+    // its approval controls; logs remain available from the sidebar.
+    activityOpenRef.current = false;
+    setActivityOpen(false);
     setBusy(true);
     setRestoreError(null);
     setRestoreResult(null);
@@ -1480,7 +1483,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
     if (!restorePlan || !restoreBinding) return;
     const currentRestorePlan = restorePlan;
     const currentDependencyPlan = dependencyPlan;
-    openActivity();
     setFailedPullResourceIds((current) => {
       const next = new Set(current);
       for (const resourceId of selection.resourceIds) next.delete(resourceId);
