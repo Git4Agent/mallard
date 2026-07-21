@@ -29,7 +29,6 @@ aws-sdk-s3 = "1"
 aws-smithy-http-client = { version = "1", features = ["rustls-aws-lc"] }
 bytes = "1"
 sha2 = "0.10"
-rusqlite = { version = "0.40.1", features = ["backup", "bundled"] }
 tempfile = "3"
 getrandom = "0.3"
 chrono = "0.4"

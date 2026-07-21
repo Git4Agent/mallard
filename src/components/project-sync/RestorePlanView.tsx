@@ -15,7 +15,6 @@ import SkillsPluginStatusPage from "./SkillsPluginStatusPage";
 import SyncReviewTabs, {
   type SyncReviewStep,
   syncReviewSteps,
-  useSyncReviewScroll,
 } from "./SyncReviewTabs";
 import { providerLabel } from "./model";
 import type { PullApplyPhase, PullReviewSelection } from "./pullReviewFlow";
@@ -28,7 +27,9 @@ import {
   includeRequiredPullProjectDirectories,
   pendingIds,
   requiredPullProjectDirectoryIds,
+  keepsLocalConversation,
   requiresApproval,
+  requiresManualResolution,
   restoreActionIds,
   type PullReviewItem,
 } from "./pullReviewModel";
@@ -184,12 +185,18 @@ function ItemList({
           pending.length === 0 &&
           !completed &&
           supportLoading;
-        const blocked = pending.length === 0 || completed || waitingForInstaller;
+        const keepLocalConversation = keepsLocalConversation(item);
+        const manualResolution = requiresManualResolution(item);
+        const blocked = keepLocalConversation || manualResolution || pending.length === 0 || completed || waitingForInstaller;
         const checked = selected.has(item.resourceId) && !completed;
         const expanded = expandedItems.has(item.resourceId);
         const activeRestore = phase === "restoring" && checked && restoreActionIds(item).some((id) => !completedActionIds.has(id));
         const activeInstall = phase === "installing" && checked && dependencyActionIds(item).some((id) => !completedActionIds.has(id));
-        const status: string | null = item.category === "global_tool"
+        const status: string | null = keepLocalConversation
+          ? "Keep local"
+          : manualResolution
+          ? "Resolve manually"
+          : item.category === "global_tool"
           ? completed
             ? "Installed"
             : failed
@@ -237,7 +244,7 @@ function ItemList({
               </span>
               <span className="v3-pull-item-icon">
                 <Icon
-                  name={failed ? "alert-triangle" : completed ? "check-circle" : item.toolKind === "plugin" ? "download" : item.toolKind === "custom_skill" ? "folder" : "file"}
+                  name={failed || manualResolution || keepLocalConversation ? "alert-triangle" : completed ? "check-circle" : item.toolKind === "plugin" ? "download" : item.toolKind === "custom_skill" ? "folder" : "file"}
                   size={14}
                 />
               </span>
@@ -317,7 +324,6 @@ export default function RestorePlanView({
   const [activeStep, setActiveStep] = useState<SyncReviewStep>(() => (
     syncReviewSteps(showProjectFiles).includes(initialStep) ? initialStep : "review"
   ));
-  const { scrollRef, rememberScrollPosition } = useSyncReviewScroll(activeStep);
   const [selected, setSelected] = useState<Set<string>>(() => new Set(
     items.filter(defaultSelected).map((item) => item.resourceId),
   ));
@@ -346,6 +352,18 @@ export default function RestorePlanView({
     pendingIds(item, completedActionIds).length > 0 && !completedResourceIds.has(item.resourceId)
   )).length;
   const hasResult = phase === "complete" || restoreResult !== null || dependencyResult !== null;
+  const approvalItems = items.filter((item) => (
+    item.category !== "project_content"
+    && requiresApproval(item)
+    && !selected.has(item.resourceId)
+    && !completedResourceIds.has(item.resourceId)
+  ));
+  const manualItems = items.filter((item) => (
+    requiresManualResolution(item) && !completedResourceIds.has(item.resourceId)
+  ));
+  const keptLocalConversationItems = items.filter((item) => (
+    keepsLocalConversation(item) && !completedResourceIds.has(item.resourceId)
+  ));
 
   useEffect(() => {
     if (phase !== "idle" || hasResult) setActiveStep("review");
@@ -359,6 +377,7 @@ export default function RestorePlanView({
   const skippedTools = globalItems.filter((item) => (
     !selected.has(item.resourceId) && !completedResourceIds.has(item.resourceId)
   )).length;
+  const unchangedCount = skippedTools + manualItems.length;
   const finalReady = hasResult && !error && failureCount === 0 && skippedTools === 0 && readiness?.state === "ready";
   const reviewCanClose = hasResult && (
     finalReady || (selectedCount === 0 && pendingProjectContentDecisionCount === 0)
@@ -376,8 +395,8 @@ export default function RestorePlanView({
     ? "Pull needs attention"
     : failureCount > 0
       ? `${failureCount} change${failureCount === 1 ? "" : "s"} need attention`
-      : skippedTools > 0
-        ? `Project restored; ${skippedTools} setup item${skippedTools === 1 ? "" : "s"} skipped`
+      : unchangedCount > 0
+        ? `Project restored; ${unchangedCount} item${unchangedCount === 1 ? "" : "s"} left unchanged`
         : readiness?.state === "ready"
           ? "Pull complete"
           : "Project restored; setup needs attention";
@@ -392,12 +411,14 @@ export default function RestorePlanView({
       : reviewCanClose
         ? "Done"
         : hasResult && selectedCount > 0
-          ? `Apply ${selectedCount} remaining change${selectedCount === 1 ? "" : "s"}`
+          ? "Apply remaining changes"
           : hasResult
             ? "Review complete"
         : selectedCount === 0 && pendingProjectContentDecisionCount > 0
-          ? `Keep ${pendingProjectContentDecisionCount} project entr${pendingProjectContentDecisionCount === 1 ? "y" : "ies"} local`
-          : `Apply ${selectedCount} change${selectedCount === 1 ? "" : "s"}`;
+          ? `Keep project entr${pendingProjectContentDecisionCount === 1 ? "y" : "ies"} local`
+          : selectedCount === 0 && keptLocalConversationItems.length > 0
+            ? `Keep conversation${keptLocalConversationItems.length === 1 ? "" : "s"} local`
+          : "Apply changes";
 
   const requiredProjectDirectories = requiredPullProjectDirectoryIds(items, selected);
   const projectContentEligible = plan.project_content_eligibility?.state === "eligible";
@@ -455,16 +476,18 @@ export default function RestorePlanView({
     review: selectedCount,
   };
   const warningSteps = new Set<SyncReviewStep>();
-  const approvalItems = items.filter((item) => (
-    item.category !== "project_content"
-    && requiresApproval(item)
-    && !selected.has(item.resourceId)
-    && !completedResourceIds.has(item.resourceId)
-  ));
   for (const item of approvalItems) {
     if (itemKindLabel(item) === "Conversation") warningSteps.add("history");
     else if (item.toolKind === "custom_skill") warningSteps.add("skills");
     else if (item.toolKind === "plugin") warningSteps.add("plugins");
+    warningSteps.add("review");
+  }
+  for (const item of manualItems) {
+    if (itemKindLabel(item) === "Conversation") warningSteps.add("history");
+    warningSteps.add("review");
+  }
+  if (keptLocalConversationItems.length > 0) {
+    warningSteps.add("history");
     warningSteps.add("review");
   }
   if (dependencyMessages > 0 || failureCount > 0) warningSteps.add("review");
@@ -497,11 +520,6 @@ export default function RestorePlanView({
         operation: item.projectContentOperation ?? undefined,
       };
     });
-  const pendingProjectContentItems = projectContentItems.filter((item) => (
-    pendingIds(item, completedActionIds).length > 0 && !completedResourceIds.has(item.resourceId)
-  ));
-  const keptLocalProjectContent = pendingProjectContentItems.filter((item) => !selected.has(item.resourceId)).length;
-
   const ReviewContainer = embedded ? "section" : "main";
 
   return (
@@ -520,9 +538,7 @@ export default function RestorePlanView({
             {embedded
               ? <h2 id="v3-pull-review-title">Pull review</h2>
               : <h1 id="v3-pull-review-title">Restore {projectName}</h1>}
-            {embedded
-              ? <span className="v3-sync-review-hint">Choose changes to apply</span>
-              : (
+            {!embedded && (
                 <p className="v3-pull-review-meta">
                   <span>{`Choose changes from ${storageName || "storage"} to apply to this machine.`}</span>
                 </p>
@@ -532,33 +548,37 @@ export default function RestorePlanView({
         <div className="v3-push-resource-actions">
           <button
             type="button"
-            className="btn btn-ghost"
+            className="btn btn-ghost v3-sync-review-icon-action has-count"
             onClick={useRecommended}
             disabled={busy || finalReady || pendingStepItems.length === 0 || stepMatchesRecommended}
             title="Restore the recommended safe selection"
+            aria-label={`Use recommended selection (${pendingRecommendedCount})`}
           >
-            Recommended ({pendingRecommendedCount})
+            <Icon name="check-circle" size={15} />
+            <span aria-hidden="true">{pendingRecommendedCount}</span>
           </button>
           <button
             type="button"
-            className="btn btn-ghost"
+            className="btn btn-ghost v3-sync-review-icon-action"
             onClick={clearStep}
             disabled={busy || finalReady || selectedIn(stepItems) === 0}
+            title="Clear current selection"
+            aria-label="Clear current selection"
           >
-            Clear
+            <Icon name="trash" size={15} />
           </button>
+          {embedded && (
+            <button
+              type="button"
+              className="btn btn-ghost v3-inline-action-close"
+              onClick={onBack}
+              disabled={busy}
+              aria-label={`Close pull review for ${projectName}`}
+            >
+              <Icon name="x" size={15} />
+            </button>
+          )}
         </div>
-        {embedded && (
-          <button
-            type="button"
-            className="btn btn-ghost v3-inline-action-close"
-            onClick={onBack}
-            disabled={busy}
-            aria-label={`Close pull review for ${projectName}`}
-          >
-            <Icon name="x" size={15} />
-          </button>
-        )}
       </header>
 
       <SyncReviewTabs
@@ -577,9 +597,7 @@ export default function RestorePlanView({
         aria-labelledby={`sync-review-${activeStep}-tab`}
       >
         <div
-          ref={scrollRef}
           className="v3-inline-action-scroll v3-sync-review-scroll"
-          onScroll={rememberScrollPosition}
         >
           {activeStep === "history" && conversationItems.length > 0 && project && binding.profile_ids.codex ? (
             <ProjectChatHistoryPage
@@ -700,6 +718,9 @@ export default function RestorePlanView({
                       {completedProjectItems.length > 0 && <li>{completedProjectItems.length} project data change{completedProjectItems.length === 1 ? "" : "s"} restored</li>}
                       {completedSkills.length > 0 && <li>{completedSkills.length} custom skill{completedSkills.length === 1 ? "" : "s"} restored</li>}
                       {completedPlugins.length > 0 && <li>{completedPlugins.map((item) => item.title).join(", ")} installed</li>}
+                      {skippedTools > 0 && <li>{globalItems.filter((item) => !selected.has(item.resourceId) && !completedResourceIds.has(item.resourceId)).map((item) => item.title).join(", ")} left unchanged</li>}
+                      {keptLocalConversationItems.length > 0 && <li>{keptLocalConversationItems.length} conversation{keptLocalConversationItems.length === 1 ? "" : "s"} kept local</li>}
+                      {manualItems.length > 0 && <li>{manualItems.length} conflict{manualItems.length === 1 ? "" : "s"} left unchanged for manual resolution</li>}
                       {finalReady && <li>Project is ready</li>}
                     </ul>
                   </div>
@@ -719,13 +740,6 @@ export default function RestorePlanView({
                 <span><Icon name="link" size={15} /><strong>Plugins</strong></span>
                 <span>{counts.plugins} selected<Icon name="chevron-right" size={13} /></span>
               </button>
-              {showProjectFiles && (
-                <button type="button" onClick={() => setActiveStep("project_files")}>
-                  <span><Icon name="file" size={15} /><strong>Project files</strong></span>
-                  <span>{counts.project_files} apply · {keptLocalProjectContent} keep local<Icon name="chevron-right" size={13} /></span>
-                </button>
-              )}
-
               {(otherItems.length > 0 || supportLoading) && (
                 <details className="v3-sync-review-other">
                   <summary>
@@ -739,10 +753,38 @@ export default function RestorePlanView({
 
               {(dependencyPlan?.blockers ?? []).map((blocker) => <div key={blocker} className="v3-callout error"><Icon name="alert-triangle" size={15} /> {blocker}</div>)}
               {(dependencyPlan?.warnings ?? []).map((warning) => <div key={warning} className="v3-callout"><Icon name="alert-triangle" size={15} /> {warning}</div>)}
-              {approvalItems.length > 0 && (
-                <div className="v3-callout v3-sync-review-blocker">
+              {!hasResult && keptLocalConversationItems.length > 0 && (
+                <div className="v3-callout warning v3-sync-review-blocker">
                   <Icon name="alert-triangle" size={15} />
-                  <span><strong>{hasResult ? "Optional setup not applied" : "Needs approval"}</strong>{approvalItems.length} optional setup change{approvalItems.length === 1 ? " is" : "s are"} not selected.</span>
+                  <span>
+                    <strong>{keptLocalConversationItems.length === 1 ? "1 conversation differs" : `${keptLocalConversationItems.length} conversations differ`}</strong>
+                    {`Apply will keep the local ${keptLocalConversationItems.length === 1 ? "version" : "versions"} and establish a comparison baseline for ${storageName || "storage"}. ${keptLocalConversationItems.length === 1 ? "It" : "They"} can be pushed later.`}
+                  </span>
+                  <button type="button" className="btn btn-ghost" onClick={() => setActiveStep("history")}>Review local</button>
+                </div>
+              )}
+              {!hasResult && manualItems.length > 0 && (
+                <div className="v3-callout warning v3-sync-review-blocker">
+                  <Icon name="alert-triangle" size={15} />
+                  <span>
+                    <strong>{manualItems.length === 1 && itemKindLabel(manualItems[0]) === "Conversation" ? "1 conflicted conversation will stay unchanged" : `${manualItems.length} changes need manual resolution`}</strong>
+                    {selectedCount > 0
+                      ? `Apply will still restore ${selectedCount} selected change${selectedCount === 1 ? "" : "s"}. Resolve ${manualItems.length === 1 ? "the conflicted item" : "the conflicted items"} separately.`
+                      : `Resolve ${manualItems.length === 1 ? "this item" : "these items"} before it can be restored.`}
+                  </span>
+                  <button type="button" className="btn btn-ghost" onClick={() => setActiveStep("history")}>Review conflict</button>
+                </div>
+              )}
+              {!hasResult && approvalItems.length > 0 && (
+                <div className="v3-callout v3-sync-review-blocker">
+                  <Icon name="help-circle" size={15} />
+                  <span>
+                    <strong>{hasResult ? `Optional change${approvalItems.length === 1 ? "" : "s"} skipped` : `Optional change${approvalItems.length === 1 ? "" : "s"} not selected`}</strong>
+                    {hasResult
+                      ? `${approvalItems.map((item) => item.title).join(", ")} ${approvalItems.length === 1 ? "was" : "were"} left unchanged.`
+                      : `Apply will skip ${approvalItems.map((item) => item.title).join(", ")} and leave ${approvalItems.length === 1 ? "it" : "them"} unchanged on this machine.`}
+                  </span>
+                  <button type="button" className="btn btn-ghost" onClick={() => setActiveStep(approvalItems[0]?.toolKind === "plugin" ? "plugins" : approvalItems[0]?.toolKind === "custom_skill" ? "skills" : "review")}>Review optional</button>
                 </div>
               )}
 
@@ -750,11 +792,11 @@ export default function RestorePlanView({
                 <div className="v3-pull-empty"><Icon name="check-circle" size={16} /><span><strong>Nothing to pull</strong><small>This project already matches the selected generation.</small></span></div>
               )}
 
-              {((readiness?.issues.length ?? 0) > 0 || (hasResult && !finalReady)) && (
+              {(hasResult && ((readiness?.issues.length ?? 0) > 0 || !finalReady)) && (
                 <section className="v3-pull-section" aria-labelledby="v3-pull-readiness">
                   <div className="v3-pull-section-heading">
                     <span className="v3-pull-section-icon"><Icon name="check-circle" size={16} /></span>
-                    <div><h2 id="v3-pull-readiness">Readiness</h2><p>{readiness?.issues.length ?? 0} check{readiness?.issues.length === 1 ? "" : "s"} may still need attention after pull.</p></div>
+                    <div><h2 id="v3-pull-readiness">Remaining items</h2><p>{readiness?.issues.length ?? 0} item{readiness?.issues.length === 1 ? "" : "s"} still need attention after Pull.</p></div>
                     <button type="button" className="btn btn-ghost" onClick={onRefresh} disabled={busy}><Icon name="refresh" size={13} /> Recheck</button>
                   </div>
                   <div className="v3-readiness-list">
@@ -780,10 +822,12 @@ export default function RestorePlanView({
       </div>
 
       <footer className={embedded ? "v3-pull-apply-bar v3-inline-action-footer v3-sync-review-footer" : "v3-pull-apply-bar v3-sync-review-footer"}>
-        <span>
-          <strong>{hasResult ? outcomeTitle : `${selectedCount} selected`}</strong>
-          <small>{hasResult ? "Review the result above or return to the project." : `${recommendedIds.size} safe change${recommendedIds.size === 1 ? "" : "s"} selected by default.`}</small>
-        </span>
+        {(hasResult || !embedded) && (
+          <span>
+            {hasResult && <strong>{outcomeTitle}</strong>}
+            {!embedded && <small>{hasResult ? "Review the result above or return to the project." : "Recommended safe changes are selected by default."}</small>}
+          </span>
+        )}
         {stepIndex > 0 && activeStep !== "review" && <button type="button" className="btn btn-ghost" onClick={goBack} disabled={busy}>Back</button>}
         {activeStep !== "review" ? (
           <button type="button" className="btn btn-primary" onClick={goNext} disabled={busy}>
@@ -796,7 +840,10 @@ export default function RestorePlanView({
             <button
               type="button"
               className="btn btn-primary v3-pull-apply-button"
-              disabled={busy || (!reviewCanClose && selectedCount === 0 && pendingProjectContentDecisionCount === 0)}
+              disabled={busy || (!reviewCanClose
+                && selectedCount === 0
+                && pendingProjectContentDecisionCount === 0
+                && keptLocalConversationItems.length === 0)}
               onClick={reviewCanClose ? onBack : () => onApply(selection)}
             >
               {busy && <Icon name="refresh" size={16} className="icon-spin" />}

@@ -13,7 +13,7 @@ use super::bundle_engine::{
 use super::chat_history::{self, CodexThreadDetailsPage, ProjectChatHistory};
 use super::domain::{
     generated_named_id, validate_absolute_clean_path, ActionId, ActionStatus, ApplyPolicy,
-    BindingState, BundleId, BundleIdentity, BundleKind, BundleManifest, BundleRecipe,
+    ApplyReceipt, BindingState, BundleId, BundleIdentity, BundleKind, BundleManifest, BundleRecipe,
     BundleSnapshot, CapturedWith, DependencyAction, DependencyActionKind,
     DependencyApplicationRecord, DependencyApplyReceipt, DependencyPlan, DraftProfileSelection,
     DraftRepositoryChoice, DraftStorageSelection, LocalProjectId, LocalProjectRegistration,
@@ -21,8 +21,8 @@ use super::domain::{
     MaterializationStatus, PlanId, ProjectBinding, ProjectFileSyncEligibility,
     ProjectFileSyncEligibilityState, ProjectSetupDraft, ProjectStorageLink, Provenance, Provider,
     ProviderProfile, RecipeBase, RecipeEntry, ReplicaId, ResourceDescriptor, ResourceId,
-    ResourceKind, ResourceScope, RestoreActionKind, RestoreActionType, RestorePlan, SetupDraftId,
-    SetupTransaction, StorageConfigV3, StorageId, StorageKind, SyncConfigV3,
+    ResourceKind, ResourceScope, RestoreAction, RestoreActionKind, RestoreActionType, RestorePlan,
+    SetupDraftId, SetupTransaction, StorageConfigV3, StorageId, StorageKind, SyncConfigV3,
     DEPENDENCY_PLAN_SCHEMA_V1, SETUP_DRAFT_SCHEMA_V1, SETUP_TRANSACTION_SCHEMA_V1,
 };
 use super::global_inventory;
@@ -3236,6 +3236,32 @@ struct MaterializedThreadBase {
     applied_at: u64,
     storage_digest: String,
     local_digest: String,
+    kept_local: bool,
+}
+
+fn is_conversation_keep_local_action(action: &RestoreAction, manifest: &BundleManifest) -> bool {
+    matches!(action.kind, RestoreActionKind::Manual { .. })
+        && manifest
+            .resources
+            .get(&action.resource_id)
+            .is_some_and(|resource| {
+                matches!(
+                    resource.kind,
+                    ResourceKind::CodexConversation | ResourceKind::ClaudeConversation
+                )
+            })
+        && action.target_path.is_some()
+        && action.source_sha256.is_some()
+        && action.expected_target_sha256.is_some()
+}
+
+fn is_kept_local_conversation_receipt(receipt: &ApplyReceipt) -> bool {
+    receipt.action_type == RestoreActionType::Manual
+        && receipt.status == ActionStatus::Skipped
+        && (receipt.resource_id.as_str().starts_with("codex:session:")
+            || receipt.resource_id.as_str().starts_with("claude:session:"))
+        && receipt.source_sha256.is_some()
+        && receipt.target_sha256_after.is_some()
 }
 
 fn is_codex_thread_resource(resource_id: &ResourceId, kind: ResourceKind) -> bool {
@@ -3307,11 +3333,18 @@ fn materialized_thread_bases(
             && record.binding_revision == binding.revision
             && record.status != MaterializationStatus::Detached
     }) {
-        for receipt in record.receipts.iter().filter(|receipt| {
-            receipt.action_type == RestoreActionType::MaterializeConversation
-                && receipt.status == ActionStatus::Applied
-                && receipt.resource_id.as_str().starts_with("codex:session:")
-        }) {
+        for receipt in record
+            .receipts
+            .iter()
+            .filter(|receipt| receipt.resource_id.as_str().starts_with("codex:session:"))
+        {
+            let kept_local = is_kept_local_conversation_receipt(receipt);
+            if !kept_local
+                && !(receipt.action_type == RestoreActionType::MaterializeConversation
+                    && receipt.status == ActionStatus::Applied)
+            {
+                continue;
+            }
             let (Some(storage_digest), Some(local_digest)) = (
                 receipt.source_sha256.as_ref(),
                 receipt.target_sha256_after.as_ref(),
@@ -3324,6 +3357,7 @@ fn materialized_thread_bases(
                 applied_at: record.applied_at,
                 storage_digest: storage_digest.clone(),
                 local_digest: local_digest.clone(),
+                kept_local,
             };
             let replace = bases
                 .get(&receipt.resource_id)
@@ -3574,10 +3608,11 @@ fn get_project_thread_sync_comparison_with_repository(
         .unwrap_or_default();
     // A Pull may intentionally leave an optional global tool unapplied. That
     // keeps the whole-bundle materialization partial (and must not authorize a
-    // later Push), but each applied conversation receipt is still a precise,
-    // two-sided comparison base. Use those per-thread receipts independently
-    // from the project recipe base so History reflects the successful part of
-    // the Pull without weakening Push safety.
+    // later Push), but each applied or reviewed keep-local conversation
+    // receipt is still a precise, two-sided comparison base. Use those
+    // per-thread receipts independently from the project recipe base so
+    // History reflects the successful part of the Pull without weakening
+    // Push safety.
     let materialized_bases = materialized_thread_bases(repository, &project, storage_id, &binding)?;
     let comparison_base_generation = base
         .map(|base| base.generation)
@@ -3643,13 +3678,23 @@ fn get_project_thread_sync_comparison_with_repository(
             let local_base_digest = materialized_base
                 .map(|materialized| materialized.local_digest.as_str())
                 .or(storage_base_digest);
-            classify_thread_sync_state_with_side_bases(
-                local_digest,
-                storage_digest,
-                base_resource_known,
-                local_base_digest,
-                storage_base_digest,
-            )
+            if materialized_base.is_some_and(|materialized| materialized.kept_local)
+                && local_digest != storage_digest
+            {
+                if storage_digest == storage_base_digest {
+                    ThreadSyncState::LocalAhead
+                } else {
+                    ThreadSyncState::Diverged
+                }
+            } else {
+                classify_thread_sync_state_with_side_bases(
+                    local_digest,
+                    storage_digest,
+                    base_resource_known,
+                    local_base_digest,
+                    storage_base_digest,
+                )
+            }
         };
         let descriptor = local.or(remote).or(base_version);
         let thread_id = descriptor
@@ -4616,11 +4661,7 @@ fn push_bundle_reviewed_with_repository(
         .collect::<Vec<_>>();
     Ok(ProjectOperationResult {
         success: true,
-        message: format!(
-            "Published generation {} with {} resources",
-            generation,
-            results.len()
-        ),
+        message: format!("Published generation {}", generation),
         operation_id: Some(commit_id),
         resources_changed: Some(results.len()),
         generation: Some(generation),
@@ -4640,7 +4681,55 @@ fn plan_bundle_restore_with_repository(
     }
     require_codex_conversation_paths_ready(repository, &binding.local_project_id)?;
     let (engine, fetched) = fetch_from_storage(repository, storage_id, bundle_id)?;
+    let config = repository.load_config()?;
+    let project = config
+        .project(&binding.local_project_id)
+        .cloned()
+        .ok_or_else(|| format!("unknown local project '{}'", binding.local_project_id))?;
+    let recipe_base = project
+        .recipe_bases
+        .get(storage_id)
+        .filter(|base| base.binding_revision == Some(binding.revision));
+    let base_manifest = match recipe_base {
+        Some(base)
+            if fetched.snapshot.head.generation == base.generation
+                && fetched.snapshot.head.manifest_sha256 == base.manifest_sha256 =>
+        {
+            Some(fetched.snapshot.manifest.clone())
+        }
+        Some(base) => base.commit_id.as_deref().and_then(|commit_id| {
+            engine
+                .inspect_manifest_version(
+                    bundle_id,
+                    base.generation,
+                    commit_id,
+                    &base.manifest_sha256,
+                )
+                .ok()
+        }),
+        None => None,
+    };
+    let materialized_bases = materialized_thread_bases(repository, &project, storage_id, &binding)?;
     let mut plan = engine.build_restore_plan(&fetched, &binding, now_secs())?;
+    plan.actions.retain(|action| {
+        if !is_conversation_keep_local_action(action, &fetched.snapshot.manifest) {
+            return true;
+        }
+        let current_storage_digest =
+            single_manifest_resource_file_digest(&fetched.snapshot.manifest, &action.resource_id);
+        let known_storage_digest = materialized_bases
+            .get(&action.resource_id)
+            .filter(|materialized| {
+                materialized_thread_base_supersedes_recipe_base(materialized, recipe_base)
+            })
+            .map(|materialized| materialized.storage_digest.clone())
+            .or_else(|| {
+                base_manifest.as_ref().and_then(|manifest| {
+                    single_manifest_resource_file_digest(manifest, &action.resource_id)
+                })
+            });
+        current_storage_digest != known_storage_digest
+    });
     plan.project_content_eligibility = Some(project_file_sync_eligibility(&binding));
     plan.validate()?;
     repository.save_restore_plan(&plan)?;
@@ -4693,6 +4782,12 @@ fn apply_bundle_restore_with_repository(
         &repository.backups_dir()?,
         applied_at,
     )?;
+    let kept_local_conversation_actions = plan
+        .actions
+        .iter()
+        .filter(|action| is_conversation_keep_local_action(action, &fetched.snapshot.manifest))
+        .map(|action| action.action_id.clone())
+        .collect::<BTreeSet<_>>();
     let files_complete = applied
         .receipts
         .iter()
@@ -4714,6 +4809,11 @@ fn apply_bundle_restore_with_repository(
             | RestoreActionType::ReviewHook
             | RestoreActionType::ReviewMcp
             | RestoreActionType::ApplySetting => receipt.status == ActionStatus::Applied,
+            RestoreActionType::Manual => {
+                receipt.status == ActionStatus::Applied
+                    || (receipt.status == ActionStatus::Skipped
+                        && kept_local_conversation_actions.contains(&receipt.action_id))
+            }
             _ => true,
         });
     let status = if files_complete {
@@ -5189,21 +5289,26 @@ fn bundle_readiness_for_fetched(
         needs_claude_home,
         binding.claude_home.as_deref(),
     );
-    if !fetched.snapshot.manifest.files.is_empty()
-        && materialization
-            .as_ref()
-            .is_none_or(|record| record.status != MaterializationStatus::Complete)
-    {
-        issues.push(BundleReadinessIssue {
-            issue_id: "restore-files".to_string(),
-            category: "project_setup".to_string(),
-            title: "Project files are not fully materialized".to_string(),
-            detail: Some("Build a restore plan and approve the intended file actions.".to_string()),
-            severity: "warning".to_string(),
-            provider: None,
-            resource_id: None,
-            action: Some("plan_restore".to_string()),
-        });
+    if !fetched.snapshot.manifest.files.is_empty() {
+        match materialization.as_ref() {
+            None => issues.push(BundleReadinessIssue {
+                issue_id: "restore-files".to_string(),
+                category: "project_setup".to_string(),
+                title: "Pull has not been applied yet".to_string(),
+                detail: Some(
+                    "Open the Pull review and apply the changes you want on this machine."
+                        .to_string(),
+                ),
+                severity: "warning".to_string(),
+                provider: None,
+                resource_id: None,
+                action: Some("plan_restore".to_string()),
+            }),
+            Some(record) if record.status == MaterializationStatus::Partial => {
+                add_partial_materialization_issues(&mut issues, record, fetched);
+            }
+            Some(_) => {}
+        }
     }
     for action in &fetched.dependency_actions {
         if !applied_dependencies.contains(&action.action_id) {
@@ -5239,6 +5344,128 @@ fn bundle_readiness_for_fetched(
         issues,
         generated_at: now_secs(),
     })
+}
+
+fn add_partial_materialization_issues(
+    issues: &mut Vec<BundleReadinessIssue>,
+    materialization: &MaterializationRecord,
+    fetched: &FetchedBundle,
+) {
+    let unresolved = materialization
+        .receipts
+        .iter()
+        .filter(|receipt| receipt.status != ActionStatus::Applied)
+        .collect::<Vec<_>>();
+
+    let manual_conversations = unresolved
+        .iter()
+        .filter(|receipt| receipt.action_type == RestoreActionType::Manual)
+        .filter(|receipt| !is_kept_local_conversation_receipt(receipt))
+        .filter(|receipt| {
+            fetched
+                .snapshot
+                .manifest
+                .resources
+                .get(&receipt.resource_id)
+                .is_some_and(|resource| {
+                    matches!(
+                        resource.kind,
+                        ResourceKind::CodexConversation | ResourceKind::ClaudeConversation
+                    )
+                })
+        })
+        .map(|receipt| receipt.resource_id.clone())
+        .collect::<BTreeSet<_>>();
+    if !manual_conversations.is_empty() {
+        let count = manual_conversations.len();
+        let resource_id = (count == 1)
+            .then(|| manual_conversations.iter().next().cloned())
+            .flatten();
+        let provider = resource_id
+            .as_ref()
+            .and_then(|resource_id| fetched.snapshot.manifest.resources.get(resource_id))
+            .and_then(|resource| resource.provider);
+        issues.push(BundleReadinessIssue {
+            issue_id: "conversation-conflicts".to_string(),
+            category: "sessions".to_string(),
+            title: if count == 1 {
+                "1 conversation conflict still needs manual resolution".to_string()
+            } else {
+                format!("{count} conversation conflicts still need manual resolution")
+            },
+            detail: Some(
+                "The other selected changes were restored. The conflicted local conversation was left unchanged."
+                    .to_string(),
+            ),
+            severity: "warning".to_string(),
+            provider,
+            resource_id,
+            action: Some("resolve_conflict".to_string()),
+        });
+    }
+
+    let incomplete_project_data = unresolved
+        .iter()
+        .filter(|receipt| {
+            if receipt.action_type == RestoreActionType::Manual {
+                if is_kept_local_conversation_receipt(receipt) {
+                    return false;
+                }
+                return !manual_conversations.contains(&receipt.resource_id);
+            }
+            match receipt.action_type {
+                RestoreActionType::WriteFile
+                | RestoreActionType::MergeFile
+                | RestoreActionType::MaterializeConversation
+                | RestoreActionType::ReviewHook
+                | RestoreActionType::ReviewMcp
+                | RestoreActionType::ApplySetting => true,
+                RestoreActionType::WriteProjectFile
+                | RestoreActionType::EnsureProjectDirectory
+                | RestoreActionType::DeleteProjectFile
+                | RestoreActionType::DeleteProjectDirectory => {
+                    matches!(receipt.status, ActionStatus::Failed | ActionStatus::Blocked)
+                }
+                RestoreActionType::InstallStandaloneSkill
+                | RestoreActionType::InstallCustomSkill
+                | RestoreActionType::OverwriteCustomSkill
+                | RestoreActionType::InstallPlugin
+                | RestoreActionType::Manual => false,
+            }
+        })
+        .copied()
+        .collect::<Vec<&ApplyReceipt>>();
+    if !incomplete_project_data.is_empty() {
+        let resource_ids = incomplete_project_data
+            .iter()
+            .map(|receipt| receipt.resource_id.clone())
+            .collect::<BTreeSet<_>>();
+        let count = resource_ids.len();
+        let failed = incomplete_project_data
+            .iter()
+            .any(|receipt| matches!(receipt.status, ActionStatus::Failed | ActionStatus::Blocked));
+        issues.push(BundleReadinessIssue {
+            issue_id: "restore-project-data".to_string(),
+            category: "project_setup".to_string(),
+            title: if count == 1 {
+                "1 project data change was left unchanged".to_string()
+            } else {
+                format!("{count} project data changes were left unchanged")
+            },
+            detail: Some(if failed {
+                "Review the technical result, fix the reported problem, and try Pull again."
+                    .to_string()
+            } else {
+                "Review this change separately before applying it on this machine.".to_string()
+            }),
+            severity: if failed { "error" } else { "warning" }.to_string(),
+            provider: None,
+            resource_id: (count == 1)
+                .then(|| resource_ids.iter().next().cloned())
+                .flatten(),
+            action: Some("review_restore".to_string()),
+        });
+    }
 }
 
 fn require_current_binding(
@@ -6039,7 +6266,7 @@ fn default_local_alias(
                 .unwrap_or(stem)
                 .to_string()
         })
-        .unwrap_or_else(crate::default_machine_name);
+        .unwrap_or_else(default_machine_name);
     let taken: BTreeSet<&str> = existing
         .iter()
         .map(|project| {
@@ -8741,6 +8968,16 @@ fn now_secs() -> u64 {
         .as_secs()
 }
 
+fn default_machine_name() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9576,6 +9813,10 @@ mod tests {
         )
         .unwrap();
         assert!(published.success);
+        assert_eq!(
+            published.message,
+            format!("Published generation {}", published.generation.unwrap())
+        );
     }
 
     #[test]
@@ -10990,9 +11231,34 @@ mod tests {
         .unwrap();
         repo.mutate_materializations(|_, materializations| {
             materializations.records[0].status = MaterializationStatus::Partial;
+            materializations.records[0].receipts.push(ApplyReceipt {
+                action_id: ActionId::parse("action-manual-conflict").unwrap(),
+                resource_id: ResourceId::parse(format!("codex:session:{session_id}")).unwrap(),
+                action_type: RestoreActionType::Manual,
+                logical_path: None,
+                source_sha256: None,
+                target_path: None,
+                target_sha256_after: None,
+                status: ActionStatus::Skipped,
+                applied_at: now_secs(),
+                error: Some("conversation was left unchanged".to_string()),
+            });
             Ok(())
         })
         .unwrap();
+        let partial_readiness =
+            get_bundle_readiness_with_repository(&repo, &storage_id, &bundle_id, &target_binding)
+                .unwrap();
+        assert_eq!(partial_readiness.state, "needs_setup");
+        assert_eq!(partial_readiness.issues.len(), 1);
+        assert_eq!(
+            partial_readiness.issues[0].title,
+            "1 conversation conflict still needs manual resolution"
+        );
+        assert_ne!(
+            partial_readiness.issues[0].title,
+            "Project files are not fully materialized"
+        );
         let partial_comparison = get_project_thread_sync_comparison_with_repository(
             &repo,
             &target.local_project_id,
@@ -11036,6 +11302,144 @@ mod tests {
             ThreadSyncState::LocalAhead,
             "real local transcript changes must still be detected"
         );
+
+        let repeated_pull =
+            plan_bundle_restore_with_repository(&repo, &storage_id, &bundle_id, &target_binding)
+                .unwrap();
+        assert!(
+            repeated_pull
+                .actions
+                .iter()
+                .all(|action| action.resource_id.as_str() != format!("codex:session:{session_id}")),
+            "a known local-ahead conversation must not return as a Pull conflict while storage is unchanged"
+        );
+
+        // A first Pull can also encounter the same thread ID with unrelated
+        // local bytes and no prior base. Applying the review means "keep
+        // local" for that conversation: no bytes are overwritten, the remote
+        // generation becomes its reviewed base, and the warning does not
+        // return until storage changes again.
+        let conflict_target = register_local_project_with_repository(
+            &repo,
+            RegisterLocalProjectRequest {
+                display_name: "conflict-target".to_string(),
+                repository_fingerprint: Some("a".repeat(64)),
+                bundle_id: Some(bundle_id.clone()),
+            },
+        )
+        .unwrap();
+        let conflict_root = temp.path().join("conflict-target");
+        let conflict_codex = temp.path().join("conflict-codex");
+        std::fs::create_dir_all(&conflict_root).unwrap();
+        let conflict_session = conflict_codex.join(&session_relative);
+        std::fs::create_dir_all(conflict_session.parent().unwrap()).unwrap();
+        let local_conflict = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "type": "session_meta",
+                "payload": { "id": session_id, "cwd": conflict_root.to_string_lossy() },
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": { "message": "local branch to preserve" },
+            }),
+        );
+        std::fs::write(&conflict_session, &local_conflict).unwrap();
+        let conflict_profile = add_profile(&repo, Provider::Codex, &conflict_codex);
+        save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: conflict_target.local_project_id.clone(),
+                project_root: conflict_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, conflict_profile)]),
+                expected_revision: None,
+            },
+        )
+        .unwrap();
+        save_project_link_with_repository(
+            &repo,
+            SaveProjectLinkRequest {
+                local_project_id: conflict_target.local_project_id.clone(),
+                storage_id: storage_id.clone(),
+                pinned: true,
+            },
+        )
+        .unwrap();
+        let conflict_binding = repo
+            .load_bindings()
+            .unwrap()
+            .active_for(&conflict_target.local_project_id)
+            .cloned()
+            .unwrap();
+        let conflict_plan =
+            plan_bundle_restore_with_repository(&repo, &storage_id, &bundle_id, &conflict_binding)
+                .unwrap();
+        let conflict_action = conflict_plan
+            .actions
+            .iter()
+            .find(|action| action.resource_id.as_str() == format!("codex:session:{session_id}"))
+            .unwrap();
+        assert!(matches!(
+            conflict_action.kind,
+            RestoreActionKind::Manual { .. }
+        ));
+        assert!(conflict_action.target_path.is_some());
+        assert!(conflict_action.source_sha256.is_some());
+        assert!(conflict_action.expected_target_sha256.is_some());
+        let approved = conflict_plan
+            .actions
+            .iter()
+            .filter(|action| !matches!(action.kind, RestoreActionKind::Manual { .. }))
+            .map(|action| action.action_id.clone())
+            .collect::<Vec<_>>();
+        let kept =
+            apply_bundle_restore_with_repository(&repo, &conflict_plan.plan_id, approved).unwrap();
+        assert!(kept.success, "{}", kept.message);
+        assert_eq!(
+            std::fs::read_to_string(&conflict_session).unwrap(),
+            local_conflict,
+            "keep-local resolution must not rewrite the conversation"
+        );
+        let conflict_materialization = repo
+            .load_materializations()
+            .unwrap()
+            .records
+            .into_iter()
+            .find(|record| record.local_project_id == conflict_target.local_project_id)
+            .unwrap();
+        assert_eq!(
+            conflict_materialization.status,
+            MaterializationStatus::Complete
+        );
+        assert!(repo
+            .load_config()
+            .unwrap()
+            .project(&conflict_target.local_project_id)
+            .unwrap()
+            .recipe_bases
+            .contains_key(&storage_id));
+        let conflict_comparison = get_project_thread_sync_comparison_with_repository(
+            &repo,
+            &conflict_target.local_project_id,
+            &storage_id,
+        )
+        .unwrap();
+        assert_eq!(
+            conflict_comparison
+                .entries
+                .iter()
+                .find(|entry| entry.thread_id == session_id)
+                .unwrap()
+                .state,
+            ThreadSyncState::LocalAhead
+        );
+        let after_keep_local =
+            plan_bundle_restore_with_repository(&repo, &storage_id, &bundle_id, &conflict_binding)
+                .unwrap();
+        assert!(after_keep_local
+            .actions
+            .iter()
+            .all(|action| action.resource_id.as_str() != format!("codex:session:{session_id}")));
     }
 
     #[test]

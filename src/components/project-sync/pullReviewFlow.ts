@@ -56,6 +56,16 @@ export interface PullReviewApplyResult {
   failedPhase: "restoring" | "installing" | "verifying" | null;
 }
 
+function hasKeepLocalConversationDecision(plan: RestorePlan): boolean {
+  return plan.actions.some((action) => (
+    action.kind.kind === "manual"
+    && /^(codex|claude):session:/.test(action.resource_id)
+    && Boolean(action.target_path)
+    && Boolean(action.source_sha256)
+    && Boolean(action.expected_target_sha256)
+  ));
+}
+
 /**
  * The two backend plans are immutable approval surfaces. Refuse to combine
  * them unless every pin identifies the same remote snapshot and local
@@ -112,9 +122,10 @@ export async function applyPullReview(
     || action.kind.kind === "delete_project_file"
     || action.kind.kind === "delete_project_directory"
   ));
+  const hasConversationKeepLocalDecisions = hasKeepLocalConversationDecision(restorePlan);
 
   onPhase("restoring");
-  if (selection.restoreActionIds.length > 0 || hasProjectContentDecisions) {
+  if (selection.restoreActionIds.length > 0 || hasProjectContentDecisions || hasConversationKeepLocalDecisions) {
     try {
       restoreResult = await api.applyRestore(restorePlan.plan_id, selection.restoreActionIds);
     } catch (reason) {

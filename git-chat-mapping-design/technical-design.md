@@ -93,7 +93,7 @@ The frontend holds message pages once per thread ID and expansion state once per
 
 Both actions revalidate ownership immediately before execution and log the exact command first.
 
-- App: `/usr/bin/open -n -a /Applications/ChatGPT.app --env CODEX_HOME=<bound-home> codex://threads/<uuid>` using structured process arguments.
+- App: first opens `codex://threads/new?path=<encoded-canonical-project-root>`, waits briefly for the bound profile to persist that project selection, then opens `codex://threads/<uuid>` in a second `/usr/bin/open -n -a /Applications/ChatGPT.app --env CODEX_HOME=<bound-home>` command. Existing-thread links do not accept a project path, and combining a folder plus a thread URL in one launch can lose the folder event when that profile is already running.
 - Terminal: resolves an absolute Codex CLI, then opens Terminal with a shell-quoted `CODEX_HOME=<bound-home> <codex> resume <uuid> -C <canonical-project-root>` command.
 
 UUIDs are strict, paths come from revalidated bindings, and user branch/cursor values never enter a shell. Missing app/CLI and OS launch failures return specific action errors.

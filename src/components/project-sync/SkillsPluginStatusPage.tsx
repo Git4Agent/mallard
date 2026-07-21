@@ -310,10 +310,15 @@ export function SkillsPluginStatusContent({
   const itemLabel = isSkillsView ? "skills" : "plugins";
   const icon = isSkillsView ? "folder" : "link";
   const headingId = `project-${view}-heading`;
+  const compactSelectionReview = selectionMode != null;
 
   return (
-    <div className="v3-capability-page v3-history-embedded" aria-labelledby={headingId}>
-      <header className="profile-links-heading v3-history-header">
+    <div
+      className={`v3-capability-page v3-history-embedded${compactSelectionReview ? " v3-history-selection-review" : ""}`}
+      aria-labelledby={compactSelectionReview ? undefined : headingId}
+      aria-label={compactSelectionReview ? title : undefined}
+    >
+      {!compactSelectionReview && <header className="profile-links-heading v3-history-header">
         <div className="profile-links-copy">
           <h2 id={headingId} className="v3-history-embedded-title"><Icon name={icon} size={15} />{title}</h2>
         </div>
@@ -347,7 +352,7 @@ export function SkillsPluginStatusContent({
             <Icon name="refresh" size={15} className={loading ? "icon-spin" : undefined} />
           </button>
         </div>
-      </header>
+      </header>}
 
       {missingProfile ? (
         <div className="v3-history-state v3-history-profile-state">

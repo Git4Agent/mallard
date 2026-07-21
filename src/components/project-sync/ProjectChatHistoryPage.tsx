@@ -170,22 +170,20 @@ function syncReviewStateLabel(
   entry: ThreadSyncEntry | undefined,
   selected: boolean,
 ): string | null {
-  if (!entry) return mode === "push" ? "Local session" : null;
+  if (!entry) return null;
   if (entry.state === "unavailable") return "Unavailable for sync";
   if (mode === "push") {
     if (entry.state === "storage_only" || entry.state === "storage_ahead" || entry.state === "diverged") {
       return "Pull required";
     }
-    if (entry.state === "local_only" || entry.state === "local_ahead") return "Local change";
-    if (entry.state === "synced") return "Up to date";
-    return "Review status";
+    return entry.state === "unknown" ? "Review status" : null;
   }
   if (entry.state === "diverged") return selected ? "Use storage version" : "Keep local";
   if (entry.state === "storage_only" || entry.state === "storage_ahead") {
     return selected ? "Restore from storage" : "Keep local";
   }
   if (entry.state === "local_only" || entry.state === "local_ahead") return "Keep local";
-  return entry.state === "synced" ? "Up to date" : "Review status";
+  return entry.state === "synced" ? null : "Review status";
 }
 
 function ThreadCard({
@@ -332,6 +330,7 @@ export function ProjectChatHistoryContent({
   const threads = useMemo(() => new Map((history?.threads ?? []).map((thread) => [thread.thread_id, thread])), [history?.threads]);
   const syncByThread = useMemo(() => new Map((comparison?.entries ?? []).map((entry) => [entry.thread_id, entry])), [comparison?.entries]);
   const comparisonStorageName = comparison?.storage_name ?? activeStorageName ?? "selected storage";
+  const compactSelectionReview = embedded && selectionMode != null;
   const storedOnlyEntries = useMemo(() => (comparison?.entries ?? [])
     .filter((entry) => !entry.local_present && entry.storage_present && !threads.has(entry.thread_id))
     .filter((entry) => !history || entry.storage_updated_at == null || entry.storage_updated_at >= history.window_start),
@@ -362,6 +361,8 @@ export function ProjectChatHistoryContent({
     + visibleComparisonCounts.diverged
     + visibleComparisonCounts.unavailable
     + visibleComparisonCounts.needsBaseline;
+  const showEmbeddedThreadCount = embedded && !compactSelectionReview && embeddedThreadCount !== null;
+  const showComparisonSummary = comparison != null && visibleComparisonChangeCount > 0;
   const renderThread = (thread: CodexThreadSummary, key: string) => {
     const entry = syncByThread.get(thread.thread_id);
     const resourceId = entry?.resource_id ?? `codex:session:${thread.thread_id}`;
@@ -402,8 +403,12 @@ export function ProjectChatHistoryContent({
   ].sort((left, right) => right.updatedAt - left.updatedAt || left.id.localeCompare(right.id));
 
   const content = (
-      <section className={embedded ? "v3-history-content" : "profile-links-section"} aria-labelledby="project-activity-heading">
-        <header className="profile-links-heading v3-history-header">
+      <section
+        className={embedded ? "v3-history-content" : "profile-links-section"}
+        aria-labelledby={compactSelectionReview ? undefined : "project-activity-heading"}
+        aria-label={compactSelectionReview ? embeddedTitle : undefined}
+      >
+        {!compactSelectionReview && <header className="profile-links-heading v3-history-header">
           <div className="profile-links-copy">
             {embedded ? (
               <h2 id="project-activity-heading" className="v3-history-embedded-title">
@@ -419,7 +424,7 @@ export function ProjectChatHistoryContent({
             )}
           </div>
           <div className="v3-history-toolbar">
-            {activeStorageName && (
+            {activeStorageName && !compactSelectionReview && (
               <span
                 className="v3-history-storage-lens"
                 title={`Comparing threads with ${activeStorageName}`}
@@ -437,9 +442,9 @@ export function ProjectChatHistoryContent({
                 </select>
               </label>
             )}
-            {(embedded && embeddedThreadCount !== null || comparison && visibleComparisonChangeCount > 0) && (
+            {(showEmbeddedThreadCount || showComparisonSummary) && (
               <span className="v3-history-toolbar-stats">
-                {embedded && embeddedThreadCount !== null && (
+                {showEmbeddedThreadCount && (
                   <span
                     className="v3-history-heading-count v3-history-toolbar-count"
                     title={`${embeddedThreadCount} thread${embeddedThreadCount === 1 ? "" : "s"} shown`}
@@ -448,7 +453,7 @@ export function ProjectChatHistoryContent({
                     <Icon name="message" size={12} />{embeddedThreadCount}
                   </span>
                 )}
-                {comparison && visibleComparisonChangeCount > 0 && (
+                {showComparisonSummary && (
                   <span className="v3-thread-sync-summary" aria-label={`Visible thread comparison with ${comparisonStorageName}`}>
                     {visibleComparisonCounts.local > 0 && <span className="local" title={`${visibleComparisonCounts.local} local thread change${visibleComparisonCounts.local === 1 ? "" : "s"}`}><Icon name="upload" size={12} />{visibleComparisonCounts.local}</span>}
                     {visibleComparisonCounts.storage > 0 && <span className="storage" title={`${visibleComparisonCounts.storage} thread change${visibleComparisonCounts.storage === 1 ? "" : "s"} in ${comparisonStorageName}`}><Icon name="download" size={12} />{visibleComparisonCounts.storage}</span>}
@@ -464,7 +469,7 @@ export function ProjectChatHistoryContent({
             <button type="button" className="v3-history-icon-action v3-history-refresh" onClick={onRefresh} disabled={loading || comparisonLoading}
               title="Refresh activity" aria-label="Refresh activity"><Icon name="refresh" size={15} className={loading || comparisonLoading ? "icon-spin" : undefined} /></button>
           </div>
-        </header>
+        </header>}
 
         {actionError && <div className="v3-callout error v3-history-error" role="alert"><Icon name="alert-triangle" size={15} /><span>{actionError}</span></div>}
         {!hasCodexProfile ? (
@@ -525,7 +530,10 @@ export function ProjectChatHistoryContent({
                 </section>
               </>
             ) : (
-              <section aria-labelledby={embedded ? "project-activity-heading" : "codex-sessions-heading"}>
+              <section
+                aria-labelledby={embedded && !compactSelectionReview ? "project-activity-heading" : !embedded ? "codex-sessions-heading" : undefined}
+                aria-label={compactSelectionReview ? embeddedTitle : undefined}
+              >
                 {!embedded && <div className="v3-history-section-heading"><h2 id="codex-sessions-heading" className="v3-history-codex-heading"><Icon name="openai" size={14} className="v3-openai-icon" />Codex threads</h2><span className="v3-history-heading-count" title={`${history.threads.length} threads`}><Icon name="message" size={12} />{history.threads.length}</span></div>}
                 <div className="v3-history-thread-list flat">{flatThreadRows.length ? flatThreadRows.map((row) => row.kind === "local"
                   ? renderThread(row.thread, row.thread.thread_id)
@@ -543,7 +551,7 @@ export function ProjectChatHistoryContent({
   );
 
   if (embedded) {
-    return <div className="v3-history-page v3-history-embedded">{content}</div>;
+    return <div className={`v3-history-page v3-history-embedded${compactSelectionReview ? " v3-history-selection-review" : ""}`}>{content}</div>;
   }
   return <main className="v3-main v3-project-links-page v3-git-info-page v3-history-page">{content}</main>;
 }

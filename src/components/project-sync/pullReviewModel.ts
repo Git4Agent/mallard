@@ -24,7 +24,7 @@ export interface PullReviewItem {
   projectContentOperation: "add" | "replace" | "create_directory" | "delete_file" | "delete_directory" | null;
 }
 
-const DEFERRED_RESTORE_KINDS = new Set(["install_plugin", "install_standalone_skill"]);
+const NON_DIRECT_RESTORE_KINDS = new Set(["install_plugin", "install_standalone_skill", "manual"]);
 
 function humanize(value: string): string {
   return value
@@ -147,10 +147,15 @@ function restoreActionCopy(action: RestoreAction): {
     };
   }
   if (kind === "manual") {
+    const conversationProvider = action.resource_id.startsWith("codex:session:")
+      ? "codex"
+      : action.resource_id.startsWith("claude:session:")
+        ? "claude"
+        : null;
     return {
-      title: "Manual setup",
+      title: conversationProvider ? "Conflicted conversation" : "Manual review",
       detail: action.kind.message,
-      provider: null,
+      provider: conversationProvider,
       category: "project_data",
       toolKind: null,
     };
@@ -293,7 +298,7 @@ export function includeRequiredPullProjectDirectories(
 
 export function restoreActionIds(item: PullReviewItem): string[] {
   return item.restoreActions
-    .filter((action) => !DEFERRED_RESTORE_KINDS.has(action.kind.kind))
+    .filter((action) => !NON_DIRECT_RESTORE_KINDS.has(action.kind.kind))
     .map((action) => action.action_id);
 }
 
@@ -310,14 +315,29 @@ export function pendingIds(item: PullReviewItem, completedActionIds: ReadonlySet
 }
 
 export function requiresApproval(item: PullReviewItem): boolean {
-  const restore = item.restoreActions.filter((action) => !DEFERRED_RESTORE_KINDS.has(action.kind.kind));
+  const restore = item.restoreActions.filter((action) => !NON_DIRECT_RESTORE_KINDS.has(action.kind.kind));
   return [...restore, ...item.dependencyActions].some((action) => action.requires_explicit_approval);
+}
+
+export function keepsLocalConversation(item: PullReviewItem): boolean {
+  return /^(codex|claude):session:/.test(item.resourceId)
+    && item.restoreActions.some((action) => (
+      action.kind.kind === "manual"
+      && Boolean(action.target_path)
+      && Boolean(action.source_sha256)
+      && Boolean(action.expected_target_sha256)
+    ));
+}
+
+export function requiresManualResolution(item: PullReviewItem): boolean {
+  return item.restoreActions.some((action) => action.kind.kind === "manual")
+    && !keepsLocalConversation(item);
 }
 
 export function defaultSelected(item: PullReviewItem): boolean {
   if (item.category === "project_content") return false;
   const actions = [
-    ...item.restoreActions.filter((action) => !DEFERRED_RESTORE_KINDS.has(action.kind.kind)),
+    ...item.restoreActions.filter((action) => !NON_DIRECT_RESTORE_KINDS.has(action.kind.kind)),
     ...item.dependencyActions,
   ];
   return actions.length > 0 && actions.every((action) => !action.requires_explicit_approval);
@@ -327,7 +347,7 @@ export function itemKindLabel(item: PullReviewItem): string {
   if (item.toolKind === "plugin") return "Plugin";
   if (item.toolKind === "custom_skill") return "Custom skill";
   if (item.toolKind === "setup_item") return "Setup item";
-  if (item.restoreActions.some((action) => action.kind.kind === "materialize_conversation")) return "Conversation";
+  if (/^(codex|claude):session:/.test(item.resourceId) || item.restoreActions.some((action) => action.kind.kind === "materialize_conversation")) return "Conversation";
   if (item.projectContentEntryType === "directory") return "Project folder";
   if (item.projectContentEntryType === "file") return "Project file";
   if (item.restoreActions.some((action) => action.kind.kind === "write_file" || action.kind.kind === "merge_file")) return "File";

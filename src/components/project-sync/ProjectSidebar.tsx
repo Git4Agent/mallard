@@ -47,7 +47,6 @@ interface Props {
   onOpenStorage: (storageId: string) => void;
   onRemoveStorage: (storageId: string) => void;
   onAddStorage: () => void;
-  onOpenLegacy: () => void;
 }
 
 export default function ProjectSidebar({
@@ -72,7 +71,6 @@ export default function ProjectSidebar({
   onOpenStorage,
   onRemoveStorage,
   onAddStorage,
-  onOpenLegacy,
 }: Props) {
   const [projectShare, setProjectShare] = useState(storedProjectShare);
   const [resizingSections, setResizingSections] = useState(false);
@@ -374,11 +372,6 @@ export default function ProjectSidebar({
         </section>
       </div>
 
-      <div className="v3-sidebar-footer">
-        <button type="button" onClick={onOpenLegacy} disabled={busy}>
-          <Icon name="computer" size={14} /> Legacy profiles
-        </button>
-      </div>
     </aside>
   );
 }

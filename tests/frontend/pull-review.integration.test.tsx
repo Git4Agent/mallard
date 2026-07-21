@@ -145,7 +145,7 @@ test("a valid Pull plan renders an enabled non-modal Apply workspace while suppo
   assert.doesNotMatch(html, /Project files &amp; setup/, "an empty setup group is omitted");
   assert.doesNotMatch(html, /aria-modal/);
   assert.doesNotMatch(html, /v3-modal-backdrop/);
-  const applyText = html.lastIndexOf("Apply 1 change");
+  const applyText = html.lastIndexOf("Apply changes");
   assert.notEqual(applyText, -1);
   const applyTagStart = html.lastIndexOf("<button", applyText);
   const applyTagEnd = html.indexOf(">", applyTagStart);
@@ -190,8 +190,37 @@ test("a Pull review opens on the Apply summary by default", () => {
     />,
   );
 
-  assert.match(html, /aria-selected="true"[^>]*aria-label="Review, 1 selected"/);
-  assert.match(html, />Apply 1 change</);
+  assert.match(html, /aria-selected="true"[^>]*aria-label="Review"/);
+  assert.match(html, />Apply changes</);
+});
+
+test("the embedded Pull footer omits redundant helper copy", () => {
+  const html = renderToStaticMarkup(
+    <RestorePlanView
+      embedded
+      projectName="gam2"
+      profileLabel="myconf2"
+      plan={restorePlan}
+      binding={binding}
+      dependencyPlan={null}
+      readiness={null}
+      restoreResult={null}
+      dependencyResult={null}
+      phase="idle"
+      supportLoading={false}
+      completedActionIds={new Set()}
+      completedResourceIds={new Set()}
+      failedResourceIds={new Set()}
+      busy={false}
+      error={null}
+      onApply={() => undefined}
+      onRefresh={() => undefined}
+      onBack={() => undefined}
+    />,
+  );
+
+  assert.match(html, /v3-inline-action-footer/);
+  assert.doesNotMatch(html, /safe change(?:s)? selected by default/);
 });
 
 function dependencyPlan(actions: DependencyPlan["actions"]): DependencyPlan {
@@ -287,7 +316,113 @@ test("restore and native dependency actions merge into one global-tool row per r
   assert.doesNotMatch(html, /Ready to restore|Preparing installer/);
   assert.match(html, /aria-label="Skills, 0 selected, needs attention/);
   assert.match(html, /aria-label="Plugins, 0 selected, needs attention/);
-  assert.match(html, />Needs approval</);
+  assert.match(html, />Optional changes not selected</);
+});
+
+test("conversation conflicts become one-time keep-local decisions without blocking safe Pull changes", async () => {
+  const conflictedPlan: RestorePlan = {
+    ...restorePlan,
+    actions: [
+      ...restorePlan.actions,
+      {
+        action_id: "manual-conflict",
+        resource_id: "codex:session:thread-conflict",
+        kind: {
+          kind: "manual",
+          message: "Conversation differs locally; this Pull will keep the local version.",
+        },
+        target_path: "/Users/test/.codex/sessions/thread-conflict.jsonl",
+        source_sha256: "c".repeat(64),
+        expected_target_sha256: "d".repeat(64),
+        requires_explicit_approval: true,
+      },
+      {
+        action_id: "restore-custom-skill",
+        resource_id: "codex:standalone-skill:frontend-skill",
+        kind: { kind: "overwrite_custom_skill", provider: "codex", skill_name: "frontend-skill" },
+        target_path: "/Users/test/.codex/skills/frontend-skill",
+        requires_explicit_approval: true,
+      },
+    ],
+  };
+  const items = buildPullReviewItems(conflictedPlan, null);
+  const selection = buildPullReviewSelection(
+    items,
+    new Set(items.map((item) => item.resourceId)),
+    new Set(),
+    new Set(),
+  );
+  assert.deepEqual(selection.restoreActionIds, ["action-session", "restore-custom-skill"]);
+  assert.doesNotMatch(selection.restoreActionIds.join(" "), /manual-conflict/);
+
+  const html = renderToStaticMarkup(
+    <RestorePlanView
+      projectName="gam2"
+      profileLabel="myconf2"
+      plan={conflictedPlan}
+      binding={binding}
+      dependencyPlan={null}
+      readiness={{
+        bundle_id: binding.bundle_id,
+        state: "needs_setup",
+        issues: [{
+          issue_id: "restore-files",
+          category: "project_setup",
+          title: "Project files are not fully materialized",
+          detail: "Build a restore plan and approve the intended file actions.",
+          severity: "warning",
+        }],
+      }}
+      restoreResult={null}
+      dependencyResult={null}
+      phase="idle"
+      supportLoading={false}
+      completedActionIds={new Set()}
+      completedResourceIds={new Set()}
+      failedResourceIds={new Set()}
+      busy={false}
+      error={null}
+      initialStep="review"
+      onApply={() => undefined}
+      onRefresh={() => undefined}
+      onBack={() => undefined}
+    />,
+  );
+
+  assert.match(html, /aria-label="Git &amp; sessions, 1 selected, needs attention/);
+  assert.match(html, /1 conversation differs/);
+  assert.match(html, /establish a comparison baseline/);
+  assert.match(html, /It can be pushed later/);
+  assert.match(html, />Optional change not selected</);
+  assert.match(html, /Apply will skip frontend-skill and leave it unchanged/);
+  assert.doesNotMatch(html, />Needs approval</);
+  assert.doesNotMatch(html, /resolve.*separately/i);
+  assert.doesNotMatch(html, /Project files are not fully materialized/);
+  assert.match(html, />Apply changes</);
+
+  const calls: string[] = [];
+  const keepLocalOnlyPlan = { ...conflictedPlan, actions: [conflictedPlan.actions[1]] };
+  const result = await applyPullReview(
+    {
+      applyRestore: async (_planId, actionIds) => {
+        calls.push(`restore:${actionIds.length}`);
+        return { success: true, message: "Local conversation kept", applied_action_ids: [], failed_actions: [] };
+      },
+      applyDependencies: async () => {
+        throw new Error("no dependency action expected");
+      },
+      getRestoreReadiness: async () => {
+        calls.push("verify");
+        return { bundle_id: binding.bundle_id, state: "ready", issues: [] };
+      },
+    },
+    keepLocalOnlyPlan,
+    null,
+    { resourceIds: [], restoreActionIds: [], dependencyActionIds: [] },
+    () => undefined,
+  );
+  assert.deepEqual(calls, ["restore:0", "verify"]);
+  assert.equal(result.success, true);
 });
 
 test("skipping a required global tool cannot produce a ready Pull outcome", () => {
@@ -329,11 +464,12 @@ test("skipping a required global tool cannot produce a ready Pull outcome", () =
       onBack={() => undefined}
     />,
   );
-  assert.match(html, /Project restored; 1 setup item skipped/);
+  assert.match(html, /Project restored; 1 item left unchanged/);
   assert.doesNotMatch(html, />Pull complete</);
-  assert.match(html, /Optional setup not applied/);
+  assert.match(html, /computer-use@openai-bundled(?:<!-- -->)? left unchanged/);
+  assert.match(html, />Remaining items</);
   assert.match(html, /Readiness is not confirmed/);
-  assert.match(html, />Recommended \(0\)</);
+  assert.match(html, /aria-label="Use recommended selection \(0\)"/);
   const doneText = html.lastIndexOf(">Done<");
   assert.notEqual(doneText, -1, "a completed data restore can be dismissed even when optional setup was skipped");
   const doneTagStart = html.lastIndexOf("<button", doneText);

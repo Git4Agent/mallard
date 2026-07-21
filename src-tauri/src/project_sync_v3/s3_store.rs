@@ -8,10 +8,13 @@
 //! an error with that instruction, but catching it is not a substitute for
 //! keeping blocking work off an async runtime worker.
 
+use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::Client as S3Client;
+use aws_sdk_s3::{Client as S3Client, Config as S3Config};
+use aws_smithy_http_client::{tls, Builder as HttpClientBuilder};
 use bytes::Bytes;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -28,6 +31,7 @@ use super::domain::{StorageConfigV3, StorageKind, MAX_FILE_BYTES};
 const MAX_LIST_PAGE: usize = 10_000;
 const S3_MAX_KEYS: usize = 1_000;
 const MAX_LIST_REQUESTS: usize = MAX_LIST_PAGE + 2;
+const R2_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
 pub struct S3BundleObjectStore {
@@ -56,23 +60,7 @@ impl S3BundleObjectStore {
             ));
         }
 
-        // Keep credentials, secret decoding, endpoint derivation, TLS, path
-        // style, and region behavior identical to the established sync path.
-        let legacy = crate::StorageConfig {
-            id: config.id.to_string(),
-            name: config.name.clone(),
-            kind: "s3".to_string(),
-            bucket: config.bucket.clone(),
-            access_key_id: config.access_key_id.clone(),
-            secret_access_key: config.secret_access_key.clone(),
-            account_id: config.account_id.clone(),
-            s3_endpoint: config.s3_endpoint.clone(),
-            region: config.region.clone(),
-            local_dir: String::new(),
-            included_default_exclusions: config.included_default_exclusions.clone(),
-            supports_conditional_writes: config.supports_conditional_writes,
-        };
-        let client = crate::make_s3_client(&legacy)?;
+        let client = make_s3_client(config)?;
         Self::from_client(client, config.bucket.clone(), runtime)
     }
 
@@ -104,7 +92,7 @@ impl S3BundleObjectStore {
             client,
             bucket,
             runtime,
-            request_timeout: crate::r2_request_timeout(),
+            request_timeout: R2_REQUEST_TIMEOUT,
         })
     }
 
@@ -137,7 +125,7 @@ impl S3BundleObjectStore {
                 ));
             }
             Ok(Ok(response)) => response,
-            Ok(Err(error)) if crate::sdk_status(&error) == Some(404) => return Ok(None),
+            Ok(Err(error)) if sdk_status(&error) == Some(404) => return Ok(None),
             Ok(Err(error)) => return Err(format!("S3 get '{}': {}", key, error)),
         };
 
@@ -200,7 +188,7 @@ impl S3BundleObjectStore {
                     .transpose()?;
                 Ok(PutAttempt::Written(etag))
             }
-            Ok(Err(error)) if matches!(crate::sdk_status(&error), Some(409) | Some(412)) => {
+            Ok(Err(error)) if matches!(sdk_status(&error), Some(409) | Some(412)) => {
                 Ok(PutAttempt::PreconditionFailed)
             }
             Ok(Err(error)) if ambiguous_sdk_error(&error) => {
@@ -481,8 +469,89 @@ fn raw_key_is_under_prefix(key: &str, prefix: &ObjectPrefix) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+fn make_s3_client(config: &StorageConfigV3) -> Result<S3Client, String> {
+    if config.bucket.is_empty() {
+        return Err("Bucket is not configured".to_string());
+    }
+    if config.access_key_id.is_empty() {
+        return Err("R2 Access Key ID is not configured".to_string());
+    }
+    if config.secret_access_key.is_empty() {
+        return Err("R2 Secret Access Key is not configured".to_string());
+    }
+    let endpoint = if !config.s3_endpoint.is_empty() {
+        config.s3_endpoint.clone()
+    } else if !config.account_id.is_empty() {
+        format!("https://{}.r2.cloudflarestorage.com", config.account_id)
+    } else {
+        return Err("Endpoint is not configured".to_string());
+    };
+    let secret = if config.secret_access_key.starts_with("cfat_") {
+        sha256_bytes(config.secret_access_key.as_bytes())
+    } else {
+        config.secret_access_key.clone()
+    };
+    let credentials = Credentials::new(
+        &config.access_key_id,
+        secret,
+        None,
+        None,
+        "mallard-project-sync",
+    );
+    let region = if config.region.is_empty() {
+        "auto".to_string()
+    } else {
+        config.region.clone()
+    };
+    let sdk_config = S3Config::builder()
+        .credentials_provider(credentials)
+        .region(Region::new(region))
+        .endpoint_url(endpoint)
+        .force_path_style(true)
+        .behavior_version_latest()
+        .http_client(
+            HttpClientBuilder::new()
+                .tls_provider(tls::Provider::Rustls(
+                    tls::rustls_provider::CryptoMode::AwsLc,
+                ))
+                .build_https(),
+        )
+        .build();
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        S3Client::from_conf(sdk_config)
+    }))
+    .map_err(|panic| {
+        if let Some(message) = panic.downcast_ref::<&str>() {
+            format!("R2 client creation panicked: {message}")
+        } else if let Some(message) = panic.downcast_ref::<String>() {
+            format!("R2 client creation panicked: {message}")
+        } else {
+            "R2 client creation panicked".to_string()
+        }
+    })
+}
+
+fn sdk_status<E>(error: &SdkError<E>) -> Option<u16> {
+    match error {
+        SdkError::ServiceError(context) => Some(context.raw().status().as_u16()),
+        SdkError::ResponseError(context) => Some(context.raw().status().as_u16()),
+        _ => None,
+    }
+}
+
+fn normalize_etag(etag: &str) -> String {
+    etag.trim_matches('"').to_string()
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn validated_service_etag(raw: &str, key: &str) -> Result<String, String> {
-    let etag = crate::normalize_etag(raw);
+    let etag = normalize_etag(raw);
     validate_expected_etag(&etag)
         .map_err(|_| format!("S3 object '{}' returned an invalid ETag", key))?;
     Ok(etag)
@@ -682,7 +751,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(found.bytes, b"one");
-        assert_eq!(found.etag, crate::sha256_bytes(b"one"));
+        assert_eq!(found.etag, sha256_bytes(b"one"));
 
         let head = ObjectKey::parse(
             ".mallard/v1/repositories/0123456789abcdef0123456789abcdef/_head.json",
@@ -702,7 +771,7 @@ mod tests {
         let CasOutcome::Written { etag } = created else {
             panic!("head create should succeed")
         };
-        assert_eq!(etag, crate::sha256_bytes(b"head-one"));
+        assert_eq!(etag, sha256_bytes(b"head-one"));
 
         let store_for_stale = store.clone();
         let head_for_stale = head.clone();
@@ -736,7 +805,7 @@ mod tests {
         assert_eq!(
             updated,
             CasOutcome::Written {
-                etag: crate::sha256_bytes(b"head-two")
+                etag: sha256_bytes(b"head-two")
             }
         );
     }
@@ -836,7 +905,7 @@ mod tests {
                 let current = objects.get(key);
                 let precondition_failed = (if_none_match && current.is_some())
                     || if_match.as_ref().is_some_and(|expected| {
-                        current.map(|bytes| crate::sha256_bytes(bytes)).as_deref()
+                        current.map(|bytes| sha256_bytes(bytes)).as_deref()
                             != Some(expected.as_str())
                     });
                 if precondition_failed {
@@ -888,7 +957,7 @@ mod tests {
                 "<Contents><Key>{}</Key><Size>{}</Size><ETag>&quot;{}&quot;</ETag><LastModified>2026-01-01T00:00:00.000Z</LastModified><StorageClass>STANDARD</StorageClass></Contents>",
                 key,
                 bytes.len(),
-                crate::sha256_bytes(bytes)
+                sha256_bytes(bytes)
             ));
         }
         if let Some(next) = next {
@@ -912,7 +981,7 @@ mod tests {
     ) -> Response<Full<HyperBytes>> {
         let mut response = Response::builder().status(status);
         if let Some(bytes) = etag_bytes {
-            response = response.header("etag", format!("\"{}\"", crate::sha256_bytes(bytes)));
+            response = response.header("etag", format!("\"{}\"", sha256_bytes(bytes)));
         }
         response.body(Full::new(HyperBytes::from(body))).unwrap()
     }

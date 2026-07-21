@@ -3,10 +3,13 @@ import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import PushResourceWorkspace, {
   nextPushReviewStep,
+  preserveSyncedPushRecipeEntries,
+  recommendedPushSelection,
 } from "../../src/components/project-sync/PushResourceWorkspace";
 import ResourceInventory from "../../src/components/project-sync/ResourceInventory";
 import { recipeWithSelection } from "../../src/components/project-sync/model";
-import type { ProjectResourceDescriptor } from "../../src/types";
+import type { BundleRecipe, ProjectResourceDescriptor } from "../../src/types";
+import type { ThreadSyncComparison } from "../../src/types";
 
 function standaloneSkill(
   effectiveName: string,
@@ -37,6 +40,94 @@ function standaloneSkill(
     install_behavior: "install on restore",
   };
 }
+
+function conversation(resourceId: string): ProjectResourceDescriptor {
+  return {
+    resource_id: resourceId,
+    kind: "conversation",
+    provider: "codex",
+    scope: "provider_state",
+    display_name: resourceId,
+    provenance: { kind: "conversation" },
+    apply_policy: "safe_file",
+    codec_version: 1,
+    metadata: {},
+    category: "conversations",
+  };
+}
+
+test("recommended Push selection includes only locally changed sessions", () => {
+  const localAhead = conversation("codex:session:local-ahead");
+  const synced = conversation("codex:session:synced");
+  const storageAhead = conversation("codex:session:storage-ahead");
+  const sessionIndex = conversation("codex:session-index");
+  const skill = standaloneSkill("frontend-skill", "frontend-skill");
+  const comparison: ThreadSyncComparison = {
+    project_id: "project-a",
+    storage_id: "storage-a",
+    storage_name: "Local storage 1",
+    compared_at: 1,
+    counts: { synced: 1, local: 1, storage: 1, diverged: 0, unavailable: 0, unknown: 0 },
+    warnings: [],
+    entries: [
+      {
+        thread_id: "local-ahead",
+        resource_id: localAhead.resource_id,
+        display_name: "Local ahead",
+        state: "local_ahead",
+        local_present: true,
+        storage_present: true,
+      },
+      {
+        thread_id: "synced",
+        resource_id: synced.resource_id,
+        display_name: "Synced",
+        state: "synced",
+        local_present: true,
+        storage_present: true,
+      },
+      {
+        thread_id: "storage-ahead",
+        resource_id: storageAhead.resource_id,
+        display_name: "Storage ahead",
+        state: "storage_ahead",
+        local_present: true,
+        storage_present: true,
+      },
+    ],
+  };
+
+  const recommended = recommendedPushSelection(
+    new Set([synced.resource_id, storageAhead.resource_id, sessionIndex.resource_id, skill.resource_id]),
+    [localAhead, synced, storageAhead, sessionIndex, skill],
+    comparison,
+  );
+
+  assert.deepEqual(
+    [...recommended].sort(),
+    [localAhead.resource_id, sessionIndex.resource_id, skill.resource_id].sort(),
+  );
+
+  const sourceRecipe: BundleRecipe = {
+    schema_version: 1,
+    revision: 3,
+    entries: Object.fromEntries([synced, sessionIndex, skill].map((resource) => [resource.resource_id, {
+      resource_id: resource.resource_id,
+      apply_policy: resource.apply_policy,
+      required: false,
+    }])),
+  };
+  const selectedRecipe: BundleRecipe = {
+    ...sourceRecipe,
+    entries: { [skill.resource_id]: sourceRecipe.entries[skill.resource_id] },
+  };
+  const publishedRecipe = preserveSyncedPushRecipeEntries(selectedRecipe, sourceRecipe, comparison);
+  assert.deepEqual(
+    Object.keys(publishedRecipe.entries).sort(),
+    [synced.resource_id, sessionIndex.resource_id, skill.resource_id].sort(),
+    "unchecked synced sessions stay stored without appearing in the recommended action set",
+  );
+});
 
 function inputTagFor(html: string, accessibleName: string): string {
   const marker = `aria-label="${accessibleName}"`;
@@ -129,12 +220,22 @@ test("the push chooser shows one concise selection summary", () => {
 
   assert.match(html, />Push review</);
   assert.match(html, /v3-sync-review-title/);
-  assert.match(html, /Push review<\/h2><span class="v3-sync-review-hint">Choose what to include<\/span>/);
-  assert.match(html, />Recommended \(1\)</);
+  assert.doesNotMatch(html, /Choose what to include/);
+  assert.match(html, /aria-label="Use recommended selection \(1\)"/);
+  assert.match(html, /aria-label="Clear current selection"/);
+  assert.match(html, /aria-label="Close push review"/);
+  const recommendedAction = html.indexOf('aria-label="Use recommended selection (1)"');
+  const clearAction = html.indexOf('aria-label="Clear current selection"');
+  const closeAction = html.indexOf('aria-label="Close push review"');
+  assert.ok(recommendedAction < clearAction && clearAction < closeAction);
   assert.match(html, />Review</);
   assert.match(html, /Back: Plugins/);
-  assert.match(html, />Push 1 resource</);
+  assert.match(html, /btn btn-secondary v3-sync-review-back/);
+  assert.match(html, />Push<\/button>/);
+  const footer = html.slice(html.indexOf('<footer class="v3-inline-action-footer v3-push-resource-footer'));
+  assert.doesNotMatch(footer, /\d+ included|Push \d+ resources?/);
   assert.doesNotMatch(html, /Choose resources to push/);
+  assert.doesNotMatch(html, /Selections are saved after Push succeeds/);
   assert.doesNotMatch(html, /last selection|selection will be remembered|resource selected/i);
 });
 

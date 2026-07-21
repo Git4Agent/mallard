@@ -12,6 +12,7 @@ interface Props {
   loadingOlder?: boolean;
   hasOlder?: boolean;
   error?: string | null;
+  scrollToBottomEpoch?: number;
   onTypeFiltersChange?: (value: ActivityLogType[]) => void;
   onLevelFilterChange?: (value: ActivityLogLevel | "all") => void;
   onSearchChange?: (value: string) => void;
@@ -66,6 +67,7 @@ export default function LogPanel({
   loadingOlder = false,
   hasOlder = false,
   error = null,
+  scrollToBottomEpoch = 0,
   onTypeFiltersChange,
   onLevelFilterChange,
   onSearchChange,
@@ -106,6 +108,31 @@ export default function LogPanel({
     const body = bodyRef.current;
     if (body) body.scrollTop = body.scrollHeight;
   }, [lines]);
+
+  useEffect(() => {
+    followTailRef.current = true;
+
+    const body = bodyRef.current;
+    if (!body) return;
+
+    const scrollToBottom = () => {
+      body.scrollTop = body.scrollHeight;
+    };
+    scrollToBottom();
+    const frame = window.requestAnimationFrame(scrollToBottom);
+    return () => window.cancelAnimationFrame(frame);
+  }, [scrollToBottomEpoch]);
+
+  useEffect(() => {
+    const body = bodyRef.current;
+    if (!body || typeof ResizeObserver === "undefined") return;
+
+    const observer = new ResizeObserver(() => {
+      if (followTailRef.current) body.scrollTop = body.scrollHeight;
+    });
+    observer.observe(body);
+    return () => observer.disconnect();
+  }, []);
 
   const handleScroll = () => {
     const body = bodyRef.current;

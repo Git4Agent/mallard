@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import LogPanel from "../../src/components/LogPanel";
@@ -53,4 +54,24 @@ test("log exposes retained-history pagination", () => {
   );
 
   assert.match(html, />Load older logs</);
+});
+
+test("Push and Pull open the activity log at its live tail", () => {
+  const logSource = readFileSync("src/components/LogPanel.tsx", "utf8");
+  const syncSource = readFileSync("src/components/project-sync/ProjectSyncV3.tsx", "utf8");
+  const pushHandler = syncSource.slice(
+    syncSource.indexOf("const publishProject = async"),
+    syncSource.indexOf("const publishPendingPush = async"),
+  );
+  const pullHandler = syncSource.slice(
+    syncSource.indexOf("const applyReview = async"),
+    syncSource.indexOf("const refreshRestore = async"),
+  );
+
+  assert.match(pushHandler, /openActivity\(\)/);
+  assert.match(pullHandler, /openActivity\(\)/);
+  assert.match(syncSource, /scrollToBottomEpoch=\{logScrollToBottomEpoch\}/);
+  assert.match(logSource, /followTailRef\.current = true/);
+  assert.match(logSource, /body\.scrollTop = body\.scrollHeight/);
+  assert.match(logSource, /new ResizeObserver/);
 });

@@ -158,9 +158,35 @@ test("an explicit Push scan presents new entries selected and locks both directo
   assert.match(html, /required directory/);
   assert.match(html, /3 entr(?:y|ies)/);
   assert.match(html, /2 ignored · 1 blocked/);
+  assert.doesNotMatch(html, /Exact entries selected|Scanning cannot prove/);
 });
 
-test("before Scan, Push has no pending ordinary files and explains the explicit opt-in", () => {
+test("Project file controls stay on the dedicated page", () => {
+  const selected = new Set(inventory.entries.map((candidate) => candidate.descriptor.resource_id));
+  const html = renderToStaticMarkup(
+    <PushResourceWorkspace
+      resources={inventory.entries.map((candidate) => candidate.descriptor)}
+      selected={selected}
+      projectDefaults={selected}
+      busy={false}
+      error={null}
+      projectContentInventory={inventory}
+      projectContentScanned
+      showProjectFiles
+      initialStep="review"
+      onToggle={() => undefined}
+      onUseProjectDefaults={() => undefined}
+      onClear={() => undefined}
+      onClose={() => undefined}
+      onPush={() => undefined}
+    />,
+  );
+
+  assert.match(html, />Project files</);
+  assert.doesNotMatch(html, /<strong>Project files<\/strong>|Rescan|Search files/);
+});
+
+test("before Scan, Push uses a compact optional-files action", () => {
   const html = renderToStaticMarkup(
     <PushResourceWorkspace
       resources={[]}
@@ -180,9 +206,28 @@ test("before Scan, Push has no pending ordinary files and explains the explicit 
       onScanProjectFiles={() => undefined}
     />,
   );
-  assert.match(html, /Scan project files/);
-  assert.match(html, /Nothing is uploaded until Push succeeds/);
+  assert.match(html, /Files outside Git/);
+  assert.match(html, /Scan files/);
+  assert.doesNotMatch(html, />Optional|Nothing is uploaded|New eligible files|Review them before continuing/);
   assert.doesNotMatch(html, /a\.md/);
+});
+
+test("an empty file review keeps only the action and state", () => {
+  const html = renderToStaticMarkup(
+    <ProjectFilesReviewPage
+      mode="push"
+      eligibility={{ state: "eligible", reason: "Not inside a Git work tree." }}
+      rows={[]}
+      selectedIds={new Set()}
+      onScan={() => undefined}
+      onToggle={() => undefined}
+    />,
+  );
+
+  assert.match(html, /Project files/);
+  assert.match(html, /Rescan/);
+  assert.match(html, /No changes/);
+  assert.doesNotMatch(html, /Search files|0 entries|0 selected|No eligible entries|Scanning cannot prove/);
 });
 
 const binding: ProjectBinding = {
@@ -267,8 +312,8 @@ test("Pull project content starts as keep-local and selecting a nested file requ
     />,
   );
   assert.match(html, /Plugins[\s\S]*Project files[\s\S]*Review/);
-  assert.match(html, /0 apply · 3 keep local/);
-  assert.match(html, /Keep 3 project entries local/);
+  assert.doesNotMatch(html, /<strong>Project files<\/strong>|0 apply · 3 keep local/);
+  assert.match(html, />Keep project entries local</);
 });
 
 test("confirming keep-local still submits an empty approved set so Pull can advance its base", async () => {

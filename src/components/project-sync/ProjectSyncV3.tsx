@@ -45,7 +45,9 @@ import ProjectLinksWorkspace from "./ProjectLinksWorkspace";
 import PushResourceWorkspace, {
   includeRequiredProjectContentDirectories,
   nextPushReviewStep,
+  preserveSyncedPushRecipeEntries,
   pushReviewBlockingCount,
+  recommendedPushSelection,
   sanitizePushSelection,
 } from "./PushResourceWorkspace";
 import ProjectSetupWorkspace, { type SetupCompletion } from "./ProjectSetupWorkspace";
@@ -71,7 +73,6 @@ import {
 interface Props {
   theme: AppTheme;
   onThemeChange: (theme: AppTheme) => void;
-  onOpenLegacy: () => void;
   onBusyChange: (busy: boolean) => void;
 }
 
@@ -210,7 +211,7 @@ function mergeLogLines(...groups: LogLine[][]): LogLine[] {
   ));
 }
 
-export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBusyChange }: Props) {
+export default function ProjectSyncV3({ theme, onThemeChange, onBusyChange }: Props) {
   const [config, setConfig] = useState<SyncConfigV3>(EMPTY_CONFIG);
   const [registrations, setRegistrations] = useState<LocalProjectRegistration[]>([]);
   const [repositoryKinds, setRepositoryKinds] = useState<Record<string, boolean>>({});
@@ -255,6 +256,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
   const [logLoadError, setLogLoadError] = useState<string | null>(null);
   const [logManagerOpen, setLogManagerOpen] = useState(false);
   const [activityOpen, setActivityOpen] = useState(false);
+  const [logScrollToBottomEpoch, setLogScrollToBottomEpoch] = useState(0);
   const [logHeight, setLogHeight] = useState(240);
   const [resizingLog, setResizingLog] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(storedSidebarWidth);
@@ -275,6 +277,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
   const [dependencyPlan, setDependencyPlan] = useState<DependencyPlan | null>(null);
   const [restoreResult, setRestoreResult] = useState<RestoreResult | null>(null);
   const [historyRefreshEpoch, setHistoryRefreshEpoch] = useState(0);
+  const [projectTabResetEpoch, setProjectTabResetEpoch] = useState(0);
   const [dependencyResult, setDependencyResult] = useState<DependencyResult | null>(null);
   const [restoreError, setRestoreError] = useState<string | null>(null);
   const [pullApplyPhase, setPullApplyPhase] = useState<PullApplyPhase>("idle");
@@ -394,6 +397,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
     activityOpenRef.current = true;
     setActivityOpen(true);
     setUnreadLogs(0);
+    setLogScrollToBottomEpoch((epoch) => epoch + 1);
     void loadActivityLogs();
   };
 
@@ -946,14 +950,8 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
           // A Git project without stored generic content keeps the normal four-step review.
         }
       }
-      const projectDefaults = sanitizePushSelection(
+      const projectDefaults = recommendedPushSelection(
         recipeSelection(nextInventory.recipe),
-        nextResources,
-        nextThreadComparison,
-        nextCapabilityReport,
-      );
-      const initialSelection = sanitizePushSelection(
-        savedRecipe ? recipeSelection(savedRecipe) : projectDefaults,
         nextResources,
         nextThreadComparison,
         nextCapabilityReport,
@@ -993,7 +991,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
         projectContentScanned: lockedProjectContentInventory !== null,
         showProjectFiles: !isGitRepository || lockedProjectContentInventory !== null,
       });
-      setPushSelected(initialSelection);
+      setPushSelected(new Set(projectDefaults));
       setActiveProjectId(projectId);
       setActiveStorageByProject((current) => ({ ...current, [projectId]: storageId }));
     } catch (reason) {
@@ -1091,6 +1089,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
       );
       setNotice(result.message);
       setHistoryRefreshEpoch((epoch) => epoch + 1);
+      setProjectTabResetEpoch((epoch) => epoch + 1);
       setPendingPush(null);
       setPushProjectContentRemovals(new Set());
       setPushWarningAcknowledgements(new Set());
@@ -1122,7 +1121,18 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
       pendingPush.capabilityReport,
       pendingPush.projectContentInventory,
     );
-    const recipe = recipeWithSelection(baseRecipe, resources, safeSelection);
+    const preservationRecipe: BundleRecipe = {
+      ...pendingPush.inventory.recipe,
+      entries: {
+        ...pendingPush.inventory.recipe.entries,
+        ...(pendingPush.savedRecipe?.entries ?? {}),
+      },
+    };
+    const recipe = preserveSyncedPushRecipeEntries(
+      recipeWithSelection(baseRecipe, resources, safeSelection),
+      preservationRecipe,
+      pendingPush.threadComparison,
+    );
     for (const resourceId of pushProjectContentRemovals) delete recipe.entries[resourceId];
     await publishProject(
       pendingPush.projectId,
@@ -1494,6 +1504,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
     });
     if (selection.restoreActionIds.length > 0) setRestoreResult(null);
     if (selection.dependencyActionIds.length > 0) setDependencyResult(null);
+    openActivity();
     setBusy(true);
     setRestoreError(null);
     try {
@@ -1504,6 +1515,16 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
         selection,
         setPullApplyPhase,
       );
+      const pullMutationCompleted = (
+        result.restoreResult !== null || result.dependencyResult !== null
+      ) && (
+        result.restoreResult?.success ?? true
+      ) && (
+        result.dependencyResult?.success ?? true
+      );
+      if (result.success || (!result.error && pullMutationCompleted)) {
+        setProjectTabResetEpoch((epoch) => epoch + 1);
+      }
       if (result.restoreResult) {
         setRestoreResult(result.restoreResult);
       }
@@ -1935,7 +1956,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
         }}
         onRemoveStorage={(storageId) => void removeStorage(storageId)}
         onAddStorage={openNewStorageConfiguration}
-        onOpenLegacy={onOpenLegacy}
       />
 
       <div
@@ -1976,7 +1996,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
             <Icon name="alert-triangle" size={15} />
             <span><strong>Project-sync backend unavailable.</strong> {backendError}</span>
             <button type="button" className="btn" onClick={() => void refresh()}>Retry</button>
-            <button type="button" className="btn btn-ghost" onClick={onOpenLegacy}>Open legacy</button>
           </div>
         )}
         {notice && (
@@ -2019,6 +2038,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
             onStorageEditorRequestHandled={() => setStorageEditorRequest(null)}
             onStorageEditorChange={setActiveStorageSettingsId}
             historyRefreshEpoch={historyRefreshEpoch}
+            projectTabResetEpoch={projectTabResetEpoch}
             inlineStorageReview={inlineStorageReview}
             newProjectSetup={setupDraftId ? (
               <ProjectSetupWorkspace
@@ -2059,6 +2079,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy, onBu
             loadingOlder={logLoadingOlder}
             hasOlder={!!logCursor}
             error={logLoadError}
+            scrollToBottomEpoch={logScrollToBottomEpoch}
             onTypeFiltersChange={setLogTypeFilters}
             onLevelFilterChange={setLogLevelFilter}
             onSearchChange={setLogSearchInput}

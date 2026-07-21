@@ -25,11 +25,16 @@ const MAX_SUMMARY_CHARS: usize = 180;
 const ACTIVE_WINDOW_SECS: u64 = 5 * 60;
 const AFTER_SESSION_WINDOW_SECS: u64 = 24 * 60 * 60;
 const MAX_LINE_BYTES: usize = 1024 * 1024;
+const MAX_ROLLOUT_IDENTITY_RECORDS: usize = 16;
 const DEFAULT_HISTORY_WINDOW_DAYS: u64 = 30;
 const DAY_SECS: u64 = 24 * 60 * 60;
 const CHAT_CACHE_SCHEMA: u32 = 3;
 const MAX_CHAT_CACHE_BYTES: u64 = 32 * 1024 * 1024;
 const MAX_CHAT_CACHE_ENTRIES: usize = 50_000;
+#[cfg(target_os = "macos")]
+const CODEX_PROJECT_ROUTE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+#[cfg(target_os = "macos")]
+const CODEX_PROJECT_ROUTE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CodexThreadSummary {
@@ -152,6 +157,19 @@ struct ParsedRollout {
     is_internal_subagent: bool,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+struct RolloutIdentity {
+    cwd: PathBuf,
+    is_internal_subagent: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct RolloutIdentityCacheEntry {
+    size: u64,
+    modified_nanos: u64,
+    identity: RolloutIdentity,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 struct RolloutCacheEntry {
     size: u64,
@@ -164,6 +182,8 @@ struct ChatHistoryCache {
     schema: u32,
     #[serde(default)]
     entries: BTreeMap<String, RolloutCacheEntry>,
+    #[serde(default)]
+    ownership: BTreeMap<String, RolloutIdentityCacheEntry>,
 }
 
 impl Default for ChatHistoryCache {
@@ -171,6 +191,7 @@ impl Default for ChatHistoryCache {
         Self {
             schema: CHAT_CACHE_SCHEMA,
             entries: BTreeMap::new(),
+            ownership: BTreeMap::new(),
         }
     }
 }
@@ -449,10 +470,15 @@ pub fn open_codex_thread_in_app(
     repository: &V3Repository,
     local_project_id: &LocalProjectId,
     thread_id: &str,
-    before_launch: impl FnOnce(&str),
+    before_launch: impl FnMut(&str),
 ) -> Result<(), String> {
     let resolved = resolve_owned_thread(repository, local_project_id, thread_id)?;
-    launch_codex_app(thread_id, &resolved.codex_home, before_launch)
+    launch_codex_app(
+        thread_id,
+        &resolved.project_root,
+        &resolved.codex_home,
+        before_launch,
+    )
 }
 
 /// Fast launch guard used by the desktop deep-link action. It deliberately
@@ -651,6 +677,52 @@ fn scan_codex_threads(
             let cache_key = format!("{}\u{0}{}", codex_home.display(), entry.path().display());
             seen_cache_keys.insert(cache_key.clone());
             let modified_nanos = modified_nanos(&metadata).unwrap_or(0);
+            let cached_identity = cache
+                .ownership
+                .get(&cache_key)
+                .filter(|cached| {
+                    cached.size == metadata.len() && cached.modified_nanos == modified_nanos
+                })
+                .map(|cached| cached.identity.clone())
+                .or_else(|| {
+                    cache
+                        .entries
+                        .get(&cache_key)
+                        .filter(|cached| {
+                            cached.size == metadata.len() && cached.modified_nanos == modified_nanos
+                        })
+                        .map(|cached| RolloutIdentity {
+                            cwd: cached.parsed.cwd.clone(),
+                            is_internal_subagent: cached.parsed.is_internal_subagent,
+                        })
+                });
+            let belongs_to_project = match cached_identity {
+                Some(identity) => {
+                    !identity.is_internal_subagent
+                        && cwd_belongs_to_project(&identity.cwd, project_root)
+                }
+                None => match read_rollout_identity(entry.path()) {
+                    Ok(Some(identity)) => {
+                        let belongs = !identity.is_internal_subagent
+                            && cwd_belongs_to_project(&identity.cwd, project_root);
+                        cache.ownership.insert(
+                            cache_key.clone(),
+                            RolloutIdentityCacheEntry {
+                                size: metadata.len(),
+                                modified_nanos,
+                                identity,
+                            },
+                        );
+                        belongs
+                    }
+                    // Legacy or malformed rollouts still go through the full parser so the
+                    // existing compatibility and warning behavior remains intact.
+                    Ok(None) | Err(_) => true,
+                },
+            };
+            if !belongs_to_project {
+                continue;
+            }
             let parsed = if !force_revalidate {
                 cache.entries.get(&cache_key).and_then(|cached| {
                     cached_rollout(
@@ -670,6 +742,17 @@ fn scan_codex_threads(
                 Some(parsed) => parsed,
                 None => match parse_rollout_file(entry.path(), fallback_time, warnings) {
                     Ok(parsed) => {
+                        cache.ownership.insert(
+                            cache_key.clone(),
+                            RolloutIdentityCacheEntry {
+                                size: metadata.len(),
+                                modified_nanos,
+                                identity: RolloutIdentity {
+                                    cwd: parsed.cwd.clone(),
+                                    is_internal_subagent: parsed.is_internal_subagent,
+                                },
+                            },
+                        );
                         cache.entries.insert(
                             cache_key,
                             RolloutCacheEntry {
@@ -730,7 +813,12 @@ fn scan_codex_threads(
     cache
         .entries
         .retain(|key, _| !key.starts_with(&profile_cache_prefix) || seen_cache_keys.contains(key));
-    if cache.entries.len() > MAX_CHAT_CACHE_ENTRIES {
+    cache
+        .ownership
+        .retain(|key, _| !key.starts_with(&profile_cache_prefix) || seen_cache_keys.contains(key));
+    if cache.entries.len() > MAX_CHAT_CACHE_ENTRIES
+        || cache.ownership.len() > MAX_CHAT_CACHE_ENTRIES
+    {
         warnings.push(format!(
             "Local chat history cache exceeded {MAX_CHAT_CACHE_ENTRIES} entries and was reset"
         ));
@@ -763,7 +851,8 @@ fn load_chat_history_cache(
     match read_json_bounded::<ChatHistoryCache>(root, path, MAX_CHAT_CACHE_BYTES) {
         Ok(Some(cache))
             if cache.schema == CHAT_CACHE_SCHEMA
-                && cache.entries.len() <= MAX_CHAT_CACHE_ENTRIES =>
+                && cache.entries.len() <= MAX_CHAT_CACHE_ENTRIES
+                && cache.ownership.len() <= MAX_CHAT_CACHE_ENTRIES =>
         {
             cache
         }
@@ -937,6 +1026,63 @@ fn parse_rollout_file(
     parser.finish()
 }
 
+/// Read only the small rollout prefix needed to determine project ownership.
+/// Codex writes `session_meta` at the start of a rollout; the bounded fallback
+/// keeps an unexpected legacy file from turning this probe into another full
+/// transcript scan.
+fn read_rollout_identity(path: &Path) -> Result<Option<RolloutIdentity>, String> {
+    let file = File::open(path).map_err(|error| format!("open '{}': {error}", path.display()))?;
+    let mut reader = BufReader::new(file);
+    let mut bytes = Vec::new();
+    for _ in 0..MAX_ROLLOUT_IDENTITY_RECORDS {
+        match read_bounded_line(&mut reader, &mut bytes, MAX_LINE_BYTES)
+            .map_err(|error| format!("read '{}': {error}", path.display()))?
+        {
+            BoundedLine::Eof => return Ok(None),
+            BoundedLine::Oversized => continue,
+            BoundedLine::Line => {}
+        }
+        if bytes.is_empty() {
+            continue;
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if let Some(identity) = rollout_identity_from_value(&value) {
+            return Ok(Some(identity));
+        }
+    }
+    Ok(None)
+}
+
+fn rollout_identity_from_value(value: &Value) -> Option<RolloutIdentity> {
+    let payload = value.get("payload").unwrap_or(value);
+    let event_type = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let payload_type = payload
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if event_type != "session_meta" && payload_type != "session_meta" {
+        return None;
+    }
+    let cwd = string_alias(payload, &["cwd", "working_directory", "project_path"])?;
+    Some(RolloutIdentity {
+        cwd: PathBuf::from(cwd),
+        is_internal_subagent: session_meta_is_internal_subagent(payload),
+    })
+}
+
+fn session_meta_is_internal_subagent(payload: &Value) -> bool {
+    payload.get("thread_source").and_then(Value::as_str) == Some("subagent")
+        || payload
+            .get("source")
+            .and_then(|source| source.get("subagent"))
+            .is_some()
+}
+
 struct RolloutParser {
     fallback_time: u64,
     thread_id: Option<String>,
@@ -996,12 +1142,7 @@ impl RolloutParser {
             self.last_timestamp = Some(timestamp);
         }
         if event_type == "session_meta" || payload_type == "session_meta" {
-            self.is_internal_subagent |= payload.get("thread_source").and_then(Value::as_str)
-                == Some("subagent")
-                || payload
-                    .get("source")
-                    .and_then(|source| source.get("subagent"))
-                    .is_some();
+            self.is_internal_subagent |= session_meta_is_internal_subagent(payload);
             if self.thread_id.is_none() {
                 self.thread_id = string_alias(payload, &["id", "thread_id", "session_id"])
                     .map(ToOwned::to_owned);
@@ -1903,38 +2044,74 @@ fn launch_terminal_resume(
 
 fn launch_codex_app(
     thread_id: &str,
+    project_root: &Path,
     codex_home: &Path,
-    before_launch: impl FnOnce(&str),
+    mut before_launch: impl FnMut(&str),
 ) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let command = codex_app_command(thread_id, codex_home)?;
-        before_launch(&command);
-        let environment = format!("CODEX_HOME={}", codex_home.to_string_lossy());
-        let uri = format!("codex://threads/{thread_id}");
-        let output = Command::new("/usr/bin/open")
-            .args([
-                "-n",
-                "-a",
-                "/Applications/ChatGPT.app",
-                "--env",
-                &environment,
-                &uri,
-            ])
-            .output()
-            .map_err(|error| format!("open the Codex desktop app: {error}"))?;
-        if !output.status.success() {
-            return Err(format!(
-                "Codex desktop app could not open the thread: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
-        }
+        let deep_links = codex_app_deep_links(thread_id, project_root, codex_home)?;
+        let commands = deep_links
+            .each_ref()
+            .map(|deep_link| codex_app_open_command(codex_home, deep_link));
+
+        // Existing-thread deep links ignore a workspace path. Send a dedicated
+        // new-thread route first, then wait for that profile to persist the
+        // project selection before replacing the composer with the target thread.
+        let state_path = codex_home.join(".codex-global-state.json");
+        let initial_state = file_stamp(&state_path);
+        before_launch(&commands[0]);
+        run_codex_app_deep_link(codex_home, &deep_links[0], "project")?;
+        wait_for_file_change(&state_path, initial_state);
+
+        before_launch(&commands[1]);
+        run_codex_app_deep_link(codex_home, &deep_links[1], "thread")?;
         Ok(())
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (thread_id, codex_home, before_launch);
+        let _ = (thread_id, project_root, codex_home, before_launch);
         Err("Open in Codex is currently supported only on macOS".to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn run_codex_app_deep_link(codex_home: &Path, deep_link: &str, target: &str) -> Result<(), String> {
+    let environment = format!("CODEX_HOME={}", codex_home.to_string_lossy());
+    let output = Command::new("/usr/bin/open")
+        .args([
+            "-n",
+            "-a",
+            "/Applications/ChatGPT.app",
+            "--env",
+            &environment,
+            deep_link,
+        ])
+        .output()
+        .map_err(|error| format!("open the Codex desktop app {target}: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Codex desktop app could not open the {target}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn file_stamp(path: &Path) -> Option<(u64, SystemTime)> {
+    let metadata = fs::metadata(path).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_file_change(path: &Path, initial: Option<(u64, SystemTime)>) {
+    let started = std::time::Instant::now();
+    while started.elapsed() < CODEX_PROJECT_ROUTE_TIMEOUT {
+        if file_stamp(path) != initial {
+            return;
+        }
+        std::thread::sleep(CODEX_PROJECT_ROUTE_POLL_INTERVAL);
     }
 }
 
@@ -1987,16 +2164,56 @@ fn terminal_resume_command(
     ))
 }
 
-fn codex_app_command(thread_id: &str, codex_home: &Path) -> Result<String, String> {
+fn codex_app_deep_links(
+    thread_id: &str,
+    project_root: &Path,
+    codex_home: &Path,
+) -> Result<[String; 2], String> {
     validate_thread_uuid(thread_id)?;
-    if !codex_home.is_absolute() {
-        return Err("Codex home must be absolute".to_string());
+    if !project_root.is_absolute() || !codex_home.is_absolute() {
+        return Err("Project root and Codex home must be absolute".to_string());
     }
-    Ok(format!(
+    Ok([
+        format!(
+            "codex://threads/new?path={}",
+            percent_encode_uri_component(&project_root.to_string_lossy())
+        ),
+        format!("codex://threads/{thread_id}"),
+    ])
+}
+
+fn codex_app_open_command(codex_home: &Path, deep_link: &str) -> String {
+    format!(
         "'/usr/bin/open' -n -a '/Applications/ChatGPT.app' --env {} {}",
         shell_quote(&format!("CODEX_HOME={}", codex_home.to_string_lossy())),
-        shell_quote(&format!("codex://threads/{thread_id}"))
-    ))
+        shell_quote(deep_link)
+    )
+}
+
+#[cfg(test)]
+fn codex_app_commands(
+    thread_id: &str,
+    project_root: &Path,
+    codex_home: &Path,
+) -> Result<[String; 2], String> {
+    Ok(codex_app_deep_links(thread_id, project_root, codex_home)?
+        .each_ref()
+        .map(|deep_link| codex_app_open_command(codex_home, deep_link)))
+}
+
+fn percent_encode_uri_component(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[(byte >> 4) as usize]));
+            encoded.push(char::from(HEX[(byte & 0x0f) as usize]));
+        }
+    }
+    encoded
 }
 
 fn validate_thread_uuid(value: &str) -> Result<(), String> {
@@ -2315,6 +2532,73 @@ mod tests {
         let parsed = parse_rollout_lines(lines.iter().map(String::as_str), 99).unwrap();
 
         assert!(!rollout_is_user_visible(&parsed));
+    }
+
+    #[test]
+    fn project_scan_only_fully_parses_owned_rollouts() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("selected-project");
+        let other_root = temp.path().join("other-project");
+        let codex_home = temp.path().join("codex-home");
+        let sessions = codex_home.join("sessions/2026/07/21");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&other_root).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let other_root = fs::canonicalize(other_root).unwrap();
+
+        fs::write(
+            sessions.join("owned.jsonl"),
+            format!(
+                "{}\n{}\n",
+                json!({
+                    "timestamp": 100,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "019f742a-a206-7932-876c-9db8d8ce575a",
+                        "cwd": project_root
+                    }
+                }),
+                json!({
+                    "timestamp": 101,
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "Owned thread"}
+                })
+            ),
+        )
+        .unwrap();
+        fs::write(
+            sessions.join("other.jsonl"),
+            format!(
+                "{}\nthis trailing record is deliberately malformed\n",
+                json!({
+                    "timestamp": 200,
+                    "type": "session_meta",
+                    "payload": {
+                        "id": "019f742a-a206-7932-876c-9db8d8ce575b",
+                        "cwd": other_root
+                    }
+                })
+            ),
+        )
+        .unwrap();
+
+        let repository = V3Repository::from_home_dir(temp.path().join("home")).unwrap();
+        let mut warnings = Vec::new();
+        let threads =
+            scan_codex_threads(&repository, &codex_home, &project_root, true, &mut warnings)
+                .unwrap();
+
+        assert_eq!(threads.len(), 1);
+        assert_eq!(threads[0].thread_id, "019f742a-a206-7932-876c-9db8d8ce575a");
+        assert!(warnings.is_empty());
+        let cache = load_chat_history_cache(
+            repository.root(),
+            &repository.root().join("chat_history_cache.json"),
+            &mut warnings,
+        );
+        assert_eq!(cache.entries.len(), 1);
+        assert_eq!(cache.ownership.len(), 2);
     }
 
     #[test]
@@ -2886,16 +3170,26 @@ mod tests {
     }
 
     #[test]
-    fn app_command_pins_codex_home_and_selected_thread() {
-        let command = codex_app_command(
+    fn app_commands_open_project_then_thread_in_pinned_codex_home() {
+        let commands = codex_app_commands(
             "019f742a-a206-7932-876c-9db8d8ce575a",
+            Path::new("/tmp/client's project"),
             Path::new("/tmp/client's config/.codex"),
         )
         .unwrap();
         assert_eq!(
-            command,
-            "'/usr/bin/open' -n -a '/Applications/ChatGPT.app' --env 'CODEX_HOME=/tmp/client'\"'\"'s config/.codex' 'codex://threads/019f742a-a206-7932-876c-9db8d8ce575a'"
+            commands,
+            [
+                "'/usr/bin/open' -n -a '/Applications/ChatGPT.app' --env 'CODEX_HOME=/tmp/client'\"'\"'s config/.codex' 'codex://threads/new?path=%2Ftmp%2Fclient%27s%20project'".to_string(),
+                "'/usr/bin/open' -n -a '/Applications/ChatGPT.app' --env 'CODEX_HOME=/tmp/client'\"'\"'s config/.codex' 'codex://threads/019f742a-a206-7932-876c-9db8d8ce575a'".to_string(),
+            ]
         );
+        assert!(codex_app_commands(
+            "019f742a-a206-7932-876c-9db8d8ce575a",
+            Path::new("relative-project"),
+            Path::new("/tmp/.codex"),
+        )
+        .is_err());
     }
 
     fn git(root: &Path, args: &[&str]) {

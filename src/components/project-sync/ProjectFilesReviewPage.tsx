@@ -155,8 +155,6 @@ export default function ProjectFilesReviewPage({
     }).slice(0, MAX_RENDERED_ROWS);
   }, [directoryPaths, expandedDirectories, normalizedSearch, rows]);
   const selectedRows = rows.filter((row) => selectedIds.has(row.resourceId) && !removalIds.has(row.resourceId));
-  const selectedFiles = selectedRows.filter((row) => row.entryType === "file").length;
-  const selectedDirectories = selectedRows.filter((row) => row.entryType === "directory").length;
   const keptLocal = mode === "pull" ? rows.length - selectedRows.length : 0;
 
   const toggleDirectory = (row: ProjectFileReviewRow) => {
@@ -185,18 +183,16 @@ export default function ProjectFilesReviewPage({
   if (!scanned && mode === "push") {
     return (
       <section className="v3-project-files-page v3-project-files-unscanned" aria-labelledby="v3-project-files-title">
-        <div className="v3-project-files-hero">
-          <span><Icon name="folder" size={22} /></span>
-          <div>
-            <h3 id="v3-project-files-title">Optional project files</h3>
-            <p>Scan this non-Git folder to choose exact files and folders. Nothing is uploaded until Push succeeds.</p>
-            <small>New eligible files and folders found by Scan are selected for this Push. Review them before continuing.</small>
+        <div className="v3-project-files-empty">
+          <span className="v3-project-files-empty-icon" aria-hidden="true"><Icon name="folder" size={17} /></span>
+          <div className="v3-project-files-empty-copy">
+            <h3 id="v3-project-files-title">Files outside Git</h3>
           </div>
+          <button type="button" className="btn btn-primary" onClick={onScan} disabled={disabled || loading || !eligible}>
+            <Icon name={loading ? "refresh" : "folder"} size={14} className={loading ? "icon-spin" : undefined} />
+            {loading ? "Scanning…" : "Scan files"}
+          </button>
         </div>
-        <button type="button" className="btn btn-primary" onClick={onScan} disabled={disabled || loading || !eligible}>
-          <Icon name={loading ? "refresh" : "folder"} size={15} className={loading ? "icon-spin" : undefined} />
-          {loading ? "Scanning…" : "Scan project files"}
-        </button>
         {!eligible && (
           <div className="v3-callout error" role="alert"><Icon name="lock" size={15} /> <span><strong>Project files are locked.</strong>{eligibility.reason}</span></div>
         )}
@@ -207,9 +203,18 @@ export default function ProjectFilesReviewPage({
   return (
     <section className="v3-project-files-page" aria-labelledby="v3-project-files-title">
       <div className="v3-project-files-toolbar">
-        <div>
+        <div className="v3-project-files-heading">
           <h3 id="v3-project-files-title">Project files</h3>
-          <p>{mode === "push" ? "Exact entries selected for this Push" : "Choose storage entries to apply; unchecked entries stay local"}</p>
+          {eligible && mode === "push" && (
+            <span
+              className="v3-project-files-note"
+              role="img"
+              aria-label="Review paths and warnings before Push; scanning cannot detect every secret."
+              title="Review paths and warnings before Push; scanning cannot detect every secret."
+            >
+              <Icon name="info" size={13} />
+            </span>
+          )}
         </div>
         {mode === "push" && onScan && (
           <button type="button" className="btn btn-ghost" onClick={onScan} disabled={disabled || loading || !eligible}>
@@ -230,23 +235,21 @@ export default function ProjectFilesReviewPage({
         </div>
       )}
 
-      {eligible && mode === "push" && (
-        <div className="v3-callout"><Icon name="info" size={15} /> Scanning cannot prove that a file is secret-free. Review warnings and paths before Push.</div>
+      {rows.length > 0 && (
+        <div className="v3-project-files-search">
+          <input
+            type="search"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Search files…"
+            aria-label="Search project file paths"
+          />
+          <span>{rows.length} entr{rows.length === 1 ? "y" : "ies"}</span>
+        </div>
       )}
 
-      <div className="v3-project-files-search">
-        <input
-          type="search"
-          value={search}
-          onChange={(event) => setSearch(event.target.value)}
-          placeholder="Search paths…"
-          aria-label="Search project file paths"
-        />
-        <span>{rows.length} entr{rows.length === 1 ? "y" : "ies"}</span>
-      </div>
-
       {rows.length === 0 ? (
-        <div className="v3-pull-empty"><Icon name="check-circle" size={16} /><span><strong>No project-file changes</strong><small>{mode === "push" ? "No eligible entries were found." : "Storage has no project-file actions for this generation."}</small></span></div>
+        <div className="v3-pull-empty"><Icon name="check-circle" size={16} /><span><strong>No changes</strong></span></div>
       ) : (
         <div className="v3-project-file-tree" role="tree" aria-label="Project files">
           {shownRows.map((row) => {
@@ -292,7 +295,7 @@ export default function ProjectFilesReviewPage({
                     <small>{displayState(row, mode)}{required ? " · required directory" : ""}{childCount > 0 ? ` · ${childCount} descendant${childCount === 1 ? "" : "s"}` : ""}</small>
                   </button>
                   {formatBytes(row.size) && <span className="v3-project-file-size">{formatBytes(row.size)}</span>}
-                  {row.warningCode && <span className="v3-project-file-warning"><Icon name="alert-triangle" size={13} /> Sensitive warning</span>}
+                  {row.warningCode && <span className="v3-project-file-warning"><Icon name="alert-triangle" size={13} /> Warning</span>}
                   {mode === "push" && row.storagePresent && onToggleRemoval && (
                     <button type="button" className={`btn btn-ghost v3-project-file-remove${removed ? " active" : ""}`} disabled={disabled || !eligible || required} onClick={() => onToggleRemoval(row.resourceId)}>
                       {removed ? "Keep in storage" : "Remove from storage"}
@@ -311,17 +314,17 @@ export default function ProjectFilesReviewPage({
                 {row.warningDigest && onToggleWarning && (
                   <label className="v3-project-file-ack">
                     <input type="checkbox" checked={warningAcknowledged} disabled={disabled || !selected} onChange={() => onToggleWarning(row.warningDigest!)} />
-                    I reviewed the warning for this exact file version.
+                    Reviewed this warning.
                   </label>
                 )}
                 {mode === "push" && STORAGE_BLOCKING_STATES.has(row.state) && onReviewPull && (
-                  <div className="v3-project-file-conflict"><span>Review the storage version before Push.</span><button type="button" className="btn btn-ghost" onClick={onReviewPull}>Review Pull</button></div>
+                  <div className="v3-project-file-conflict"><span>Pull required</span><button type="button" className="btn btn-ghost" onClick={onReviewPull}>Review Pull</button></div>
                 )}
               </div>
             );
           })}
           {shownRows.length >= MAX_RENDERED_ROWS && rows.length > shownRows.length && (
-            <div className="v3-project-file-limit">Showing the first {MAX_RENDERED_ROWS} visible entries. Narrow the path search or collapse folders.</div>
+            <div className="v3-project-file-limit">First {MAX_RENDERED_ROWS} shown. Search or collapse folders.</div>
           )}
         </div>
       )}
@@ -333,11 +336,13 @@ export default function ProjectFilesReviewPage({
         </details>
       )}
 
-      <div className="v3-project-files-counts">
-        <strong>{selectedFiles} file{selectedFiles === 1 ? "" : "s"} · {selectedDirectories} director{selectedDirectories === 1 ? "y" : "ies"} {mode === "push" ? "included" : "selected"}</strong>
-        {mode === "pull" && <small>{keptLocal} entr{keptLocal === 1 ? "y" : "ies"} will stay local</small>}
-        {mode === "push" && removalIds.size > 0 && <small>{removalIds.size} confirmed storage removal{removalIds.size === 1 ? "" : "s"}</small>}
-      </div>
+      {rows.length > 0 && (
+        <div className="v3-project-files-counts" aria-label={`${selectedRows.length} entries selected`}>
+          <strong>{selectedRows.length} selected</strong>
+          {mode === "pull" && keptLocal > 0 && <small>{keptLocal} local</small>}
+          {mode === "push" && removalIds.size > 0 && <small>{removalIds.size} removal{removalIds.size === 1 ? "" : "s"}</small>}
+        </div>
+      )}
     </section>
   );
 }

@@ -79,12 +79,14 @@ interface Props {
   onStorageEditorChange?: (storageId: string | null) => void;
   newProjectSetup?: ReactNode;
   historyRefreshEpoch?: number;
+  projectTabResetEpoch?: number;
   inlineStorageReview?: InlineStorageReview | null;
 }
 
 function storageSubtitle(storage: StorageConfigV3): string {
   if (storage.kind === "local") return compactProjectPath(storage.local_dir || "Folder not configured");
-  return storage.bucket || storage.s3_endpoint || "S3 storage not configured";
+  if (storage.bucket) return `Bucket · ${storage.bucket}`;
+  return storage.s3_endpoint ? "S3 endpoint configured" : "S3 storage not configured";
 }
 
 export function ProjectWorkspaceTabs({
@@ -286,6 +288,7 @@ export default function ProjectLinksWorkspace({
   onStorageEditorChange,
   newProjectSetup,
   historyRefreshEpoch = 0,
+  projectTabResetEpoch = 0,
   inlineStorageReview,
 }: Props) {
   const [linkingProjectId, setLinkingProjectId] = useState<string | null>(null);
@@ -319,6 +322,10 @@ export default function ProjectLinksWorkspace({
   useEffect(() => {
     setStoragePickerProjectId(null);
   }, [activeProjectId]);
+
+  useEffect(() => {
+    setActiveProjectTab("history");
+  }, [projectTabResetEpoch]);
 
   useEffect(() => {
     if (!inlineStorageReview) return;
@@ -904,7 +911,6 @@ export default function ProjectLinksWorkspace({
                           <div className="storage-link-row">
                             <div className="storage-link-storage-section">
                               <div ref={storagePickerRef} className="storage-link-main">
-                                <span className="storage-link-selector active" aria-hidden="true"><span /></span>
                                 <span className="storage-link-icon">
                                   <Icon name={storage.kind === "local" ? "drive" : "cloud"} size={23} />
                                 </span>
@@ -999,7 +1005,10 @@ export default function ProjectLinksWorkspace({
                                   </div>
                                 )}
                               </div>
-                              <div className="storage-link-row-controls">
+                            </div>
+
+                            <div className="storage-link-actions">
+                              <div className="storage-link-row-controls" role="group" aria-label="Storage settings">
                                 <button
                                   type="button"
                                   className={`storage-link-configure${editingStorage?.storageId === storage.id ? " active" : ""}`}
@@ -1022,17 +1031,18 @@ export default function ProjectLinksWorkspace({
                                   title={`Unlink ${storage.name || "storage"} from this project`}
                                   aria-label={`Unlink ${storage.name || "storage"} from ${projectLabel(project)}`}
                                 >
-                                  <Icon name="x" size={13} />
-                                  {runningAction === `unlink:${actionPrefix}` ? "Unlinking…" : "Unlink"}
+                                  <Icon
+                                    name={runningAction === `unlink:${actionPrefix}` ? "refresh" : "x"}
+                                    size={14}
+                                    className={runningAction === `unlink:${actionPrefix}` ? "icon-spin" : undefined}
+                                  />
                                 </button>
                               </div>
-                            </div>
 
-                            <div className="storage-link-actions">
-                              <div className="storage-link-action-group" role="group" aria-label="Project storage actions">
+                              <div className="storage-link-action-group" role="group" aria-label="Sync actions">
                                 <button
                                   type="button"
-                                  className={`storage-link-sync storage-link-sync-primary${pullReviewOpen ? " active" : ""}`}
+                                  className={`storage-link-sync storage-link-sync-secondary${pullReviewOpen ? " active" : ""}`}
                                   disabled={busy
                                     || !!runningAction
                                     || conversationPathBlocked
@@ -1073,7 +1083,7 @@ export default function ProjectLinksWorkspace({
                                 </button>
                                 <button
                                   type="button"
-                                  className={`storage-link-sync${pushReviewOpen ? " active" : ""}`}
+                                  className={`storage-link-sync storage-link-sync-commit${pushReviewOpen ? " active" : ""}`}
                                   disabled={busy
                                     || !!runningAction
                                     || conversationPathBlocked

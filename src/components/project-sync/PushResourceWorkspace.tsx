@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import type {
+  BundleRecipe,
   CapabilityStatusReport,
   LocalProjectSummary,
   ProjectBinding,
@@ -15,7 +16,6 @@ import SkillsPluginStatusPage from "./SkillsPluginStatusPage";
 import SyncReviewTabs, {
   type SyncReviewStep,
   syncReviewSteps,
-  useSyncReviewScroll,
 } from "./SyncReviewTabs";
 import { categoryFor } from "./model";
 
@@ -212,6 +212,71 @@ export function sanitizePushSelection(
   return new Set([...selected].filter((resourceId) => selectableIds.has(resourceId)));
 }
 
+const RECOMMENDED_PUSH_THREAD_STATES = new Set(["local_only", "local_ahead"]);
+
+export function recommendedPushSelection(
+  selected: ReadonlySet<string>,
+  resources: ProjectResourceDescriptor[],
+  threadComparison?: ThreadSyncComparison | null,
+  capabilityReport?: CapabilityStatusReport | null,
+  projectContentInventory?: ProjectContentInventory | null,
+): Set<string> {
+  const selectableIds = pushSelectableResourceIds(
+    resources,
+    threadComparison,
+    capabilityReport,
+    projectContentInventory,
+  );
+  const recommended = new Set([...selected].filter((resourceId) => selectableIds.has(resourceId)));
+  if (!threadComparison) return recommended;
+
+  const comparisonByResourceId = new Map(threadComparison.entries.map((entry) => [entry.resource_id, entry]));
+  const conversations = resources.filter((resource) => categoryFor(resource) === "conversations");
+  const sessionIndex = conversations.find((resource) => resource.resource_id === "codex:session-index") ?? null;
+
+  for (const resource of conversations) {
+    if (resource.resource_id === sessionIndex?.resource_id) continue;
+    const comparison = comparisonByResourceId.get(resource.resource_id);
+    if (!comparison) continue;
+    if (RECOMMENDED_PUSH_THREAD_STATES.has(comparison.state) && selectableIds.has(resource.resource_id)) {
+      recommended.add(resource.resource_id);
+    } else {
+      recommended.delete(resource.resource_id);
+    }
+  }
+
+  if (sessionIndex) {
+    const hasSelectedSession = conversations.some((resource) => (
+      resource.resource_id !== sessionIndex.resource_id && recommended.has(resource.resource_id)
+    ));
+    if (hasSelectedSession && selectableIds.has(sessionIndex.resource_id)) {
+      recommended.add(sessionIndex.resource_id);
+    } else {
+      recommended.delete(sessionIndex.resource_id);
+    }
+  }
+
+  return recommended;
+}
+
+export function preserveSyncedPushRecipeEntries(
+  recipe: BundleRecipe,
+  sourceRecipe: BundleRecipe,
+  threadComparison?: ThreadSyncComparison | null,
+): BundleRecipe {
+  const syncedResourceIds = new Set((threadComparison?.entries ?? [])
+    .filter((entry) => entry.state === "synced")
+    .map((entry) => entry.resource_id));
+  if (syncedResourceIds.size === 0) return recipe;
+
+  const entries = { ...recipe.entries };
+  for (const resourceId of [...syncedResourceIds, "codex:session-index"]) {
+    const sourceEntry = sourceRecipe.entries[resourceId];
+    if (sourceEntry) entries[resourceId] = sourceEntry;
+  }
+  return { ...recipe, entries };
+}
+
 export function requiredProjectContentDirectoryIds(
   inventory: ProjectContentInventory | null | undefined,
   selected: ReadonlySet<string>,
@@ -277,7 +342,6 @@ export default function PushResourceWorkspace({
   const [uncontrolledActiveStep, setUncontrolledActiveStep] = useState<SyncReviewStep>(initialStep);
   const requestedActiveStep = controlledActiveStep ?? uncontrolledActiveStep;
   const activeStep = steps.includes(requestedActiveStep) ? requestedActiveStep : "review";
-  const { scrollRef, rememberScrollPosition } = useSyncReviewScroll(activeStep);
   const selectStep = (step: SyncReviewStep) => {
     if (controlledActiveStep === undefined) setUncontrolledActiveStep(step);
     onStepChange?.(step);
@@ -462,37 +526,46 @@ export default function PushResourceWorkspace({
     : currentGroup.every((resource) => (
       effectiveSelected.has(resource.resource_id) === safeProjectDefaults.has(resource.resource_id)
     ));
+  const recommendedCount = activeStep === "review" ? safeProjectDefaults.size : currentDefaults.length;
 
   return (
     <section className="v3-inline-action-review v3-inline-push-review v3-sync-review-workspace" aria-labelledby="v3-push-resource-title">
       <header className="v3-inline-action-header v3-push-resource-header v3-sync-review-header">
         <div className="v3-sync-review-title">
           <h2 id="v3-push-resource-title">Push review</h2>
-          <span className="v3-sync-review-hint">Choose what to include</span>
         </div>
         <div className="v3-push-resource-actions">
           <button
             type="button"
-            className="btn btn-ghost"
+            className="btn btn-ghost v3-sync-review-icon-action has-count"
             onClick={useRecommendedForStep}
             disabled={busy || safeProjectDefaults.size === 0 || currentMatchesDefaults}
             title={`Use the recommended ${activeStep === "review" ? "selection" : `${activeStep} selection`}`}
+            aria-label={`Use recommended selection (${recommendedCount})`}
           >
-            Recommended{activeStep === "review" ? ` (${safeProjectDefaults.size})` : ` (${currentDefaults.length})`}
+            <Icon name="check-circle" size={15} />
+            <span aria-hidden="true">{recommendedCount}</span>
           </button>
-          <button type="button" className="btn btn-ghost" onClick={clearStep} disabled={busy || countSelected(currentGroup, effectiveSelected) === 0}>
-            Clear
+          <button
+            type="button"
+            className="btn btn-ghost v3-sync-review-icon-action"
+            onClick={clearStep}
+            disabled={busy || countSelected(currentGroup, effectiveSelected) === 0}
+            title="Clear current selection"
+            aria-label="Clear current selection"
+          >
+            <Icon name="trash" size={15} />
+          </button>
+          <button
+            type="button"
+            className="btn btn-ghost v3-inline-action-close"
+            onClick={onClose}
+            disabled={busy}
+            aria-label="Close push review"
+          >
+            <Icon name="x" size={15} />
           </button>
         </div>
-        <button
-          type="button"
-          className="btn btn-ghost v3-inline-action-close"
-          onClick={onClose}
-          disabled={busy}
-          aria-label="Close push review"
-        >
-          <Icon name="x" size={15} />
-        </button>
       </header>
 
       <SyncReviewTabs
@@ -511,9 +584,7 @@ export default function PushResourceWorkspace({
         aria-labelledby={`sync-review-${activeStep}-tab`}
       >
         <div
-          ref={scrollRef}
           className="v3-inline-action-scroll v3-sync-review-scroll"
-          onScroll={rememberScrollPosition}
         >
           {activeStep === "history" && project && binding?.profile_ids?.codex ? (
             <ProjectChatHistoryPage
@@ -606,16 +677,6 @@ export default function PushResourceWorkspace({
                 <span><Icon name="link" size={15} /><strong>Plugins</strong></span>
                 <span>{counts.plugins} included<Icon name="chevron-right" size={13} /></span>
               </button>
-              {showProjectFiles && (
-                <button type="button" onClick={() => selectStep("project_files")}>
-                  <span><Icon name="file" size={15} /><strong>Project files</strong></span>
-                  <span>
-                    {counts.project_files} included
-                    {projectContentRemovals.size > 0 ? ` · ${projectContentRemovals.size} removal${projectContentRemovals.size === 1 ? "" : "s"}` : ""}
-                    <Icon name="chevron-right" size={13} />
-                  </span>
-                </button>
-              )}
               <details className="v3-sync-review-other">
                 <summary>
                   <span><Icon name="settings" size={15} /><strong>Agent setup & tools</strong></span>
@@ -641,12 +702,9 @@ export default function PushResourceWorkspace({
       </div>
 
       <footer className="v3-inline-action-footer v3-push-resource-footer v3-sync-review-footer">
-        <span>
-          <strong>{selectedCount} included</strong>
-          <small>{blockingCount > 0 ? blockerFooter : "Selections are saved after Push succeeds."}</small>
-        </span>
+        {blockingCount > 0 && <span><small>{blockerFooter}</small></span>}
         {stepIndex > 0 && (
-          <button type="button" className="btn btn-ghost" onClick={goBack} disabled={busy}>
+          <button type="button" className="btn btn-secondary v3-sync-review-back" onClick={goBack} disabled={busy}>
             <Icon name="chevron-left" size={14} />
             Back: {STEP_LABELS[previousStep]}
           </button>
@@ -659,9 +717,7 @@ export default function PushResourceWorkspace({
         ) : (
           <button type="button" className="btn btn-primary v3-pull-apply-button" onClick={onPush} disabled={busy || (selectedCount === 0 && projectContentRemovals.size === 0) || blockingCount > 0}>
             <Icon name={busy ? "refresh" : "upload"} size={16} className={busy ? "icon-spin" : undefined} />
-            {busy ? "Pushing…" : projectContentRemovals.size > 0
-              ? `Push ${selectedCount} resource${selectedCount === 1 ? "" : "s"} · ${projectContentRemovals.size} removal${projectContentRemovals.size === 1 ? "" : "s"}`
-              : `Push ${selectedCount} resource${selectedCount === 1 ? "" : "s"}`}
+            {busy ? "Pushing…" : "Push"}
           </button>
         )}
       </footer>

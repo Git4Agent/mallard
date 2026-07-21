@@ -1,10 +1,4 @@
-import {
-  useCallback,
-  useLayoutEffect,
-  useRef,
-  type KeyboardEvent as ReactKeyboardEvent,
-  type UIEvent as ReactUIEvent,
-} from "react";
+import type { KeyboardEvent as ReactKeyboardEvent } from "react";
 import Icon from "../Icons";
 
 export type SyncReviewStep = "history" | "skills" | "plugins" | "project_files" | "review";
@@ -15,30 +9,6 @@ export function syncReviewSteps(includeProjectFiles: boolean): SyncReviewStep[] 
   return includeProjectFiles
     ? ["history", "skills", "plugins", "project_files", "review"]
     : ["history", "skills", "plugins", "review"];
-}
-
-export function useSyncReviewScroll(activeStep: SyncReviewStep) {
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const activeStepRef = useRef(activeStep);
-  const positionsRef = useRef<Record<SyncReviewStep, number>>({
-    history: 0,
-    skills: 0,
-    plugins: 0,
-    project_files: 0,
-    review: 0,
-  });
-
-  const rememberScrollPosition = useCallback((event: ReactUIEvent<HTMLDivElement>) => {
-    positionsRef.current[activeStepRef.current] = event.currentTarget.scrollTop;
-  }, []);
-
-  useLayoutEffect(() => {
-    activeStepRef.current = activeStep;
-    const scrollElement = scrollRef.current;
-    if (scrollElement) scrollElement.scrollTop = positionsRef.current[activeStep];
-  }, [activeStep]);
-
-  return { scrollRef, rememberScrollPosition };
 }
 
 interface Props {
@@ -112,7 +82,7 @@ export default function SyncReviewTabs({
             role="tab"
             aria-selected={active}
             aria-controls={`sync-review-${step.id}-panel`}
-            aria-label={`${step.label}, ${count} selected${warning ? ", needs attention" : ""}`}
+            aria-label={`${step.label}${step.id === "review" ? "" : `, ${count} selected`}${warning ? ", needs attention" : ""}`}
             tabIndex={active ? 0 : -1}
             className={`${active ? "active" : ""}${warning ? " warning" : ""}`}
             disabled={disabled}

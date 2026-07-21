@@ -4495,7 +4495,7 @@ summary:focus-visible {
 
 .v3-inline-action-header {
   position: relative;
-  padding: 14px 48px 13px 20px;
+  padding: 14px 20px 13px;
   border-bottom: 1px solid var(--border);
 }
 
@@ -4525,10 +4525,10 @@ summary:focus-visible {
 }
 
 .v3-inline-action-close {
-  position: absolute;
-  top: 10px;
-  right: 9px;
+  position: relative;
   width: 32px;
+  height: 32px;
+  min-width: 32px;
   min-height: 32px;
   padding: 0;
 }
@@ -4605,10 +4605,45 @@ summary:focus-visible {
 }
 .v3-push-resource-actions {
   display: flex;
+  flex: 0 0 auto;
   align-items: center;
-  gap: 8px;
+  gap: 2px;
+  margin-left: auto;
 }
-.v3-push-resource-actions .btn { min-height: 32px; padding: 0 9px; }
+.v3-push-resource-actions .btn { height: 32px; min-height: 32px; padding: 0 9px; }
+.v3-push-resource-actions .v3-sync-review-icon-action {
+  width: 32px;
+  min-width: 32px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+}
+.v3-push-resource-actions .v3-sync-review-icon-action.has-count {
+  width: auto;
+  min-width: 42px;
+  padding: 0 7px;
+}
+.v3-push-resource-actions .v3-inline-action-close {
+  margin-left: 7px;
+}
+.v3-push-resource-actions .v3-inline-action-close::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: -5px;
+  width: 1px;
+  background: var(--border);
+  pointer-events: none;
+}
+.v3-sync-review-icon-action > span {
+  color: var(--text-2);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 650;
+}
 .v3-push-resource-content { padding-top: 8px; }
 .v3-inline-action-scroll > .v3-resource-groups { gap: 4px; }
 .v3-push-resource-footer {
@@ -5141,7 +5176,7 @@ summary:focus-visible {
 
 .v3-project-combined-page .project-profile-storage-heading {
   min-height: 46px;
-  padding: 0 2px;
+  padding: 0 8px;
   border-top: 0;
   color: var(--text-0);
   font-size: 13px;
@@ -5165,7 +5200,8 @@ summary:focus-visible {
 }
 
 .v3-project-combined-page .project-profile-storage-list .storage-link-block.selected {
-  background: color-mix(in srgb, var(--accent) 4%, transparent);
+  background: var(--surface-subtle);
+  box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 72%, transparent);
 }
 
 .v3-project-combined-page .project-profile-storage-list .storage-link-block:last-child {
@@ -5173,11 +5209,12 @@ summary:focus-visible {
 }
 
 .v3-project-combined-page .project-profile-storage-list .storage-link-row {
-  min-height: 54px;
+  min-height: 58px;
 }
 
 .v3-project-combined-page .project-profile-storage-list .storage-link-main {
-  padding-left: 8px;
+  gap: 10px;
+  padding: 8px 6px 8px 12px;
 }
 
 .v3-project-combined-page .storage-link-copy strong {
@@ -5190,40 +5227,66 @@ summary:focus-visible {
 }
 
 .v3-project-combined-page .storage-link-configure {
-  width: 28px;
-  height: 28px;
+  width: 30px;
+  height: 30px;
   border-radius: 6px;
 }
 
 .v3-project-combined-page .storage-link-unlink {
-  min-height: 28px;
-  padding: 0 6px;
+  width: 30px;
+  height: 30px;
+  min-height: 30px;
+  justify-content: center;
+  padding: 0;
+}
+
+.v3-project-combined-page .storage-link-row-controls {
+  gap: 2px;
+  margin-right: 6px;
+  padding-right: 8px;
+  border-right: 1px solid var(--border);
 }
 
 .v3-project-combined-page .storage-link-actions {
   align-self: center;
-  padding: 0 2px 0 8px;
+  gap: 0;
+  padding: 0 8px;
   border-left: 0;
 }
 
 .v3-project-combined-page .storage-link-action-group {
-  gap: 1px;
+  gap: 4px;
   padding: 0;
   border: 0;
   border-radius: 0;
   background: transparent;
 }
 
-.v3-project-combined-page .storage-link-sync,
-.v3-project-combined-page .storage-link-sync-primary {
-  min-height: 28px;
+.v3-project-combined-page .storage-link-sync {
+  min-height: 32px;
+  padding: 0 10px;
   background: transparent;
-  font-size: 10.5px;
+  font-size: 11px;
 }
 
-.v3-project-combined-page .storage-link-sync:hover:not(:disabled),
-.v3-project-combined-page .storage-link-sync-primary:hover:not(:disabled) {
+.v3-project-combined-page .storage-link-sync-secondary {
+  color: var(--text-2);
+}
+
+.v3-project-combined-page .storage-link-sync-secondary:hover:not(:disabled) {
   background: var(--bg-hover);
+  color: var(--text-0);
+}
+
+.v3-project-combined-page .storage-link-sync-commit {
+  border: 1px solid var(--button-primary-border);
+  background: var(--button-primary-bg);
+  font-weight: 620;
+}
+
+.v3-project-combined-page .storage-link-sync-commit:hover:not(:disabled),
+.v3-project-combined-page .storage-link-sync-commit.active {
+  background: var(--button-primary-hover);
 }
 
 .v3-project-heading-identity {
@@ -5271,7 +5334,7 @@ summary:focus-visible {
   max-width: 100%;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: 0;
   color: var(--text-2);
   font-size: 11px;
 }
@@ -5281,6 +5344,20 @@ summary:focus-visible {
   display: inline-flex;
   align-items: center;
   gap: 5px;
+  max-width: min(360px, 34vw);
+}
+
+.v3-project-heading-meta-item + .v3-project-heading-meta-item {
+  margin-left: 10px;
+}
+
+.v3-project-heading-meta-item + .v3-project-heading-meta-item::before {
+  content: "";
+  width: 1px;
+  height: 11px;
+  flex: 0 0 auto;
+  margin-right: 5px;
+  background: var(--border-mid);
 }
 
 .v3-project-heading-meta-item svg {
@@ -6858,11 +6935,13 @@ summary:focus-visible {
 }
 
 .storage-link-unlink {
-  min-height: 32px;
+  width: 34px;
+  height: 34px;
+  min-height: 34px;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 0 7px;
+  justify-content: center;
+  padding: 0;
   border: 0;
   border-radius: 7px;
   background: transparent;
@@ -7019,12 +7098,12 @@ div.storage-link-main {
   background: var(--chip-strong-bg);
 }
 
-.storage-link-sync-primary {
+.storage-link-sync-commit {
   background: var(--chip-bg);
   color: var(--text-0);
 }
 
-.storage-link-sync-primary:hover:not(:disabled) {
+.storage-link-sync-commit:hover:not(:disabled) {
   background: var(--chip-strong-bg);
 }
 
@@ -9237,10 +9316,10 @@ div.storage-link-main {
 
 .v3-sync-review-header {
   min-height: 58px;
-  padding: 10px 48px 10px 20px;
+  padding: 10px 20px;
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 12px;
 }
 
 .v3-inline-action-header.v3-sync-review-header {
@@ -9273,15 +9352,6 @@ div.storage-link-main {
 .v3-sync-review-title h2 {
   flex: 0 0 auto;
   margin-right: 0;
-}
-
-.v3-sync-review-hint {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--text-3);
-  font-size: 10.5px;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .v3-sync-review-header p {
@@ -9348,83 +9418,26 @@ div.storage-link-main {
   padding-bottom: 6px;
 }
 
-/* An open Push/Pull review owns the workspace scroll instead of nesting it
-   inside the project page scroll. The fixed frame also keeps step changes
-   from shifting the storage row, tabs, or footer. */
+/* Keep the review in normal document flow so the project workspace remains
+   the only vertical scroll owner. */
 .v3-main.v3-sync-review-page {
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
-}
-
-.v3-sync-review-page > .profile-links-section,
-.v3-sync-review-page .v3-combined-settings-panel,
-.v3-sync-review-page .v3-project-link-card,
-.v3-sync-review-page .profile-link-connections,
-.v3-sync-review-page .project-storage-group,
-.v3-sync-review-page .project-profile-storage-list,
-.v3-sync-review-page .storage-link-block.v3-review-open,
-.v3-sync-review-page .v3-storage-inline-review,
-.v3-sync-review-page .v3-sync-review-workspace,
-.v3-sync-review-page .v3-sync-review-content {
-  min-height: 0;
-}
-
-.v3-sync-review-page > .profile-links-section,
-.v3-sync-review-page .v3-combined-settings-panel,
-.v3-sync-review-page .v3-project-link-card,
-.v3-sync-review-page .profile-link-connections,
-.v3-sync-review-page .project-storage-group,
-.v3-sync-review-page .project-profile-storage-list,
-.v3-sync-review-page .storage-link-block.v3-review-open,
-.v3-sync-review-page .v3-storage-inline-review,
-.v3-sync-review-page .v3-sync-review-workspace,
-.v3-sync-review-page .v3-sync-review-content {
-  display: flex;
-  flex-direction: column;
-}
-
-.v3-sync-review-page > .profile-links-section,
-.v3-sync-review-page .v3-combined-settings-panel,
-.v3-sync-review-page .v3-project-link-card,
-.v3-sync-review-page .profile-link-connections,
-.v3-sync-review-page .project-storage-group,
-.v3-sync-review-page .project-profile-storage-list,
-.v3-sync-review-page .storage-link-block.v3-review-open,
-.v3-sync-review-page .v3-storage-inline-review,
-.v3-sync-review-page .v3-sync-review-workspace,
-.v3-sync-review-page .v3-sync-review-content {
-  flex: 1 1 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-bottom: 64px;
 }
 
 .v3-sync-review-page .profile-link-connections {
   padding-bottom: 0;
 }
 
-.v3-sync-review-page .project-storage-group,
-.v3-sync-review-page .v3-storage-inline-review,
-.v3-sync-review-page .v3-sync-review-content {
-  overflow: hidden;
-}
-
 .v3-sync-review-page .storage-link-block.v3-review-open {
   margin-bottom: 0;
 }
 
-.v3-sync-review-page .storage-link-row,
-.v3-sync-review-page .v3-sync-review-header,
-.v3-sync-review-page .v3-sync-review-tabs,
-.v3-sync-review-page .v3-sync-review-footer {
-  flex: 0 0 auto;
-}
-
 .v3-sync-review-page .v3-sync-review-scroll {
-  min-height: 0;
   max-height: none;
-  flex: 1 1 0;
-  overflow-x: hidden;
-  overflow-y: auto;
-  scrollbar-gutter: stable;
+  overflow: visible;
+  scrollbar-gutter: auto;
 }
 
 .v3-sync-review-scroll > .v3-history-embedded,
@@ -9434,17 +9447,31 @@ div.storage-link-main {
   border-top: 0;
 }
 
+.v3-sync-review-scroll > .v3-history-selection-review {
+  padding-top: 0;
+  padding-right: 8px;
+}
+
+.v3-history-selection-review .v3-history-section-heading {
+  margin-top: 8px;
+}
+
 .v3-sync-review-footer {
-  min-height: 60px;
-  padding: 9px 20px;
+  min-height: 48px;
+  padding: 5px 20px;
   gap: 8px;
 }
 
 .v3-sync-review-footer > .btn {
-  min-height: 36px;
+  min-height: 34px;
   display: inline-flex;
   align-items: center;
   gap: 6px;
+}
+
+.v3-inline-pull-review .v3-sync-review-footer {
+  min-height: 48px;
+  padding: 5px 20px;
 }
 
 .v3-sync-review-summary {
@@ -9652,12 +9679,11 @@ div.storage-link-main {
 }
 
 .v3-project-files-unscanned {
-  max-width: 680px;
-  align-items: flex-start;
-  padding-top: 28px;
+  gap: 10px;
+  padding-top: 18px;
 }
 
-.v3-project-files-hero,
+.v3-project-files-empty,
 .v3-project-files-toolbar,
 .v3-project-files-search,
 .v3-project-file-row-main,
@@ -9666,18 +9692,36 @@ div.storage-link-main {
   align-items: center;
 }
 
-.v3-project-files-hero { gap: 13px; }
-.v3-project-files-hero > span {
-  width: 42px;
-  height: 42px;
+.v3-project-files-empty {
+  width: 100%;
+  min-height: 52px;
   display: grid;
-  flex: 0 0 42px;
+  grid-template-columns: 32px minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 4px 0;
+}
+
+.v3-project-files-empty-icon {
+  width: 32px;
+  height: 32px;
+  display: grid;
+  flex: 0 0 32px;
   place-items: center;
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  color: var(--text-1);
+  border-radius: 8px;
+  color: var(--text-2);
   background: var(--surface-subtle);
 }
+
+.v3-project-files-empty-copy {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.v3-project-files-empty-copy small { white-space: nowrap; }
+.v3-project-files-empty > .btn { min-height: 32px; padding: 0 11px; }
 
 .v3-project-files-page h3,
 .v3-project-files-page p { margin: 0; }
@@ -9688,6 +9732,14 @@ div.storage-link-main {
 .v3-project-files-toolbar { justify-content: space-between; gap: 12px; }
 .v3-project-files-toolbar > .btn { margin-left: auto; }
 .v3-project-files-toolbar > .btn + .btn { margin-left: 0; }
+.v3-project-files-heading { display: flex; align-items: center; gap: 6px; }
+.v3-project-files-note { display: grid; place-items: center; color: var(--text-3); }
+
+.v3-project-files-page > .v3-pull-empty {
+  min-height: 0;
+  align-items: center;
+  padding: 12px 2px;
+}
 
 .v3-project-files-search {
   gap: 10px;
@@ -9832,6 +9884,8 @@ button.v3-project-file-expand { cursor: pointer; }
   .v3-sync-review-footer { flex-wrap: wrap; }
   .v3-sync-review-footer > span { flex-basis: 100%; }
   .v3-sync-review-footer .v3-pull-apply-button { min-width: 0; }
+  .v3-project-files-empty { grid-template-columns: 32px minmax(0, 1fr); }
+  .v3-project-files-empty > .btn { grid-column: 2; justify-self: start; }
 }
 
 @media (max-width: 900px) {

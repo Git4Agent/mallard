@@ -102,8 +102,9 @@ test("an unselected blocked skill does not prevent Push", () => {
   );
 
   assert.doesNotMatch(html, /Pull before pushing|storage change.*review|needs attention/);
-  const pushText = html.lastIndexOf("Push 1 resource");
+  const pushText = html.lastIndexOf(">Push</button>");
   assert.notEqual(pushText, -1);
+  assert.doesNotMatch(html, /Push \d+ resources?/);
   const pushTagStart = html.lastIndexOf("<button", pushText);
   const pushTagEnd = html.indexOf(">", pushTagStart);
   assert.doesNotMatch(html.slice(pushTagStart, pushTagEnd), /disabled/);
@@ -165,6 +166,11 @@ test("Push rejects blocked selections while preserving storage conflict review",
   const blockedCheckbox = inputTagFor(statusHtml, "Include broken-skill");
   assert.match(blockedCheckbox, /disabled=""/);
   assert.doesNotMatch(blockedCheckbox, /checked=""/);
+  assert.match(statusHtml, /v3-history-selection-review/);
+  assert.match(statusHtml, /aria-label="Skill status"/);
+  assert.doesNotMatch(statusHtml, /v3-history-header/);
+  assert.doesNotMatch(statusHtml, /v3-history-storage-lens/);
+  assert.doesNotMatch(statusHtml, /v3-history-toolbar-count/);
 
   const html = renderToStaticMarkup(
     <PushResourceWorkspace
@@ -184,7 +190,7 @@ test("Push rejects blocked selections while preserving storage conflict review",
     />,
   );
   assert.match(html, />0 included</);
-  assert.match(html, />Recommended \(0\)</);
+  assert.match(html, /aria-label="Use recommended selection \(0\)"/);
   assert.doesNotMatch(html, /Resolve selected resources|cannot be captured|needs attention/);
   assert.doesNotMatch(html, /Review Pull/);
 });

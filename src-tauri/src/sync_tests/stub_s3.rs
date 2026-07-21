@@ -22,7 +22,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use crate::sha256_bytes;
+use sha2::{Digest, Sha256};
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
 
 pub enum HookAction {
     /// Run before the precondition is evaluated — e.g. publish a competing

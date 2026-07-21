@@ -747,6 +747,7 @@ fn managed_marketplace_home_is_allowed_for_default(
     }
 }
 
+#[cfg(test)]
 fn managed_marketplace_home_is_allowed(name: &str, source: &Path, target_home: &Path) -> bool {
     dirs::home_dir()
         .map(|home| home.join(".codex"))

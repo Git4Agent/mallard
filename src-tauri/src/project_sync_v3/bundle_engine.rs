@@ -1077,13 +1077,12 @@ impl<S: BundleObjectStore> BundleEngine<S> {
                     .as_ref()
                     .is_some_and(|digest| digest != &materialized_sha256 && digest != &entry.sha256)
             {
-                actions.push(manual_action(
+                actions.push(conversation_keep_local_action(
                     &entry.resource_id,
-                    &format!(
-                        "Conversation '{}' diverges at '{}'; resolve the quarantined branch before materialization",
-                        logical_path,
-                        target.display()
-                    ),
+                    logical_path,
+                    &target,
+                    &entry.sha256,
+                    target_state.digest.as_deref().unwrap(),
                 )?);
                 continue;
             }
@@ -3043,6 +3042,42 @@ fn manual_action(resource_id: &ResourceId, message: &str) -> Result<RestoreActio
     Ok(action)
 }
 
+fn conversation_keep_local_action(
+    resource_id: &ResourceId,
+    logical_path: &LogicalPath,
+    target: &Path,
+    source_sha256: &str,
+    target_sha256: &str,
+) -> Result<RestoreAction, String> {
+    let message = format!(
+        "Conversation '{}' differs at '{}'; this Pull will keep the local version",
+        logical_path,
+        target.display()
+    );
+    let suffix = &sha256(message.as_bytes())[..24];
+    let action = RestoreAction {
+        action_id: ActionId::parse(format!("manual-{}", suffix))?,
+        resource_id: resource_id.clone(),
+        kind: RestoreActionKind::Manual { message },
+        target_path: Some(path_text(target)?),
+        source_sha256: Some(source_sha256.to_string()),
+        expected_target_sha256: Some(target_sha256.to_string()),
+        expected_target_mode: None,
+        requires_explicit_approval: true,
+    };
+    action.validate()?;
+    Ok(action)
+}
+
+fn is_conversation_keep_local_action(action: &RestoreAction) -> bool {
+    matches!(action.kind, RestoreActionKind::Manual { .. })
+        && (action.resource_id.as_str().starts_with("codex:session:")
+            || action.resource_id.as_str().starts_with("claude:session:"))
+        && action.target_path.is_some()
+        && action.source_sha256.is_some()
+        && action.expected_target_sha256.is_some()
+}
+
 fn continuation_action(
     descriptor: &ResourceDescriptor,
     binding: &ProjectBinding,
@@ -4549,13 +4584,20 @@ impl<S: BundleObjectStore> BundleEngine<S> {
 
         for action in &plan.actions {
             if !effective_approved.contains(&action.action_id) {
+                let keeps_local_conversation = is_conversation_keep_local_action(action);
                 receipts.push(receipt_for(
                     action,
                     ActionStatus::Skipped,
                     applied_at,
                     None,
-                    None,
-                    Some("action was not approved".to_string()),
+                    keeps_local_conversation
+                        .then(|| action.expected_target_sha256.clone())
+                        .flatten(),
+                    Some(if keeps_local_conversation {
+                        "local conversation was kept by the reviewed Pull".to_string()
+                    } else {
+                        "action was not approved".to_string()
+                    }),
                 ));
                 continue;
             }
