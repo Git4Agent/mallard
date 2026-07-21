@@ -5,6 +5,25 @@ GitHub Release. A pushed `v*` tag starts `.github/workflows/release.yml`, which
 builds Apple Silicon and Intel macOS packages plus a Windows x64 NSIS package.
 The release remains a draft until it has been installed and verified.
 
+## Ad-hoc tester builds
+
+Until Mallard has an Apple Developer Program membership, macOS packages use
+Tauri's explicit ad-hoc signing identity. This makes the bundle structurally
+valid on Apple Silicon, but it is not a Developer ID signature and cannot be
+notarized. Testers must grant manual Gatekeeper approval after copying Mallard
+to Applications; do not describe these artifacts as trusted public macOS
+releases.
+
+Before publishing a draft, verify its macOS app bundle with:
+
+```bash
+codesign --verify --deep --strict --verbose=4 /path/to/Mallard.app
+```
+
+The release workflow performs the same check inside the Tauri build command,
+before `tauri-action` creates or uploads a draft. A failed check therefore
+prevents release assets from being created.
+
 GitHub Releases is the public source of truth for installers and updates. The
 stable updater manifest is always available at:
 

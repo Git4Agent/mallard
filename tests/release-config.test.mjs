@@ -6,17 +6,27 @@ const projectUrl = new URL("../", import.meta.url);
 const read = (path) => readFile(new URL(path, projectUrl), "utf8");
 
 test("desktop releases and updates use the public GitHub repository", async () => {
-  const [tauriConfigSource, workflow, releaseGuide] = await Promise.all([
+  const [tauriConfigSource, workflow, releaseGuide, packageSource, packageLockSource] = await Promise.all([
     read("src-tauri/tauri.conf.json"),
     read(".github/workflows/release.yml"),
     read("docs/RELEASING.md"),
+    read("package.json"),
+    read("package-lock.json"),
   ]);
   const tauriConfig = JSON.parse(tauriConfigSource);
+  const packageConfig = JSON.parse(packageSource);
+  const packageLock = JSON.parse(packageLockSource);
+
+  assert.equal(packageLock.version, packageConfig.version);
+  assert.equal(packageLock.packages[""].version, packageConfig.version);
 
   assert.deepEqual(tauriConfig.plugins.updater.endpoints, [
     "https://github.com/Git4Agent/mallard/releases/latest/download/latest.json",
   ]);
   assert.equal(tauriConfig.bundle.createUpdaterArtifacts, true);
+  assert.deepEqual(tauriConfig.bundle.macOS, {
+    signingIdentity: "-",
+  });
 
   for (const target of [
     "aarch64-apple-darwin",
@@ -26,9 +36,14 @@ test("desktop releases and updates use the public GitHub repository", async () =
   assert.match(workflow, /tauri-apps\/tauri-action@v1/);
   assert.match(workflow, /releaseDraft: true/);
   assert.match(workflow, /uploadUpdaterJson: true/);
+  assert.match(workflow, /MALLARD_VERIFY_MACOS_BUNDLE: \$\{\{ runner\.os == 'macOS' && '1' \|\| '' \}\}/);
+  assert.doesNotMatch(workflow, /name: Verify macOS app signature/);
+  assert.equal(packageConfig.scripts.tauri, "node scripts/tauri-build.mjs");
   assert.doesNotMatch(workflow, /Cloudflare|CLOUDFLARE|\bR2\b|r2 object|api\.mallard-ai\.com/);
 
   assert.match(releaseGuide, /GitHub Releases is the public source of truth/);
   assert.match(releaseGuide, /releases\/latest\/download\/latest\.json/);
+  assert.match(releaseGuide, /ad-hoc tester build/i);
+  assert.match(releaseGuide, /manual Gatekeeper approval/i);
   assert.doesNotMatch(releaseGuide, /CLOUDFLARE_API_TOKEN|CLOUDFLARE_ACCOUNT_ID/);
 });

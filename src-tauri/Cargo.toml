@@ -1,6 +1,6 @@
 [package]
 name = "mallard"
-version = "0.1.0"
+version = "0.1.1"
 description = "Mallard — sync Codex and Claude project resources"
 authors = ["you"]
 license = "Apache-2.0"

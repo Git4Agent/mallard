@@ -65,7 +65,7 @@ jobs:
       - name: Test release configuration
         run: npm run test:release-config
 
-      - name: Build and upload signed release
+      - name: Build and upload release draft
         id: tauri
         uses: tauri-apps/tauri-action@v1
         env:
@@ -78,10 +78,11 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          MALLARD_VERIFY_MACOS_BUNDLE: ${{ runner.os == 'macOS' && '1' || '' }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Mallard ${{ github.ref_name }}"
-          releaseBody: "A signed Mallard update is ready. Review the attached installers and edit these notes before publishing."
+          releaseBody: "A Mallard tester release is ready. The macOS installer uses valid ad-hoc signing and requires manual Gatekeeper approval. Review the attached installers and edit these notes before publishing."
           releaseDraft: true
           prerelease: false
           retryAttempts: 2

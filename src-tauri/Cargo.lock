@@ -2771,7 +2771,7 @@ dependencies = [
 
 [[package]]
 name = "mallard"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "aws-sdk-s3",
  "aws-smithy-http-client",
