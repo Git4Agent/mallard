@@ -184,11 +184,14 @@ test("history content uses the local alias and renders commit/thread actions", (
   assert.match(html, /Add project-scoped history/);
   assert.match(html, /class="v3-history-thread-updated"/);
   assert.match(html, /aria-label="Updated [^"]+"/);
-  assert.match(html, /aria-label="Show session details"/);
-  assert.doesNotMatch(html, /aria-label="User rounds: 3"/);
-  assert.doesNotMatch(html, /data-tooltip="User turns/);
-  assert.doesNotMatch(html, /24\.8K/);
-  assert.doesNotMatch(html, /Appears under 2 commits/);
+  assert.doesNotMatch(html, /aria-label="Show session details"/);
+  assert.doesNotMatch(html, /aria-label="Hide session details"/);
+  assert.match(html, /aria-label="Started [^"]+"/);
+  assert.match(html, /aria-label="Ended [^"]+"/);
+  assert.match(html, /aria-label="User turns: 3"/);
+  assert.match(html, /data-tooltip="Total tokens · 24\.8K"/);
+  assert.match(html, /Appears under 2 commits/);
+  assert.match(html, /aria-label="Load chat history"/);
   assert.doesNotMatch(html, /during session|after session|started from/);
   assert.doesNotMatch(html, /Map project-owned Codex sessions onto/);
   assert.doesNotMatch(html, /aria-label="Show conversation details"/);
@@ -200,7 +203,7 @@ test("history content uses the local alias and renders commit/thread actions", (
   assert.doesNotMatch(html, /Show chat details/);
 });
 
-test("expanded session details label every metric icon", () => {
+test("permanent session summaries label every metric icon", () => {
   const html = renderToStaticMarkup(<ThreadMetrics thread={history.threads[0]} />);
 
   assert.match(html, /data-tooltip="User turns · 3"/);
@@ -209,7 +212,7 @@ test("expanded session details label every metric icon", () => {
   assert.match(html, /data-tooltip="Tool calls · 8"/);
 });
 
-test("chat history loads through its own control inside session details", () => {
+test("chat history remains independently collapsible under the permanent summary", () => {
   const thread = history.threads[0];
   const html = renderToStaticMarkup(
     <ProjectChatHistoryContent
@@ -252,7 +255,7 @@ test("chat history loads through its own control inside session details", () => 
     />,
   );
 
-  assert.match(html, /aria-label="Hide session details"/);
+  assert.doesNotMatch(html, /aria-label="Hide session details"/);
   assert.doesNotMatch(html, /conversation details/);
   assert.match(html, /aria-label="Hide chat history"/);
   assert.match(html, /data-tooltip="User turns · 3"/);

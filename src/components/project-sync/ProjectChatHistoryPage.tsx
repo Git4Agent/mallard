@@ -182,23 +182,14 @@ function ThreadCard({
   syncEntry, storageName, resourceId, selectionMode, selected = false, selectable = false,
   selectionDisabled = false, onToggleResource,
 }: ThreadCardProps) {
-  const [localDetailsOpen, setLocalDetailsOpen] = useState(false);
   const launchable = THREAD_UUID.test(thread.thread_id);
-  const detailsId = `thread-details-${occurrenceKey.replace(/[^a-z0-9_-]/gi, "-")}`;
   const chatDetailsId = `thread-chat-${occurrenceKey.replace(/[^a-z0-9_-]/gi, "-")}`;
   const updatedLabel = `Updated ${formatDate(thread.ended_at)}`;
-  const sessionDetailsOpen = localDetailsOpen || detailsOpen;
-  const sessionDetailsLabel = sessionDetailsOpen ? "Hide session details" : "Show session details";
   const chatDetailsLabel = detailsOpen
     ? "Hide chat history"
     : details?.page
       ? "Show chat history"
       : "Load chat history";
-  const toggleSessionDetails = () => {
-    const nextOpen = !sessionDetailsOpen;
-    setLocalDetailsOpen(nextOpen);
-    if (!nextOpen && detailsOpen) onToggleDetails?.(thread.thread_id, occurrenceKey);
-  };
   const reviewStateLabel = selectionMode ? syncReviewStateLabel(selectionMode, syncEntry, selected) : null;
   return (
     <article className={`v3-history-thread-card${selectionMode ? " v3-sync-selectable-row" : ""}${selected ? " selected" : ""}`}>
@@ -233,11 +224,6 @@ function ThreadCard({
           </time>
         </div>
         <div className="v3-history-thread-actions">
-          <button type="button" className={`v3-history-icon-action${sessionDetailsOpen ? " active" : ""}`}
-            aria-label={sessionDetailsLabel} title={sessionDetailsLabel} aria-expanded={sessionDetailsOpen} aria-controls={detailsId}
-            onClick={toggleSessionDetails}>
-            <Icon name="info" size={14} />
-          </button>
           <button type="button" className="btn btn-ghost v3-history-launch-action" disabled={!launchable || busy}
             onClick={() => onOpenCodex(thread.thread_id)} title={busy ? "Opening in Codex…" : "Open in Codex"}
             aria-label={busy ? "Opening in Codex" : "Open in Codex"}>
@@ -251,39 +237,37 @@ function ThreadCard({
         </div>
       </div>
 
-      {sessionDetailsOpen && (
-        <div id={detailsId} className="v3-history-session-details">
-          <div className="v3-history-session-summary">
-            <ThreadMetrics thread={thread} />
-            {onToggleDetails && (
-              <button type="button" className={`btn btn-ghost v3-history-chat-toggle${detailsOpen ? " active" : ""}`}
-                aria-label={chatDetailsLabel} title={chatDetailsLabel} aria-expanded={detailsOpen} aria-controls={chatDetailsId}
-                onClick={() => onToggleDetails(thread.thread_id, occurrenceKey)}>
-                <Icon name="message" size={13} />{chatDetailsLabel}
-              </button>
-            )}
-          </div>
-          {onToggleDetails && detailsOpen && (
-            <div id={chatDetailsId} className="v3-history-chat-details" aria-live="polite">
-              {details?.loading && !details.page ? <div className="v3-history-detail-state"><span className="status-loader" /> Loading chat history…</div> : null}
-              {details?.error && <div className="v3-history-detail-state error" role="alert">{details.error}</div>}
-              {details?.page?.next_cursor != null && (
-                <button type="button" className="btn btn-ghost v3-history-load-older" disabled={details.loading}
-                  onClick={() => onLoadMoreDetails?.(thread.thread_id)}>
-                  {details.loading ? "Loading older messages…" : `Load ${CHAT_HISTORY_PAGE_SIZE} older messages`}
-                </button>
-              )}
-              {details?.page?.turns.map((turn) => (
-                <div key={`${thread.thread_id}:${turn.ordinal}`} className="v3-history-turn">
-                  <span>{turn.role === "user" ? "User" : "Codex"}</span>
-                  <time>{formatDate(turn.timestamp)}</time>
-                  <p title={turn.preview}>{turn.preview}</p>
-                </div>
-              ))}
-            </div>
+      <div className="v3-history-session-details">
+        <div className="v3-history-session-summary">
+          <ThreadMetrics thread={thread} />
+          {onToggleDetails && (
+            <button type="button" className={`btn btn-ghost v3-history-chat-toggle${detailsOpen ? " active" : ""}`}
+              aria-label={chatDetailsLabel} title={chatDetailsLabel} aria-expanded={detailsOpen} aria-controls={chatDetailsId}
+              onClick={() => onToggleDetails(thread.thread_id, occurrenceKey)}>
+              <Icon name="message" size={13} />{chatDetailsLabel}
+            </button>
           )}
         </div>
-      )}
+        {onToggleDetails && detailsOpen && (
+          <div id={chatDetailsId} className="v3-history-chat-details" aria-live="polite">
+            {details?.loading && !details.page ? <div className="v3-history-detail-state"><span className="status-loader" /> Loading chat history…</div> : null}
+            {details?.error && <div className="v3-history-detail-state error" role="alert">{details.error}</div>}
+            {details?.page?.next_cursor != null && (
+              <button type="button" className="btn btn-ghost v3-history-load-older" disabled={details.loading}
+                onClick={() => onLoadMoreDetails?.(thread.thread_id)}>
+                {details.loading ? "Loading older messages…" : `Load ${CHAT_HISTORY_PAGE_SIZE} older messages`}
+              </button>
+            )}
+            {details?.page?.turns.map((turn) => (
+              <div key={`${thread.thread_id}:${turn.ordinal}`} className="v3-history-turn">
+                <span>{turn.role === "user" ? "User" : "Codex"}</span>
+                <time>{formatDate(turn.timestamp)}</time>
+                <p title={turn.preview}>{turn.preview}</p>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
     </article>
   );
 }
