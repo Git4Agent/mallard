@@ -4,7 +4,7 @@
 
 **Goal:** Produce Mallard 0.1.2 as one ad-hoc-signed Apple Silicon DMG with no automatic updater or updater signing-key requirement.
 
-**Architecture:** Remove the updater vertically from React, Tauri capabilities, Rust initialization, and both dependency graphs. Keep Tauri's explicit macOS ad-hoc identity and existing post-build `codesign` guard, while narrowing the tag workflow to one `aarch64-apple-darwin` DMG job. Build and inspect the same DMG locally before creating any release tag.
+**Architecture:** Remove the updater vertically from React, Tauri capabilities, Rust initialization, and both dependency graphs. Keep Tauri's explicit macOS ad-hoc identity and verify the application mounted from the finished DMG, while narrowing the tag workflow to one `aarch64-apple-darwin` job. Build and inspect the same DMG locally before creating any release tag.
 
 **Tech Stack:** React 19, TypeScript 5.8, Vite 7, Tauri 2, Rust, Node test runner, GitHub Actions, macOS `codesign`, `file`, and `hdiutil`.
 
@@ -330,7 +330,9 @@ Expected: PASS.
 MALLARD_VERIFY_MACOS_BUNDLE=1 npm run tauri build -- --target aarch64-apple-darwin --bundles dmg
 ```
 
-Expected: Tauri creates `Mallard_0.1.2_aarch64.dmg`, then strict `codesign` verification succeeds.
+Expected: Tauri creates `Mallard_0.1.2_aarch64.dmg`; the wrapper verifies and
+mounts that DMG, runs strict `codesign` validation against its `Mallard.app`,
+and detaches it successfully.
 
 - [ ] **Step 3: Inspect the outputs**
 

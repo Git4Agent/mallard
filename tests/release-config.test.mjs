@@ -102,10 +102,15 @@ test("desktop release builds one verified Apple Silicon DMG", async () => {
   assert.match(workflow, /MALLARD_VERIFY_MACOS_BUNDLE: "1"/);
   assert.doesNotMatch(workflow, /TAURI_SIGNING|uploadUpdater|updaterJson|APPLE_[A-Z_]+/);
   assert.equal(packageConfig.scripts.tauri, "node scripts/tauri-build.mjs");
+  assert.match(tauriBuildScript, /"hdiutil", \["verify", dmgPath\]/);
+  assert.match(tauriBuildScript, /"hdiutil", \["attach", "-nobrowse", "-readonly"/);
+  assert.match(tauriBuildScript, /join\(mountPath, "Mallard\.app"\)/);
   assert.match(
     tauriBuildScript,
     /"codesign", \["--verify", "--deep", "--strict", "--verbose=4"/,
   );
+  assert.match(tauriBuildScript, /"hdiutil", \["detach", mountPath\]/);
+  assert.doesNotMatch(tauriBuildScript, /"bundle",\s*"macos"/);
   assert.match(releaseGuide, /Apple Silicon/i);
   assert.match(releaseGuide, /Privacy & Security/i);
   assert.doesNotMatch(releaseGuide, /updater|TAURI_SIGNING|latest\.json/i);
