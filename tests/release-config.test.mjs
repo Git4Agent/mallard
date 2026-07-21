@@ -95,9 +95,9 @@ test("desktop release builds one verified Apple Silicon DMG", async () => {
   const packageConfig = JSON.parse(packageSource);
 
   assert.deepEqual(tauriConfig.bundle.macOS, { signingIdentity: "-" });
-  assert.match(workflow, /target: aarch64-apple-darwin/);
+  assert.match(workflow, /--target aarch64-apple-darwin/);
   assert.doesNotMatch(workflow, /x86_64-apple-darwin|windows-latest|x86_64-pc-windows-msvc/);
-  assert.match(workflow, /bundles: dmg/);
+  assert.match(workflow, /--bundles dmg/);
   assert.match(workflow, /releaseDraft: true/);
   assert.match(workflow, /MALLARD_VERIFY_MACOS_BUNDLE: "1"/);
   assert.doesNotMatch(workflow, /TAURI_SIGNING|uploadUpdater|updaterJson|APPLE_[A-Z_]+/);

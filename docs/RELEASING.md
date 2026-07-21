@@ -1,143 +1,97 @@
 # Releasing Mallard
 
-Mallard publishes first-install packages and signed in-app updates from the same
-GitHub Release. A pushed `v*` tag starts `.github/workflows/release.yml`, which
-builds Apple Silicon and Intel macOS packages plus a Windows x64 NSIS package.
-The release remains a draft until it has been installed and verified.
+Mallard is distributed as one Apple Silicon DMG through GitHub Releases. A
+pushed `v*` tag starts `.github/workflows/release.yml`; the workflow builds for
+`aarch64-apple-darwin` and creates a draft release for manual inspection.
 
-## Ad-hoc tester builds
+## Signing and macOS approval
 
-Until Mallard has an Apple Developer Program membership, macOS packages use
-Tauri's explicit ad-hoc signing identity. This makes the bundle structurally
-valid on Apple Silicon, but it is not a Developer ID signature and cannot be
-notarized. Testers must grant manual Gatekeeper approval after copying Mallard
-to Applications; do not describe these artifacts as trusted public macOS
-releases.
+Mallard does not currently have an Apple Developer Program certificate. Its
+macOS bundle therefore uses Tauri's explicit ad-hoc identity (`-`). This gives
+the Apple Silicon application a structurally valid code signature, but it is
+not a Developer ID signature and the application is not notarized.
 
-Before publishing a draft, verify its macOS app bundle with:
+The release build validates the application before upload with:
 
 ```bash
 codesign --verify --deep --strict --verbose=4 /path/to/Mallard.app
 ```
 
-The release workflow performs the same check inside the Tauri build command,
-before `tauri-action` creates or uploads a draft. A failed check therefore
-prevents release assets from being created.
+If that validation fails, the GitHub release draft is not created or updated.
+Ad-hoc signing does not prevent Gatekeeper warnings; testers must approve the
+application manually.
 
-GitHub Releases is the public source of truth for installers and updates. The
-stable updater manifest is always available at:
+## Install the DMG
 
-```text
-https://github.com/Git4Agent/mallard/releases/latest/download/latest.json
-```
+1. Download the Apple Silicon DMG from the GitHub Release.
+2. Open the DMG and drag Mallard to Applications.
+3. Attempt to open Mallard from Applications.
+4. If macOS blocks it, open System Settings, select Privacy & Security, find the
+   message about Mallard, and choose Open Anyway.
+5. Confirm the final Open prompt.
 
-The download website reads the repository's public latest-release API and uses
-the returned `browser_download_url` values. No Cloudflare credential, R2
-mirror, or GitHub token is required for public downloads.
+Do not tell users that this build is notarized or signed by an identified Apple
+developer.
 
-## Updater signing key
+## Prepare version 0.1.2
 
-The public updater key is committed in `src-tauri/tauri.conf.json`. The matching
-private key is intentionally outside this repository. On the machine where the
-updater was introduced it was generated at:
+The version must match in these files:
 
-```text
-~/.tauri/mallard.key
-```
+- `package.json`
+- `package-lock.json`
+- `src-tauri/Cargo.toml`
+- `src-tauri/tauri.conf.json`
 
-It is passwordless and protected by the containing user directory and owner-only
-file permissions. Back it up in an encrypted secrets system before publishing
-the first updater-enabled release. Losing this key prevents installed copies
-from accepting future updates.
-
-Add the private key content to the repository's Actions secrets:
+Run the release checks before creating a tag:
 
 ```bash
-gh secret set TAURI_SIGNING_PRIVATE_KEY < ~/.tauri/mallard.key
+npm run check:release-version -- v0.1.2
+npm run test:integration
+npm run build
+cargo check --manifest-path src-tauri/Cargo.toml
 ```
 
-`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` may be omitted for the current key. If the
-key is replaced with a password-protected key, create that secret as well.
+## Build and verify locally
 
-Updater signing proves that a release came from Mallard. It does not replace
-Apple Developer ID signing/notarization or Windows Authenticode signing.
-
-## Platform signing secrets
-
-For a trusted public macOS release, configure these GitHub Actions secrets:
-
-- `APPLE_CERTIFICATE`
-- `APPLE_CERTIFICATE_PASSWORD`
-- `APPLE_SIGNING_IDENTITY`
-- `APPLE_ID`
-- `APPLE_PASSWORD`
-- `APPLE_TEAM_ID`
-
-Configure a Windows signing certificate and Tauri `signCommand` or certificate
-thumbprint before treating the Windows package as a trusted public build. The
-workflow can create updater-signed internal installers before those publisher
-credentials are available, but operating-system warnings will remain.
-
-## Prepare a release
-
-Merge the release workflow into the repository's default branch before
-creating a tag.
-
-1. Update the version in all three files:
-   - `package.json`
-   - `src-tauri/Cargo.toml`
-   - `src-tauri/tauri.conf.json`
-2. Run the checks:
-
-   ```bash
-   npm run check:release-version -- v0.2.0
-   npm run build
-   npm run test:integration
-   ```
-
-3. Commit the version change, then create and push the matching tag:
-
-   ```bash
-   git tag v0.2.0
-   git push origin v0.2.0
-   ```
-
-4. Wait for all three release jobs. `tauri-action` attaches the installers,
-   updater bundles, signatures, and generated `latest.json` to one draft
-   GitHub Release.
-5. Inspect the draft GitHub Release, edit its release notes, install each
-   first-install package, and verify every attached artifact.
-6. Publish the draft. GitHub's release URLs immediately expose the versioned
-   assets, while `/releases/latest/download/latest.json` resolves to the newly
-   published release. The website discovers the same release independently.
-
-Do not replace artifacts under an existing version. Fix the problem, increment
-the semantic version, and publish a new signed release.
-
-## Local updater build
-
-On macOS, a local signed updater bundle can be built with:
+Build the same Apple Silicon DMG locally before creating the release tag:
 
 ```bash
-TAURI_SIGNING_PRIVATE_KEY="$HOME/.tauri/mallard.key" \
-  npm run tauri build -- --bundles app,dmg
+MALLARD_VERIFY_MACOS_BUNDLE=1 npm run tauri build -- \
+  --target aarch64-apple-darwin \
+  --bundles dmg
 ```
 
-The normal DMG is the first-install package. The updater consumes the generated
-`.app.tar.gz` and `.sig` artifacts. On Windows it consumes the NSIS setup
-executable and its `.sig` file. `tauri-action` uploads these files and generates
-the multi-platform `latest.json` file automatically. The website independently
-discovers the DMG and NSIS installers from the latest GitHub Release API.
+Inspect the generated DMG and application:
 
-## Upgrade verification
+```bash
+hdiutil verify \
+  src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/Mallard_0.1.2_aarch64.dmg
 
-Before publishing, verify at minimum:
+file \
+  src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Mallard.app/Contents/MacOS/mallard
 
-- no update is offered when the installed version is current;
-- macOS Apple Silicon, macOS Intel, and Windows x64 select the correct artifact;
-- an update cannot start during Push, Pull, restore, or another busy operation;
-- download failure can be retried without changing user files;
-- an invalid signature is rejected;
-- the app restarts into the new version and shows its release notes once; and
-- project registrations, provider profiles, and `~/.codex` / `~/.claude` data
-  remain unchanged.
+codesign --verify --deep --strict --verbose=4 \
+  src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Mallard.app
+
+codesign -dvvv \
+  src-tauri/target/aarch64-apple-darwin/release/bundle/macos/Mallard.app
+```
+
+The DMG verification must succeed, `file` must report an `arm64` executable,
+and `codesign` must report a valid ad-hoc signature. Install this local DMG and
+complete the manual Gatekeeper approval flow before creating the tag.
+
+## Create the GitHub draft
+
+After the local installation succeeds, commit the release changes and push
+them to the default branch. Then create and push the matching tag:
+
+```bash
+git tag v0.1.2
+git push origin v0.1.2
+```
+
+Wait for the single Apple Silicon job. Inspect the draft release, download and
+install its DMG on an Apple Silicon Mac, and publish the draft only after that
+artifact passes the same checks. Do not replace an artifact for an existing
+version; fix the problem, increment the version, and create a new release.

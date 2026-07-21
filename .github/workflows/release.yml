@@ -1,4 +1,4 @@
-name: Release desktop app
+name: Release Apple Silicon app
 
 on:
   push:
@@ -11,27 +11,10 @@ concurrency:
 
 jobs:
   publish:
-    name: ${{ matrix.name }}
+    name: macOS Apple Silicon
     permissions:
       contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: macOS Apple Silicon
-            platform: macos-latest
-            target: aarch64-apple-darwin
-            bundles: app,dmg
-          - name: macOS Intel
-            platform: macos-latest
-            target: x86_64-apple-darwin
-            bundles: app,dmg
-          - name: Windows x64
-            platform: windows-latest
-            target: x86_64-pc-windows-msvc
-            bundles: nsis
-
-    runs-on: ${{ matrix.platform }}
+    runs-on: macos-latest
 
     steps:
       - name: Check out source
@@ -46,7 +29,7 @@ jobs:
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
@@ -70,18 +53,14 @@ jobs:
         uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          MALLARD_VERIFY_MACOS_BUNDLE: ${{ runner.os == 'macOS' && '1' || '' }}
+          MALLARD_VERIFY_MACOS_BUNDLE: "1"
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Mallard ${{ github.ref_name }}"
-          releaseBody: "A Mallard tester release is ready. The macOS installer uses valid ad-hoc signing and requires manual Gatekeeper approval. Review the attached installers and edit these notes before publishing."
+          releaseBody: "Apple Silicon tester build. The app is ad-hoc signed and unnotarized, so macOS requires manual approval in Privacy & Security before first launch. Verify the attached DMG before publishing this draft."
           releaseDraft: true
           prerelease: false
           retryAttempts: 2
-          uploadUpdaterJson: true
-          uploadUpdaterSignatures: true
-          updaterJsonPreferNsis: true
           args: >-
-            --target ${{ matrix.target }}
-            --bundles ${{ matrix.bundles }}
+            --target aarch64-apple-darwin
+            --bundles dmg
