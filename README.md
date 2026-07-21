@@ -12,6 +12,13 @@ copying an entire Codex home directory or credential store.
 **[Devpost submission](https://devpost.com/software/agentgithub)** ·
 **[Watch the demo](https://youtu.be/5Agu6OuaQLg)**
 
+## How Codex was used
+
+Codex was used end to end: Sol for product design and technical planning,
+ImageGen 2 for design prototyping, and Terra for implementation and iteration.
+Mallard is itself a feature for Codex, making project-scoped sessions and
+resources portable across teammates and machines.
+
 ## What Mallard does
 
 - Maps Codex sessions onto a Git branch's first-parent commit history, so a
