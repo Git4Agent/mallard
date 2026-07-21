@@ -342,7 +342,7 @@ test("selected storage adds directional indicators and storage-only threads", ()
     generation: 4,
     base_generation: 3,
     compared_at: 1_752_804_000,
-    counts: { synced: 0, local: 2, storage: 1, diverged: 0, unknown: 0 },
+    counts: { synced: 0, local: 2, storage: 1, diverged: 0, unavailable: 0, unknown: 0 },
     warnings: [],
     entries: [
       {
@@ -422,6 +422,61 @@ test("selected storage adds directional indicators and storage-only threads", ()
     html.indexOf('aria-label="Only in Local storage 1. Pull to download it here."')
       < html.indexOf("Stored thread 019f7798"),
   );
+});
+
+test("unavailable sessions explain why they cannot be synced", () => {
+  const thread = history.threads[0];
+  const comparison = {
+    project_id: project.local_project_id,
+    storage_id: "storage-1",
+    storage_name: "Local storage 1",
+    compared_at: 1_752_804_000,
+    counts: { synced: 0, local: 0, storage: 0, diverged: 0, unavailable: 1, unknown: 0 },
+    warnings: [],
+    entries: [{
+      thread_id: thread.thread_id,
+      resource_id: `codex:session:${thread.thread_id}`,
+      display_name: thread.thread_id,
+      state: "unavailable" as const,
+      local_present: true,
+      storage_present: false,
+      status_detail: "Session file exceeds the 16 MiB per-file sync limit.",
+      local_updated_at: thread.ended_at,
+    }],
+  };
+  const html = renderToStaticMarkup(
+    <ProjectChatHistoryContent
+      embedded
+      project={project}
+      binding={{
+        replica_id: "replica",
+        local_project_id: project.local_project_id,
+        bundle_id: project.bundle_id,
+        project_root: project.project_root,
+        canonical_project_root: project.project_root,
+        profile_ids: { codex: "profile-codex" },
+        state: "active",
+        revision: 1,
+        updated_at: 2,
+      }}
+      history={{ ...history, git: null }}
+      comparison={comparison}
+      activeStorageName="Local storage 1"
+      loading={false}
+      loadingMore={false}
+      actionError={null}
+      actionBusyThreadId={null}
+      onBranchChange={() => undefined}
+      onRefresh={() => undefined}
+      onLoadMore={() => undefined}
+      onOpenCodex={() => undefined}
+      onOpenTerminal={() => undefined}
+    />,
+  );
+
+  assert.match(html, /aria-label="Unavailable for sync\. Session file exceeds the 16 MiB per-file sync limit\."/);
+  assert.match(html, /title="1 thread is unavailable for sync"/);
+  assert.doesNotMatch(html, /can.t tell which copy is newer/);
 });
 
 test("non-Git history renders a flat Codex thread list", () => {

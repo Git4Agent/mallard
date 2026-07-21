@@ -408,6 +408,7 @@ pub enum ThreadSyncState {
     StorageOnly,
     StorageAhead,
     Diverged,
+    Unavailable,
     Unknown,
 }
 
@@ -420,6 +421,8 @@ pub struct ThreadSyncEntry {
     pub local_present: bool,
     pub storage_present: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub status_detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub local_updated_at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub storage_updated_at: Option<u64>,
@@ -431,6 +434,7 @@ pub struct ThreadSyncCounts {
     pub local: usize,
     pub storage: usize,
     pub diverged: usize,
+    pub unavailable: usize,
     pub unknown: usize,
 }
 
@@ -3215,6 +3219,13 @@ struct ThreadVersion {
     updated_at: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
+struct LocalThreadDescriptor {
+    thread_id: String,
+    display_name: String,
+    blocked_reason: Option<String>,
+}
+
 fn is_codex_thread_resource(resource_id: &ResourceId, kind: ResourceKind) -> bool {
     kind == ResourceKind::CodexConversation && resource_id.as_str().starts_with("codex:session:")
 }
@@ -3270,12 +3281,35 @@ fn classify_thread_sync_state(
     }
 }
 
+fn thread_capture_unavailable_detail(blocked_reason: Option<&str>) -> String {
+    let Some(reason) = blocked_reason else {
+        return "Session could not be read safely during this scan.".to_string();
+    };
+    if reason.contains(&format!(
+        "exceeds {} bytes",
+        provider_capture::MAX_FILE_BYTES
+    )) {
+        return format!(
+            "Session file exceeds the {} MiB per-file sync limit.",
+            provider_capture::MAX_FILE_BYTES / (1024 * 1024)
+        );
+    }
+    if reason.contains("hard-linked") {
+        return "Session file is hard-linked and cannot be synced safely.".to_string();
+    }
+    if reason.contains("not a regular no-follow file") {
+        return "Session path is not a regular file and cannot be synced safely.".to_string();
+    }
+    "Session is unavailable for safe capture.".to_string()
+}
+
 fn count_thread_sync_state(counts: &mut ThreadSyncCounts, state: ThreadSyncState) {
     match state {
         ThreadSyncState::Synced => counts.synced += 1,
         ThreadSyncState::LocalOnly | ThreadSyncState::LocalAhead => counts.local += 1,
         ThreadSyncState::StorageOnly | ThreadSyncState::StorageAhead => counts.storage += 1,
         ThreadSyncState::Diverged => counts.diverged += 1,
+        ThreadSyncState::Unavailable => counts.unavailable += 1,
         ThreadSyncState::Unknown => counts.unknown += 1,
     }
 }
@@ -3322,10 +3356,11 @@ fn get_project_thread_sync_comparison_with_repository(
         .map(|candidate| {
             Ok((
                 ResourceId::parse(candidate.resource_id.clone())?,
-                (
-                    candidate.display_name.clone(),
-                    candidate.display_name.clone(),
-                ),
+                LocalThreadDescriptor {
+                    thread_id: candidate.display_name.clone(),
+                    display_name: candidate.display_name.clone(),
+                    blocked_reason: candidate.blocked_reason.clone(),
+                },
             ))
         })
         .collect::<Result<BTreeMap<_, _>, String>>()?;
@@ -3443,11 +3478,21 @@ fn get_project_thread_sync_comparison_with_repository(
                 || base_version
                     .and_then(|version| version.digest.as_deref())
                     .is_some());
-        let incomplete = unavailable.contains(&resource_id)
-            || (local_present && local_digest.is_none())
-            || (storage_present && storage_digest.is_none());
-        let state = if incomplete {
-            ThreadSyncState::Unknown
+        let local_descriptor = local_descriptors.get(&resource_id);
+        let local_unavailable =
+            unavailable.contains(&resource_id) || (local_present && local_digest.is_none());
+        let storage_unavailable = storage_present && storage_digest.is_none();
+        let status_detail = if local_unavailable {
+            Some(thread_capture_unavailable_detail(
+                local_descriptor.and_then(|descriptor| descriptor.blocked_reason.as_deref()),
+            ))
+        } else if storage_unavailable {
+            Some("Stored session metadata is incomplete and cannot be compared safely.".to_string())
+        } else {
+            None
+        };
+        let state = if status_detail.is_some() {
+            ThreadSyncState::Unavailable
         } else {
             classify_thread_sync_state(
                 local_digest,
@@ -3457,14 +3502,13 @@ fn get_project_thread_sync_comparison_with_repository(
             )
         };
         let descriptor = local.or(remote).or(base_version);
-        let local_descriptor = local_descriptors.get(&resource_id);
         let thread_id = descriptor
             .map(|version| version.thread_id.clone())
-            .or_else(|| local_descriptor.map(|(thread_id, _)| thread_id.clone()))
+            .or_else(|| local_descriptor.map(|descriptor| descriptor.thread_id.clone()))
             .unwrap_or_else(|| resource_id.as_str().to_string());
         let display_name = descriptor
             .map(|version| version.display_name.clone())
-            .or_else(|| local_descriptor.map(|(_, display_name)| display_name.clone()))
+            .or_else(|| local_descriptor.map(|descriptor| descriptor.display_name.clone()))
             .unwrap_or_else(|| thread_id.clone());
         count_thread_sync_state(&mut counts, state);
         entries.push(ThreadSyncEntry {
@@ -3474,6 +3518,7 @@ fn get_project_thread_sync_comparison_with_repository(
             state,
             local_present,
             storage_present,
+            status_detail,
             local_updated_at: local.and_then(|version| version.updated_at),
             storage_updated_at: remote.and_then(|version| version.updated_at),
         });
@@ -3620,6 +3665,7 @@ fn capability_state_name(state: ThreadSyncState) -> &'static str {
         ThreadSyncState::StorageOnly => "storage_only",
         ThreadSyncState::StorageAhead => "storage_ahead",
         ThreadSyncState::Diverged => "diverged",
+        ThreadSyncState::Unavailable => "unavailable",
         ThreadSyncState::Unknown => "unknown",
     }
 }
@@ -8397,6 +8443,23 @@ mod tests {
             classify_thread_sync_state(None, Some("storage"), false, None),
             ThreadSyncState::StorageOnly
         );
+    }
+
+    #[test]
+    fn unavailable_thread_state_reports_the_capture_limit() {
+        let reason = format!(
+            "'/tmp/session.jsonl' exceeds {} bytes",
+            provider_capture::MAX_FILE_BYTES
+        );
+        assert_eq!(
+            thread_capture_unavailable_detail(Some(&reason)),
+            "Session file exceeds the 16 MiB per-file sync limit."
+        );
+
+        let mut counts = ThreadSyncCounts::default();
+        count_thread_sync_state(&mut counts, ThreadSyncState::Unavailable);
+        assert_eq!(counts.unavailable, 1);
+        assert_eq!(counts.unknown, 0);
     }
 
     #[test]

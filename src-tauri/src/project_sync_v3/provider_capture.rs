@@ -18,7 +18,7 @@ use super::domain;
 use super::global_inventory;
 
 const MAX_DISCOVERED_FILES: usize = 20_000;
-const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub(crate) const MAX_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_CAPTURE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 1024 * 1024;
 const MAX_METADATA_LINES: usize = 128;

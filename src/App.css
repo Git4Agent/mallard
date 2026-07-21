@@ -8732,7 +8732,8 @@ div.storage-link-main {
 .v3-thread-sync-summary .local { color: var(--accent); }
 .v3-thread-sync-summary .storage { color: var(--text-1); }
 .v3-thread-sync-summary .diverged { color: var(--yellow); }
-.v3-thread-sync-summary .unknown { color: var(--text-3); }
+.v3-thread-sync-summary .unavailable { color: var(--red); }
+.v3-thread-sync-summary .needs-baseline { color: var(--text-3); }
 
 .v3-thread-sync-loading {
   width: 24px;
@@ -9043,6 +9044,7 @@ div.storage-link-main {
 .v3-thread-sync-indicator.storage { color: var(--text-1); }
 .v3-thread-sync-indicator.diverged,
 .v3-thread-sync-error { color: var(--yellow); }
+.v3-thread-sync-indicator.unavailable { color: var(--red); }
 
 .v3-thread-sync-indicator::after,
 .v3-thread-sync-error::after {
@@ -9609,6 +9611,10 @@ div.storage-link-main {
 .v3-sync-review-state.state-storage_ahead,
 .v3-sync-review-state.state-diverged {
   color: var(--yellow);
+}
+
+.v3-sync-review-state.state-unavailable {
+  color: var(--red);
 }
 
 .v3-capability-row.v3-capability-selectable {

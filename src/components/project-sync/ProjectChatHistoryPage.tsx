@@ -7,7 +7,6 @@ import type {
   ProjectChatHistory,
   ThreadSyncComparison,
   ThreadSyncEntry,
-  ThreadSyncState,
 } from "../../types";
 import Icon from "../Icons";
 import { projectSyncApi } from "./api";
@@ -78,8 +77,8 @@ function formatCount(value?: number | null): string {
   return new Intl.NumberFormat(undefined, { notation: value >= 1_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value);
 }
 
-function threadSyncPresentation(state: ThreadSyncState, storageName: string) {
-  switch (state) {
+function threadSyncPresentation(entry: ThreadSyncEntry, storageName: string) {
+  switch (entry.state) {
     case "synced":
       return { icon: "check-circle" as const, className: "synced", label: `Up to date here and in ${storageName}.` };
     case "local_only":
@@ -92,13 +91,19 @@ function threadSyncPresentation(state: ThreadSyncState, storageName: string) {
       return { icon: "download" as const, className: "storage", label: `Newer in ${storageName}. Pull to update this computer.` };
     case "diverged":
       return { icon: "alert-triangle" as const, className: "diverged", label: `Changed here and in ${storageName}. Review before syncing.` };
+    case "unavailable":
+      return {
+        icon: "ban" as const,
+        className: "unavailable",
+        label: `Unavailable for sync. ${entry.status_detail ?? "Mallard could not safely read this session."}`,
+      };
     default:
-      return { icon: "help-circle" as const, className: "unknown", label: `Mallard can’t tell which copy is newer in ${storageName}.` };
+      return { icon: "help-circle" as const, className: "needs-baseline", label: `Comparison baseline needed in ${storageName}. Pull or Push to establish one.` };
   }
 }
 
 function ThreadSyncIndicator({ entry, storageName }: { entry: ThreadSyncEntry; storageName: string }) {
-  const presentation = threadSyncPresentation(entry.state, storageName);
+  const presentation = threadSyncPresentation(entry, storageName);
   return (
     <span
       className={`v3-thread-sync-indicator ${presentation.className}`}
@@ -155,6 +160,7 @@ function syncReviewStateLabel(
   selected: boolean,
 ): string | null {
   if (!entry) return mode === "push" ? "Local session" : null;
+  if (entry.state === "unavailable") return "Unavailable for sync";
   if (mode === "push") {
     if (entry.state === "storage_only" || entry.state === "storage_ahead" || entry.state === "diverged") {
       return "Pull required";
@@ -363,14 +369,15 @@ export function ProjectChatHistoryContent({
   const visibleComparisonCounts = useMemo(() => {
     const visibleThreadIds = new Set(threads.keys());
     storedOnlyEntries.forEach((entry) => visibleThreadIds.add(entry.thread_id));
-    const counts = { local: 0, storage: 0, diverged: 0, unknown: 0 };
+    const counts = { local: 0, storage: 0, diverged: 0, unavailable: 0, needsBaseline: 0 };
 
     for (const entry of comparison?.entries ?? []) {
       if (!visibleThreadIds.has(entry.thread_id)) continue;
       if (entry.state === "local_only" || entry.state === "local_ahead") counts.local += 1;
       else if (entry.state === "storage_only" || entry.state === "storage_ahead") counts.storage += 1;
       else if (entry.state === "diverged") counts.diverged += 1;
-      else if (entry.state === "unknown") counts.unknown += 1;
+      else if (entry.state === "unavailable") counts.unavailable += 1;
+      else if (entry.state === "unknown") counts.needsBaseline += 1;
     }
 
     return counts;
@@ -378,7 +385,8 @@ export function ProjectChatHistoryContent({
   const visibleComparisonChangeCount = visibleComparisonCounts.local
     + visibleComparisonCounts.storage
     + visibleComparisonCounts.diverged
-    + visibleComparisonCounts.unknown;
+    + visibleComparisonCounts.unavailable
+    + visibleComparisonCounts.needsBaseline;
   const renderThread = (thread: CodexThreadSummary, key: string) => {
     const entry = syncByThread.get(thread.thread_id);
     const resourceId = entry?.resource_id ?? `codex:session:${thread.thread_id}`;
@@ -470,7 +478,8 @@ export function ProjectChatHistoryContent({
                     {visibleComparisonCounts.local > 0 && <span className="local" title={`${visibleComparisonCounts.local} local thread change${visibleComparisonCounts.local === 1 ? "" : "s"}`}><Icon name="upload" size={12} />{visibleComparisonCounts.local}</span>}
                     {visibleComparisonCounts.storage > 0 && <span className="storage" title={`${visibleComparisonCounts.storage} thread change${visibleComparisonCounts.storage === 1 ? "" : "s"} in ${comparisonStorageName}`}><Icon name="download" size={12} />{visibleComparisonCounts.storage}</span>}
                     {visibleComparisonCounts.diverged > 0 && <span className="diverged" title={`${visibleComparisonCounts.diverged} diverged thread${visibleComparisonCounts.diverged === 1 ? "" : "s"}`}><Icon name="alert-triangle" size={12} />{visibleComparisonCounts.diverged}</span>}
-                    {visibleComparisonCounts.unknown > 0 && <span className="unknown" title={`${visibleComparisonCounts.unknown} thread state${visibleComparisonCounts.unknown === 1 ? "" : "s"} could not be determined`}><Icon name="help-circle" size={12} />{visibleComparisonCounts.unknown}</span>}
+                    {visibleComparisonCounts.unavailable > 0 && <span className="unavailable" title={`${visibleComparisonCounts.unavailable} thread${visibleComparisonCounts.unavailable === 1 ? " is" : "s are"} unavailable for sync`}><Icon name="ban" size={12} />{visibleComparisonCounts.unavailable}</span>}
+                    {visibleComparisonCounts.needsBaseline > 0 && <span className="needs-baseline" title={`${visibleComparisonCounts.needsBaseline} thread${visibleComparisonCounts.needsBaseline === 1 ? " needs" : "s need"} a comparison baseline`}><Icon name="help-circle" size={12} />{visibleComparisonCounts.needsBaseline}</span>}
                   </span>
                 )}
               </span>

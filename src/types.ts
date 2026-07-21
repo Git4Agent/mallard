@@ -1061,6 +1061,7 @@ export type ThreadSyncState =
   | "storage_only"
   | "storage_ahead"
   | "diverged"
+  | "unavailable"
   | "unknown";
 
 export interface ThreadSyncEntry {
@@ -1070,6 +1071,7 @@ export interface ThreadSyncEntry {
   state: ThreadSyncState;
   local_present: boolean;
   storage_present: boolean;
+  status_detail?: string | null;
   local_updated_at?: number | null;
   storage_updated_at?: number | null;
 }
@@ -1079,6 +1081,7 @@ export interface ThreadSyncCounts {
   local: number;
   storage: number;
   diverged: number;
+  unavailable: number;
   unknown: number;
 }
 

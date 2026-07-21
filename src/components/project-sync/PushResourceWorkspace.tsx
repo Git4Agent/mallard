@@ -99,6 +99,7 @@ function pushBlockerKind(
   if (state === "unknown") {
     return storagePresent ? "storage" : selected ? "local" : null;
   }
+  if (state === "unavailable") return selected ? "local" : null;
   if (state === "blocked") return selected ? "local" : null;
   return null;
 }
@@ -174,7 +175,9 @@ export function pushSelectableResourceIds(
 ): Set<string> {
   const blockedIds = new Set<string>();
   for (const entry of threadComparison?.entries ?? []) {
-    if ((entry.state as string) === "blocked") blockedIds.add(entry.resource_id);
+    if (entry.state === "unavailable" || (entry.state as string) === "blocked") {
+      blockedIds.add(entry.resource_id);
+    }
   }
   for (const item of capabilityReport?.items ?? []) {
     if (item.state === "blocked" || item.blocked_reason) blockedIds.add(item.resource_id);
