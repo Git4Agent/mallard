@@ -539,21 +539,25 @@ impl V3Repository {
                 error
             )
         })?;
-        if let Ok(metadata) = fs::symlink_metadata(&self.root) {
-            if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        match fs::symlink_metadata(&self.root) {
+            Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
+            }
+            Ok(_) => {
                 return Err(format!(
                     "metadata directory '{}' is not a real directory",
                     self.root.display()
                 ));
             }
-        } else {
-            fs::create_dir(&self.root).map_err(|error| {
-                format!(
-                    "create metadata directory '{}': {}",
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                create_metadata_root(&self.root)?;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "inspect metadata directory '{}': {}",
                     self.root.display(),
                     error
-                )
-            })?;
+                ));
+            }
         }
         #[cfg(unix)]
         {
@@ -619,6 +623,23 @@ fn persistence_guard() -> Result<std::sync::MutexGuard<'static, ()>, String> {
     PERSISTENCE_LOCK
         .lock()
         .map_err(|_| "project-sync persistence lock is poisoned".to_string())
+}
+
+fn create_metadata_root(path: &Path) -> Result<(), String> {
+    match fs::create_dir(path) {
+        Ok(()) => Ok(()),
+        // Multiple startup commands can all observe a missing first-run root.
+        // The process that loses creation must validate the winner rather than
+        // report a harmless EEXIST as a backend failure.
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            ensure_real_directory(path)
+        }
+        Err(error) => Err(format!(
+            "create metadata directory '{}': {}",
+            path.display(),
+            error
+        )),
+    }
 }
 
 fn ensure_real_directory(path: &Path) -> Result<(), String> {
@@ -816,6 +837,16 @@ mod tests {
             .unwrap();
         assert_eq!(returned.as_str(), "project-a");
         assert_eq!(repo.load_config().unwrap().revision, 1);
+    }
+
+    #[test]
+    fn metadata_root_creation_accepts_a_concurrent_winner() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join(".mallard");
+        fs::create_dir(&root).unwrap();
+
+        create_metadata_root(&root).unwrap();
+        assert!(root.is_dir());
     }
 
     #[test]

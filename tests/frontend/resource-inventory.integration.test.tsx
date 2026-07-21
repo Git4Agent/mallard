@@ -1,8 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import PushResourceWorkspace from "../../src/components/project-sync/PushResourceWorkspace";
+import PushResourceWorkspace, {
+  nextPushReviewStep,
+} from "../../src/components/project-sync/PushResourceWorkspace";
 import ResourceInventory from "../../src/components/project-sync/ResourceInventory";
+import { recipeWithSelection } from "../../src/components/project-sync/model";
 import type { ProjectResourceDescriptor } from "../../src/types";
 
 function standaloneSkill(
@@ -94,6 +97,18 @@ test("duplicate effective-name claims remain unselectable", () => {
   assert.equal(disabledInputs.length, 2);
 });
 
+test("blocked resources cannot enter a published recipe", () => {
+  const allowed = standaloneSkill("frontend-skill", "frontend-skill");
+  const blocked = standaloneSkill("broken-skill", "broken-skill", "SKILL.md is unreadable");
+  const recipe = recipeWithSelection(
+    { schema_version: 1, revision: 3, entries: {} },
+    [allowed, blocked],
+    new Set([allowed.resource_id, blocked.resource_id]),
+  );
+
+  assert.deepEqual(Object.keys(recipe.entries), [allowed.resource_id]);
+});
+
 test("the push chooser shows one concise selection summary", () => {
   const resource = standaloneSkill("review", "review");
   const html = renderToStaticMarkup(
@@ -103,6 +118,7 @@ test("the push chooser shows one concise selection summary", () => {
       projectDefaults={new Set([resource.resource_id])}
       busy={false}
       error={null}
+      initialStep="review"
       onToggle={() => undefined}
       onUseProjectDefaults={() => undefined}
       onClear={() => undefined}
@@ -111,9 +127,39 @@ test("the push chooser shows one concise selection summary", () => {
     />,
   );
 
-  assert.match(html, />Push resources</);
-  assert.match(html, />Defaults \(1\)</);
+  assert.match(html, />Push review</);
+  assert.match(html, /v3-sync-review-title/);
+  assert.match(html, /Push review<\/h2><span class="v3-sync-review-hint">Choose what to include<\/span>/);
+  assert.match(html, />Recommended \(1\)</);
+  assert.match(html, />Review</);
+  assert.match(html, /Back: Plugins/);
   assert.match(html, />Push 1 resource</);
   assert.doesNotMatch(html, /Choose resources to push/);
   assert.doesNotMatch(html, /last selection|selection will be remembered|resource selected/i);
+});
+
+test("the push chooser provides contextual back and next actions", () => {
+  const resource = standaloneSkill("review", "review");
+  const html = renderToStaticMarkup(
+    <PushResourceWorkspace
+      resources={[resource]}
+      selected={new Set([resource.resource_id])}
+      projectDefaults={new Set([resource.resource_id])}
+      busy={false}
+      error={null}
+      initialStep="skills"
+      onToggle={() => undefined}
+      onUseProjectDefaults={() => undefined}
+      onClear={() => undefined}
+      onClose={() => undefined}
+      onPush={() => undefined}
+    />,
+  );
+
+  assert.match(html, /Back: Git &amp; sessions/);
+  assert.match(html, /Next: Plugins/);
+  assert.equal(nextPushReviewStep("history"), "skills");
+  assert.equal(nextPushReviewStep("skills"), "plugins");
+  assert.equal(nextPushReviewStep("plugins"), "review");
+  assert.equal(nextPushReviewStep("review"), "review");
 });

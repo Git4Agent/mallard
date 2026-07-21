@@ -8008,12 +8008,7 @@ fn emit_progress(app: &AppHandle, done: usize, total: usize) {
 }
 
 pub(crate) fn emit_log<R: tauri::Runtime>(app: &tauri::AppHandle<R>, level: &str, message: &str) {
-    activity_log::emit_typed_log(
-        app,
-        activity_log::ActivityLogType::System,
-        level,
-        message,
-    );
+    activity_log::emit_typed_log(app, activity_log::ActivityLogType::System, level, message);
 }
 
 fn now_secs() -> u64 {
@@ -10632,11 +10627,13 @@ fn commands_used_by_run() {
         project_sync_v3::commands::discard_restore_plan,
         project_sync_v3::commands::discover_project,
         project_sync_v3::commands::get_bundle_inventory,
+        project_sync_v3::commands::inspect_project_files,
         project_sync_v3::commands::list_remote_bundles,
         project_sync_v3::commands::list_remote_bundle_snapshots,
         project_sync_v3::commands::find_remote_bundle_matches,
         project_sync_v3::commands::fetch_bundle,
         project_sync_v3::commands::get_bundle_status,
+        project_sync_v3::commands::get_project_capability_status,
         project_sync_v3::commands::get_project_thread_sync_comparison,
         project_sync_v3::commands::push_bundle,
         project_sync_v3::commands::plan_bundle_restore,
@@ -10733,11 +10730,13 @@ pub fn run() {
             project_sync_v3::commands::discard_restore_plan,
             project_sync_v3::commands::discover_project,
             project_sync_v3::commands::get_bundle_inventory,
+            project_sync_v3::commands::inspect_project_files,
             project_sync_v3::commands::list_remote_bundles,
             project_sync_v3::commands::list_remote_bundle_snapshots,
             project_sync_v3::commands::find_remote_bundle_matches,
             project_sync_v3::commands::fetch_bundle,
             project_sync_v3::commands::get_bundle_status,
+            project_sync_v3::commands::get_project_capability_status,
             project_sync_v3::commands::get_project_thread_sync_comparison,
             project_sync_v3::commands::push_bundle,
             project_sync_v3::commands::plan_bundle_restore,

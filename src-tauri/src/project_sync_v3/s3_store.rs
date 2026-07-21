@@ -40,7 +40,7 @@ pub struct S3BundleObjectStore {
 impl S3BundleObjectStore {
     /// Build a schema-3 store using the application's existing S3/R2 client
     /// configuration path.  An explicitly unsupported conditional-write
-    /// capability is rejected: schema 3 publishes mutable heads only by CAS.
+    /// capability is rejected: schema 4 publishes mutable heads only by CAS.
     pub fn from_config(config: &StorageConfigV3, runtime: Handle) -> Result<Self, String> {
         config.validate()?;
         if config.kind != StorageKind::S3 {

@@ -2,7 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import ProjectBindingEditor from "../../src/components/project-sync/ProjectBindingEditor";
-import ProjectLinksWorkspace from "../../src/components/project-sync/ProjectLinksWorkspace";
+import ProjectLinksWorkspace, {
+  projectPushActionLabel,
+  storageActionLockedForReview,
+} from "../../src/components/project-sync/ProjectLinksWorkspace";
 import {
   configuredProjectProvider,
   singleProviderSelection,
@@ -46,6 +49,23 @@ test("provider selection keeps exactly one project profile", () => {
     ),
     { claude: "profile-claude" },
   );
+});
+
+test("the project Push action describes its workflow state", () => {
+  assert.equal(projectPushActionLabel({ reviewOpen: false, preparing: false, publishing: false }), "Push");
+  assert.equal(projectPushActionLabel({ reviewOpen: false, preparing: true, publishing: false }), "Preparing…");
+  assert.equal(projectPushActionLabel({ reviewOpen: true, preparing: false, publishing: false }), "Continue push");
+  assert.equal(projectPushActionLabel({ reviewOpen: true, preparing: false, publishing: true }), "Pushing…");
+});
+
+test("an open sync review locks storage controls and the opposite sync action", () => {
+  assert.equal(storageActionLockedForReview("push", "storage"), true);
+  assert.equal(storageActionLockedForReview("push", "pull"), true);
+  assert.equal(storageActionLockedForReview("push", "push"), false);
+  assert.equal(storageActionLockedForReview("pull", "storage"), true);
+  assert.equal(storageActionLockedForReview("pull", "push"), true);
+  assert.equal(storageActionLockedForReview("pull", "pull"), false);
+  assert.equal(storageActionLockedForReview(null, "storage"), false);
 });
 
 test("binding setup renders one profile editor behind an explicit agent choice", () => {
@@ -172,7 +192,6 @@ test("the configured profile keeps a repair action inline with the storage headi
       conversationPathAudits={{ [projectId]: audit }}
       conversationPathAuditErrors={{}}
       conversationPathAuditLoading={false}
-      onSelectProject={() => undefined}
       onSelectStorage={() => undefined}
       onLinkStorage={() => undefined}
       onUnlinkStorage={() => undefined}
@@ -184,13 +203,6 @@ test("the configured profile keeps a repair action inline with the storage headi
       onAddProject={() => undefined}
       onOpenStorageSettings={() => undefined}
       onSaveStorage={() => undefined}
-      inlineStorageReview={{
-        kind: "push",
-        projectId,
-        storageId,
-        content: <span>Push review</span>,
-        onClose: () => undefined,
-      }}
     />,
   );
 
@@ -199,7 +211,6 @@ test("the configured profile keeps a repair action inline with the storage headi
   const storageActionsIndex = html.indexOf("project-profile-storage-actions", storageHeadingIndex);
   const addStorageIndex = html.indexOf(">Add storage<", storageHeadingIndex);
   const storageIndex = html.indexOf("storage-link-block");
-  const settingsIndex = html.indexOf('aria-label="Hide project settings"');
   const activityIndex = html.indexOf(">Activity<");
 
   assert.ok(warningIndex >= 0);
@@ -208,19 +219,21 @@ test("the configured profile keeps a repair action inline with the storage headi
   assert.ok(addStorageIndex > storageActionsIndex);
   assert.ok(addStorageIndex < storageIndex);
   assert.ok(storageIndex > warningIndex);
-  assert.ok(settingsIndex >= 0);
-  assert.ok(settingsIndex < storageHeadingIndex);
   assert.ok(activityIndex > storageIndex);
-  assert.match(html, /aria-expanded="true" aria-controls="project-configuration-panel"/);
-  assert.doesNotMatch(html, /Close project settings/);
+  assert.doesNotMatch(html, /Show project settings|Hide project settings|Close project settings/);
   assert.equal(html.match(/conversation-path-repair-notice/g)?.length, 1);
-  assert.equal(html.match(/class="storage-link-block/g)?.length, 2);
-  assert.equal(html.match(/class="storage-link-unlink"/g)?.length, 2);
-  assert.equal(html.match(/type="radio"/g)?.length, 2);
-  assert.match(html, /aria-label="Compare threads with Local storage"[^>]*checked=""/);
-  assert.match(html, /aria-label="Compare threads with R2 storage"/);
+  assert.equal(html.match(/class="storage-link-block/g)?.length, 1);
+  assert.equal(html.match(/class="storage-link-unlink"/g)?.length, 1);
+  assert.doesNotMatch(html, /type="radio"/);
+  assert.match(html, /aria-label="Active storage: Local storage\. Choose another storage"/);
+  assert.match(html, /role="menu" aria-label="Choose active storage" hidden=""/);
+  assert.equal(html.match(/class="storage-link-menu-option/g)?.length, 2);
+  assert.equal(html.match(/role="menuitemradio"/g)?.length, 2);
+  assert.match(html, /role="menuitemradio" aria-checked="true" class="storage-link-menu-option selected"/);
+  assert.match(html, /storage-link-menu-copy"><strong>Local storage<\/strong><span[^>]*>~\/storage<\/span>/);
+  assert.match(html, /storage-link-menu-copy"><strong>R2 storage<\/strong><span[^>]*>agent<\/span>/);
   assert.match(html, /aria-label="Unlink Local storage from Project one"/);
-  assert.match(html, /aria-label="Unlink R2 storage from Project one"/);
+  assert.doesNotMatch(html, /aria-label="Unlink R2 storage from Project one"/);
   assert.equal(html.match(/class="storage-link-profile-section/g)?.length ?? 0, 0);
   assert.match(html, /aria-label="2 linked storage locations"/);
   assert.match(html, /project-profile-storage-icon/);

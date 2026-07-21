@@ -59,7 +59,7 @@ export default function BundleConnectionDialog({
             </h1>
             <p>
               {missing
-                ? `${projectName} has a local-only identity. Choose which existing repo it should pull from.`
+                ? `${projectName} has a local-only identity. Pull from an existing repo, or publish this one separately.`
                 : `${storage.name} contains the repos below. Git matches are recommended, but every repo remains available.`}
             </p>
           </div>
@@ -126,7 +126,7 @@ export default function BundleConnectionDialog({
 
         <footer className="v3-modal-footer">
           <button type="button" className="btn btn-ghost" onClick={onKeepCurrent} disabled={busy}>
-            {missing ? "Keep local-only repo" : "Create separate repo"}
+            {missing ? "Review separate Push" : "Create separate repo"}
           </button>
           <div>
             <button type="button" className="btn" onClick={onCancel} disabled={busy}>Cancel</button>

@@ -1,4 +1,4 @@
-//! Schema-3 project-sync domain model.
+//! Schema-3 local project-sync state and schema-4 portable bundle model.
 //!
 //! This module intentionally contains no Tauri or filesystem code.  All
 //! strings which can become cloud namespace components are validated on
@@ -6,13 +6,14 @@
 //! turn untrusted JSON into an unchecked path or identifier.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::path::{Component, Path};
 
 pub const LOCAL_SCHEMA_V3: u32 = 3;
 pub const MACHINE_PROJECT_SCHEMA_V1: u32 = 1;
-pub const BUNDLE_SCHEMA_V3: u32 = 3;
+pub const BUNDLE_SCHEMA_V4: u32 = 4;
 pub const RECIPE_SCHEMA_V1: u32 = 1;
 pub const RESTORE_PLAN_SCHEMA_V1: u32 = 1;
 pub const DEPENDENCY_PLAN_SCHEMA_V1: u32 = 1;
@@ -30,6 +31,8 @@ pub const MAX_FILES: usize = 100_000;
 pub const MAX_ACTIONS: usize = 100_000;
 pub const MAX_LOGICAL_PATH_BYTES: usize = 1_024;
 pub const MAX_FILE_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_PROJECT_CONTENT_FILE_BYTES: u64 = 16 * 1024 * 1024;
+pub const MAX_PROJECT_CONTENT_TOTAL_BYTES: u64 = 512 * 1024 * 1024;
 
 const WINDOWS_RESERVED_NAMES: &[&str] = &[
     "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
@@ -407,6 +410,8 @@ pub enum ResourceKind {
     CodexConversation,
     ClaudeConversation,
     ProjectFile,
+    ProjectContentFile,
+    ProjectContentDirectory,
     ProjectMemory,
     Agent,
     Command,
@@ -707,9 +712,139 @@ pub struct ProjectStorageLink {
     /// schema-3 links fall back to the project's default recipe.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recipe: Option<BundleRecipe>,
+    /// Machine-local, destination-specific decisions for generic project
+    /// content. These preferences are never serialized into a remote bundle.
+    #[serde(default)]
+    pub project_content_preferences: ProjectContentPreferences,
     #[serde(default)]
     pub pinned: bool,
     pub created_at: u64,
+}
+
+pub const PROJECT_CONTENT_PREFERENCES_SCHEMA_V1: u32 = 1;
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ProjectContentPreferences {
+    pub schema_version: u32,
+    pub revision: u64,
+    #[serde(default)]
+    pub excluded_resource_ids: BTreeSet<ResourceId>,
+}
+
+impl Default for ProjectContentPreferences {
+    fn default() -> Self {
+        Self {
+            schema_version: PROJECT_CONTENT_PREFERENCES_SCHEMA_V1,
+            revision: 0,
+            excluded_resource_ids: BTreeSet::new(),
+        }
+    }
+}
+
+impl ProjectContentPreferences {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != PROJECT_CONTENT_PREFERENCES_SCHEMA_V1 {
+            return Err(format!(
+                "unsupported project-content preferences schema {}",
+                self.schema_version
+            ));
+        }
+        if self.excluded_resource_ids.len() > MAX_RESOURCES {
+            return Err(format!(
+                "project-content preferences exceed {} exclusions",
+                MAX_RESOURCES
+            ));
+        }
+        if let Some(resource_id) = self
+            .excluded_resource_ids
+            .iter()
+            .find(|resource_id| !is_project_content_resource_id(resource_id))
+        {
+            return Err(format!(
+                "project-content preferences contain non-content resource '{}'",
+                resource_id
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub fn is_project_content_resource_id(resource_id: &ResourceId) -> bool {
+    resource_id.as_str().starts_with("project:content-file:")
+        || resource_id.as_str().starts_with("project:content-dir:")
+}
+
+fn project_content_identity(
+    entry_type: &str,
+    logical_path: &LogicalPath,
+) -> Result<(String, ResourceId), String> {
+    let relative_path = logical_path
+        .as_str()
+        .strip_prefix("project/")
+        .filter(|relative| !relative.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "project-content path '{}' is outside the project namespace",
+                logical_path
+            )
+        })?;
+    let digest = Sha256::digest(format!("{}\0{}", entry_type, relative_path).as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(&mut hex, "{:02x}", byte);
+    }
+    let prefix = match entry_type {
+        "file" => "project:content-file:",
+        "dir" => "project:content-dir:",
+        _ => {
+            return Err(format!(
+                "unsupported project-content entry type '{}'",
+                entry_type
+            ))
+        }
+    };
+    Ok((
+        relative_path.to_string(),
+        ResourceId::parse(format!("{}{}", prefix, hex))?,
+    ))
+}
+
+fn validate_project_content_descriptor_identity(
+    descriptor: &ResourceDescriptor,
+    logical_path: &LogicalPath,
+    entry_type: &str,
+) -> Result<(), String> {
+    let (relative_path, expected_id) = project_content_identity(entry_type, logical_path)?;
+    if descriptor.resource_id != expected_id {
+        return Err(format!(
+            "project-content resource '{}' does not match {} path '{}'",
+            descriptor.resource_id, entry_type, logical_path
+        ));
+    }
+    match &descriptor.provenance {
+        Provenance::ProjectLocal {
+            relative_path: provenance,
+        } if provenance == &relative_path => {}
+        _ => {
+            return Err(format!(
+                "project-content resource '{}' has mismatched path provenance",
+                descriptor.resource_id
+            ));
+        }
+    }
+    if descriptor.scope != ResourceScope::Project
+        || descriptor.apply_policy != ApplyPolicy::ExplicitReview
+        || descriptor.codec_version != 1
+        || descriptor.provider.is_some()
+        || descriptor.relative_cwd.is_some()
+    {
+        return Err(format!(
+            "project-content resource '{}' has invalid descriptor policy",
+            descriptor.resource_id
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -792,6 +927,7 @@ impl SyncConfigV3 {
             if let Some(recipe) = &link.recipe {
                 recipe.validate()?;
             }
+            link.project_content_preferences.validate()?;
             if !cells.insert((link.local_project_id.clone(), link.storage_id.clone())) {
                 return Err(format!(
                     "duplicate project/storage link '{}'/ '{}'",
@@ -1000,9 +1136,10 @@ impl MachineProjectState {
                 // use the same provider profile.
                 let folded = binding.canonical_project_root.to_lowercase();
                 for profile_id in binding.profile_ids.values() {
-                    if let Some(other) = active_root_profiles
-                        .insert((folded.clone(), profile_id.clone()), &binding.local_project_id)
-                    {
+                    if let Some(other) = active_root_profiles.insert(
+                        (folded.clone(), profile_id.clone()),
+                        &binding.local_project_id,
+                    ) {
                         return Err(format!(
                             "projects '{}' and '{}' use the same provider config for one checkout",
                             other, binding.local_project_id
@@ -1259,6 +1396,23 @@ pub struct BundleFileEntry {
     pub mode: Option<u32>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct BundleDirectoryEntry {
+    pub resource_id: ResourceId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    pub source_mtime: u64,
+}
+
+impl BundleDirectoryEntry {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.mode.is_some_and(|mode| mode & !0o777 != 0) {
+            return Err("bundle directory mode contains unsafe bits".to_string());
+        }
+        Ok(())
+    }
+}
+
 impl BundleFileEntry {
     pub fn validate(&self) -> Result<(), String> {
         validate_sha256("bundle file", &self.sha256)?;
@@ -1293,6 +1447,14 @@ pub enum TombstoneTarget {
         resource_id: ResourceId,
         logical_path: LogicalPath,
     },
+    ProjectContentFile {
+        resource_id: ResourceId,
+        logical_path: LogicalPath,
+    },
+    ProjectContentDirectory {
+        resource_id: ResourceId,
+        logical_path: LogicalPath,
+    },
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -1311,6 +1473,14 @@ impl Tombstone {
                 resource_id,
                 logical_path,
             } => format!("file:{}:{}", resource_id, logical_path),
+            TombstoneTarget::ProjectContentFile {
+                resource_id,
+                logical_path,
+            } => format!("project-content-file:{}:{}", resource_id, logical_path),
+            TombstoneTarget::ProjectContentDirectory {
+                resource_id,
+                logical_path,
+            } => format!("project-content-dir:{}:{}", resource_id, logical_path),
         }
     }
 
@@ -1336,7 +1506,7 @@ pub struct BundleHead {
 
 impl BundleHead {
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != BUNDLE_SCHEMA_V3 {
+        if self.schema_version != BUNDLE_SCHEMA_V4 {
             return Err(format!(
                 "unsupported bundle head schema {}",
                 self.schema_version
@@ -1369,12 +1539,14 @@ pub struct BundleManifest {
     #[serde(default)]
     pub files: BTreeMap<LogicalPath, BundleFileEntry>,
     #[serde(default)]
+    pub directories: BTreeMap<LogicalPath, BundleDirectoryEntry>,
+    #[serde(default)]
     pub tombstones: BTreeMap<String, Tombstone>,
 }
 
 impl BundleManifest {
     pub fn validate(&self) -> Result<(), String> {
-        if self.schema_version != BUNDLE_SCHEMA_V3 {
+        if self.schema_version != BUNDLE_SCHEMA_V4 {
             return Err(format!(
                 "unsupported bundle manifest schema {}",
                 self.schema_version
@@ -1385,6 +1557,7 @@ impl BundleManifest {
         self.recipe.validate()?;
         if self.resources.len() > MAX_RESOURCES
             || self.files.len() > MAX_FILES
+            || self.directories.len() > MAX_FILES
             || self.tombstones.len() > MAX_FILES
         {
             return Err("bundle manifest exceeds collection limits".to_string());
@@ -1400,30 +1573,125 @@ impl BundleManifest {
         if recipe_ids != resource_ids {
             return Err("manifest recipe and live resources differ".to_string());
         }
-        let mut folded_paths = BTreeMap::<String, &LogicalPath>::new();
-        for (path, entry) in &self.files {
+        let mut folded_paths = BTreeMap::<String, (&LogicalPath, &'static str)>::new();
+        let mut file_owners = BTreeMap::<ResourceId, usize>::new();
+        let mut directory_owners = BTreeMap::<ResourceId, usize>::new();
+        let mut project_content_bytes = 0_u64;
+        for (path, entry) in &self.directories {
             entry.validate()?;
-            if !self.resources.contains_key(&entry.resource_id) {
+            let descriptor = self.resources.get(&entry.resource_id).ok_or_else(|| {
+                format!(
+                    "directory '{}' references missing resource '{}'",
+                    path, entry.resource_id
+                )
+            })?;
+            if descriptor.kind != ResourceKind::ProjectContentDirectory {
                 return Err(format!(
-                    "file '{}' references missing resource '{}'",
+                    "directory '{}' is owned by non-directory resource '{}'",
                     path, entry.resource_id
                 ));
             }
-            let folded = path.as_str().to_lowercase();
-            if let Some(previous) = folded_paths.insert(folded, path) {
-                if previous != path {
+            validate_project_content_descriptor_identity(descriptor, path, "dir")?;
+            *directory_owners
+                .entry(entry.resource_id.clone())
+                .or_default() += 1;
+            let components = path.as_str().split('/').collect::<Vec<_>>();
+            for end in 2..components.len() {
+                let ancestor = LogicalPath::parse(components[..end].join("/"))?;
+                if !self.directories.contains_key(&ancestor) {
                     return Err(format!(
-                        "case-insensitive path collision '{}' and '{}'",
-                        previous, path
+                        "project-content directory '{}' lacks directory entry '{}'",
+                        path, ancestor
                     ));
                 }
+            }
+            let folded = path.as_str().to_lowercase();
+            if let Some((previous, previous_kind)) =
+                folded_paths.insert(folded, (path, "directory"))
+            {
+                return Err(format!(
+                    "portable path collision between {} '{}' and directory '{}'",
+                    previous_kind, previous, path
+                ));
+            }
+        }
+        for (path, entry) in &self.files {
+            entry.validate()?;
+            let descriptor = self.resources.get(&entry.resource_id).ok_or_else(|| {
+                format!(
+                    "file '{}' references missing resource '{}'",
+                    path, entry.resource_id
+                )
+            })?;
+            *file_owners.entry(entry.resource_id.clone()).or_default() += 1;
+            let folded = path.as_str().to_lowercase();
+            if let Some((previous, previous_kind)) = folded_paths.insert(folded, (path, "file")) {
+                return Err(format!(
+                    "portable path collision between {} '{}' and file '{}'",
+                    previous_kind, previous, path
+                ));
+            }
+            if descriptor.kind == ResourceKind::ProjectContentFile {
+                validate_project_content_descriptor_identity(descriptor, path, "file")?;
+                if entry.size > MAX_PROJECT_CONTENT_FILE_BYTES {
+                    return Err(format!(
+                        "project-content file '{}' exceeds {} bytes",
+                        path, MAX_PROJECT_CONTENT_FILE_BYTES
+                    ));
+                }
+                project_content_bytes = project_content_bytes
+                    .checked_add(entry.size)
+                    .ok_or_else(|| "project-content byte total overflow".to_string())?;
+                if project_content_bytes > MAX_PROJECT_CONTENT_TOTAL_BYTES {
+                    return Err(format!(
+                        "project content exceeds {} bytes",
+                        MAX_PROJECT_CONTENT_TOTAL_BYTES
+                    ));
+                }
+                let components = path.as_str().split('/').collect::<Vec<_>>();
+                for end in 2..components.len() {
+                    let ancestor = LogicalPath::parse(components[..end].join("/"))?;
+                    if !self.directories.contains_key(&ancestor) {
+                        return Err(format!(
+                            "project-content file '{}' lacks directory entry '{}'",
+                            path, ancestor
+                        ));
+                    }
+                }
+            }
+        }
+        for (resource_id, descriptor) in &self.resources {
+            let file_count = file_owners.get(resource_id).copied().unwrap_or_default();
+            let directory_count = directory_owners
+                .get(resource_id)
+                .copied()
+                .unwrap_or_default();
+            match descriptor.kind {
+                ResourceKind::ProjectContentFile if file_count != 1 || directory_count != 0 => {
+                    return Err(format!(
+                        "project-content file resource '{}' must own exactly one file",
+                        resource_id
+                    ));
+                }
+                ResourceKind::ProjectContentDirectory
+                    if directory_count != 1 || file_count != 0 =>
+                {
+                    return Err(format!(
+                        "project-content directory resource '{}' must own exactly one directory",
+                        resource_id
+                    ));
+                }
+                _ => {}
             }
         }
         for path in self.files.keys() {
             let components: Vec<_> = path.as_str().split('/').collect();
             for end in 1..components.len() {
                 let ancestor = components[..end].join("/").to_lowercase();
-                if let Some(existing) = folded_paths.get(&ancestor) {
+                if let Some((existing, kind)) = folded_paths.get(&ancestor) {
+                    if *kind == "directory" {
+                        continue;
+                    }
                     return Err(format!(
                         "manifest file '{}' is ancestor of '{}'",
                         existing, path
@@ -1456,6 +1724,66 @@ impl BundleManifest {
                         && !self.recipe.entries.contains_key(resource_id)
                     {
                         return Err(format!("invalid file tombstone resource '{}'", resource_id));
+                    }
+                }
+                TombstoneTarget::ProjectContentFile {
+                    resource_id,
+                    logical_path,
+                } => {
+                    if self.files.contains_key(logical_path) {
+                        return Err(format!(
+                            "live project-content file '{}' also has a tombstone",
+                            logical_path
+                        ));
+                    }
+                    let (_, expected_id) = project_content_identity("file", logical_path)?;
+                    if resource_id != &expected_id {
+                        return Err(format!(
+                            "project-content file tombstone resource '{}' does not match '{}'",
+                            resource_id, logical_path
+                        ));
+                    }
+                    if self.resources.contains_key(resource_id) {
+                        return Err(format!(
+                            "live resource '{}' also has a project-content tombstone",
+                            resource_id
+                        ));
+                    }
+                    if tombstone.last_sha256.is_none() {
+                        return Err(format!(
+                            "project-content file tombstone '{}' lacks its last digest",
+                            logical_path
+                        ));
+                    }
+                }
+                TombstoneTarget::ProjectContentDirectory {
+                    resource_id,
+                    logical_path,
+                } => {
+                    if self.directories.contains_key(logical_path) {
+                        return Err(format!(
+                            "live project-content directory '{}' also has a tombstone",
+                            logical_path
+                        ));
+                    }
+                    let (_, expected_id) = project_content_identity("dir", logical_path)?;
+                    if resource_id != &expected_id {
+                        return Err(format!(
+                            "project-content directory tombstone resource '{}' does not match '{}'",
+                            resource_id, logical_path
+                        ));
+                    }
+                    if self.resources.contains_key(resource_id) {
+                        return Err(format!(
+                            "live resource '{}' also has a project-content tombstone",
+                            resource_id
+                        ));
+                    }
+                    if tombstone.last_sha256.is_some() {
+                        return Err(format!(
+                            "project-content directory tombstone '{}' cannot have a digest",
+                            logical_path
+                        ));
                     }
                 }
             }
@@ -1495,6 +1823,10 @@ impl BundleSnapshot {
 #[serde(rename_all = "snake_case")]
 pub enum RestoreActionType {
     WriteFile,
+    WriteProjectFile,
+    EnsureProjectDirectory,
+    DeleteProjectFile,
+    DeleteProjectDirectory,
     MergeFile,
     MaterializeConversation,
     InstallStandaloneSkill,
@@ -1511,6 +1843,23 @@ pub enum RestoreActionType {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RestoreActionKind {
     WriteFile {
+        logical_path: LogicalPath,
+    },
+    WriteProjectFile {
+        logical_path: LogicalPath,
+        mode: u32,
+        source_mtime: u64,
+    },
+    EnsureProjectDirectory {
+        logical_path: LogicalPath,
+        mode: u32,
+        source_mtime: u64,
+    },
+    DeleteProjectFile {
+        logical_path: LogicalPath,
+        last_sha256: String,
+    },
+    DeleteProjectDirectory {
         logical_path: LogicalPath,
     },
     MergeFile {
@@ -1562,6 +1911,10 @@ impl RestoreActionKind {
     pub fn action_type(&self) -> RestoreActionType {
         match self {
             Self::WriteFile { .. } => RestoreActionType::WriteFile,
+            Self::WriteProjectFile { .. } => RestoreActionType::WriteProjectFile,
+            Self::EnsureProjectDirectory { .. } => RestoreActionType::EnsureProjectDirectory,
+            Self::DeleteProjectFile { .. } => RestoreActionType::DeleteProjectFile,
+            Self::DeleteProjectDirectory { .. } => RestoreActionType::DeleteProjectDirectory,
             Self::MergeFile { .. } => RestoreActionType::MergeFile,
             Self::MaterializeConversation { .. } => RestoreActionType::MaterializeConversation,
             Self::InstallStandaloneSkill { .. } => RestoreActionType::InstallStandaloneSkill,
@@ -1577,6 +1930,16 @@ impl RestoreActionKind {
 
     fn validate(&self) -> Result<(), String> {
         match self {
+            Self::WriteProjectFile { mode, .. } | Self::EnsureProjectDirectory { mode, .. } => {
+                if mode & !0o777 != 0 {
+                    Err("project-content mode contains unsafe bits".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+            Self::DeleteProjectFile { last_sha256, .. } => {
+                validate_sha256("project-content deletion", last_sha256)
+            }
             Self::ReviewHook { definition_sha256 } | Self::ReviewMcp { definition_sha256 } => {
                 validate_sha256("definition", definition_sha256)
             }
@@ -1624,6 +1987,8 @@ pub struct RestoreAction {
     pub source_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expected_target_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_target_mode: Option<u32>,
     pub requires_explicit_approval: bool,
 }
 
@@ -1639,6 +2004,12 @@ impl RestoreAction {
         if let Some(digest) = &self.expected_target_sha256 {
             validate_sha256("restore target", digest)?;
         }
+        if self
+            .expected_target_mode
+            .is_some_and(|mode| mode & !0o777 != 0)
+        {
+            return Err("restore target mode contains unsafe bits".to_string());
+        }
         if matches!(
             self.kind.action_type(),
             RestoreActionType::InstallPlugin
@@ -1648,6 +2019,10 @@ impl RestoreAction {
                 | RestoreActionType::ReviewHook
                 | RestoreActionType::ReviewMcp
                 | RestoreActionType::ApplySetting
+                | RestoreActionType::WriteProjectFile
+                | RestoreActionType::EnsureProjectDirectory
+                | RestoreActionType::DeleteProjectFile
+                | RestoreActionType::DeleteProjectDirectory
         ) && !self.requires_explicit_approval
         {
             return Err(format!(
@@ -1674,6 +2049,34 @@ pub struct RestorePlan {
     pub expires_at: u64,
     #[serde(default)]
     pub actions: Vec<RestoreAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_content_eligibility: Option<ProjectFileSyncEligibility>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectFileSyncEligibilityState {
+    Eligible,
+    GitManaged,
+    Unknown,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct ProjectFileSyncEligibility {
+    pub state: ProjectFileSyncEligibilityState,
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detected_root: Option<String>,
+}
+
+impl ProjectFileSyncEligibility {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_display_text("project-file eligibility reason", &self.reason, false)?;
+        if let Some(root) = &self.detected_root {
+            validate_absolute_clean_path("detected Git root", root)?;
+        }
+        Ok(())
+    }
 }
 
 impl RestorePlan {
@@ -1690,6 +2093,9 @@ impl RestorePlan {
             return Err("invalid restore plan lifetime or action count".to_string());
         }
         let mut action_ids = HashSet::new();
+        if let Some(eligibility) = &self.project_content_eligibility {
+            eligibility.validate()?;
+        }
         for action in &self.actions {
             action.validate()?;
             if !action_ids.insert(action.action_id.clone()) {
@@ -2093,6 +2499,94 @@ mod tests {
         ResourceId::parse(value).unwrap()
     }
 
+    fn project_content_descriptor(entry_type: &str, relative_path: &str) -> ResourceDescriptor {
+        let logical_path = LogicalPath::parse(format!("project/{}", relative_path)).unwrap();
+        let (_, resource_id) = project_content_identity(entry_type, &logical_path).unwrap();
+        ResourceDescriptor {
+            resource_id,
+            kind: match entry_type {
+                "file" => ResourceKind::ProjectContentFile,
+                "dir" => ResourceKind::ProjectContentDirectory,
+                _ => panic!("unsupported test entry type"),
+            },
+            provider: None,
+            scope: ResourceScope::Project,
+            display_name: relative_path.to_string(),
+            provenance: Provenance::ProjectLocal {
+                relative_path: relative_path.to_string(),
+            },
+            apply_policy: ApplyPolicy::ExplicitReview,
+            relative_cwd: None,
+            codec_version: 1,
+            metadata: BTreeMap::new(),
+        }
+    }
+
+    fn project_content_manifest() -> BundleManifest {
+        let mut manifest = BundleManifest {
+            schema_version: BUNDLE_SCHEMA_V4,
+            generation: 1,
+            commit_id: "commit-project-content".to_string(),
+            updated_at: 1,
+            bundle: BundleIdentity {
+                bundle_id: bundle_id(),
+                display_name: "Project".to_string(),
+                kind: BundleKind::Project,
+                repository_fingerprint: None,
+            },
+            recipe: BundleRecipe::default(),
+            captured_with: CapturedWith::default(),
+            resources: BTreeMap::new(),
+            files: BTreeMap::new(),
+            directories: BTreeMap::new(),
+            tombstones: BTreeMap::new(),
+        };
+        for relative_path in ["docs", "docs/specs", "docs/empty"] {
+            let descriptor = project_content_descriptor("dir", relative_path);
+            let resource_id = descriptor.resource_id.clone();
+            manifest.recipe.entries.insert(
+                resource_id.clone(),
+                RecipeEntry {
+                    resource_id: resource_id.clone(),
+                    apply_policy: ApplyPolicy::ExplicitReview,
+                    required: relative_path != "docs/empty",
+                },
+            );
+            manifest.resources.insert(resource_id.clone(), descriptor);
+            manifest.directories.insert(
+                LogicalPath::parse(format!("project/{}", relative_path)).unwrap(),
+                BundleDirectoryEntry {
+                    resource_id,
+                    mode: Some(0o755),
+                    source_mtime: 1,
+                },
+            );
+        }
+        let descriptor = project_content_descriptor("file", "docs/specs/a.md");
+        let resource_id = descriptor.resource_id.clone();
+        manifest.recipe.entries.insert(
+            resource_id.clone(),
+            RecipeEntry {
+                resource_id: resource_id.clone(),
+                apply_policy: ApplyPolicy::ExplicitReview,
+                required: false,
+            },
+        );
+        manifest.resources.insert(resource_id.clone(), descriptor);
+        manifest.files.insert(
+            LogicalPath::parse("project/docs/specs/a.md").unwrap(),
+            BundleFileEntry {
+                resource_id,
+                sha256: "a".repeat(64),
+                size: 1,
+                source_mtime: 1,
+                object_key: "_uploads/upload-1/files/project/docs/specs/a.md".to_string(),
+                mode: Some(0o644),
+            },
+        );
+        manifest
+    }
+
     #[test]
     fn ids_fail_closed_during_deserialization() {
         assert!(BundleId::parse("../escape").is_err());
@@ -2156,6 +2650,7 @@ mod tests {
                 storage_id: StorageId::parse("personal").unwrap(),
                 bundle_id: BundleId::parse("11111111111111111111111111111111").unwrap(),
                 recipe: None,
+                project_content_preferences: Default::default(),
                 pinned: false,
                 created_at: 1,
             }],
@@ -2309,7 +2804,7 @@ mod tests {
             },
         );
         let manifest = BundleManifest {
-            schema_version: BUNDLE_SCHEMA_V3,
+            schema_version: BUNDLE_SCHEMA_V4,
             generation: 1,
             commit_id: "commit-1".to_string(),
             updated_at: 1,
@@ -2323,12 +2818,118 @@ mod tests {
             captured_with: CapturedWith::default(),
             resources,
             files,
+            directories: BTreeMap::new(),
             tombstones: BTreeMap::new(),
         };
         assert!(manifest.validate().is_ok());
         let mut broken = manifest.clone();
         broken.resources.clear();
         assert!(broken.validate().is_err());
+    }
+
+    #[test]
+    fn schema_four_project_content_manifest_validates_exact_tree_identity() {
+        let manifest = project_content_manifest();
+        manifest.validate().unwrap();
+
+        let mut legacy = manifest.clone();
+        legacy.schema_version = 3;
+        assert!(legacy.validate().unwrap_err().contains("unsupported"));
+
+        let mut missing_ancestor = manifest.clone();
+        let docs = LogicalPath::parse("project/docs").unwrap();
+        let docs_resource = missing_ancestor
+            .directories
+            .remove(&docs)
+            .unwrap()
+            .resource_id;
+        missing_ancestor.resources.remove(&docs_resource);
+        missing_ancestor.recipe.entries.remove(&docs_resource);
+        assert!(missing_ancestor
+            .validate()
+            .unwrap_err()
+            .contains("lacks directory entry"));
+
+        let mut orphan = manifest.clone();
+        orphan
+            .files
+            .remove(&LogicalPath::parse("project/docs/specs/a.md").unwrap());
+        assert!(orphan
+            .validate()
+            .unwrap_err()
+            .contains("must own exactly one file"));
+
+        let mut forged = manifest.clone();
+        let file_id = forged.files.values().next().unwrap().resource_id.clone();
+        forged.resources.get_mut(&file_id).unwrap().provenance = Provenance::ProjectLocal {
+            relative_path: "docs/specs/other.md".to_string(),
+        };
+        assert!(forged
+            .validate()
+            .unwrap_err()
+            .contains("mismatched path provenance"));
+    }
+
+    #[test]
+    fn project_content_manifest_rejects_path_collision_and_oversized_file() {
+        let mut collision = project_content_manifest();
+        let descriptor = project_content_descriptor("file", "docs/empty");
+        let resource_id = descriptor.resource_id.clone();
+        collision.recipe.entries.insert(
+            resource_id.clone(),
+            RecipeEntry {
+                resource_id: resource_id.clone(),
+                apply_policy: ApplyPolicy::ExplicitReview,
+                required: false,
+            },
+        );
+        collision.resources.insert(resource_id.clone(), descriptor);
+        collision.files.insert(
+            LogicalPath::parse("project/docs/empty").unwrap(),
+            BundleFileEntry {
+                resource_id,
+                sha256: "b".repeat(64),
+                size: 1,
+                source_mtime: 1,
+                object_key: "_uploads/upload-1/files/project/docs/empty".to_string(),
+                mode: Some(0o644),
+            },
+        );
+        assert!(collision.validate().unwrap_err().contains("path collision"));
+
+        let mut oversized = project_content_manifest();
+        oversized.files.values_mut().next().unwrap().size = MAX_PROJECT_CONTENT_FILE_BYTES + 1;
+        assert!(oversized.validate().unwrap_err().contains("exceeds"));
+    }
+
+    #[test]
+    fn project_content_tombstones_are_typed_and_path_bound() {
+        let mut manifest = project_content_manifest();
+        let path = LogicalPath::parse("project/docs/specs/a.md").unwrap();
+        let entry = manifest.files.remove(&path).unwrap();
+        manifest.resources.remove(&entry.resource_id);
+        manifest.recipe.entries.remove(&entry.resource_id);
+        let tombstone = Tombstone {
+            target: TombstoneTarget::ProjectContentFile {
+                resource_id: entry.resource_id,
+                logical_path: path,
+            },
+            last_sha256: Some(entry.sha256),
+            deleted_at: 2,
+        };
+        manifest
+            .tombstones
+            .insert(tombstone.canonical_key(), tombstone);
+        manifest.validate().unwrap();
+
+        let key = manifest.tombstones.keys().next().unwrap().clone();
+        let tombstone = manifest.tombstones.get_mut(&key).unwrap();
+        if let TombstoneTarget::ProjectContentFile { resource_id, .. } = &mut tombstone.target {
+            *resource_id = project_content_descriptor("file", "docs/specs/other.md").resource_id;
+        }
+        let changed = manifest.tombstones.remove(&key).unwrap();
+        manifest.tombstones.insert(changed.canonical_key(), changed);
+        assert!(manifest.validate().unwrap_err().contains("does not match"));
     }
 
     #[test]
@@ -2343,6 +2944,7 @@ mod tests {
             target_path: None,
             source_sha256: None,
             expected_target_sha256: None,
+            expected_target_mode: None,
             requires_explicit_approval: false,
         };
         assert!(action.validate().unwrap_err().contains("explicit approval"));

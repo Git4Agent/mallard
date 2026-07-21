@@ -16,6 +16,7 @@ type IconName =
   | "folder"
   | "external-link"
   | "git-branch"
+  | "git-folder"
   | "help-circle"
   | "info"
   | "link"
@@ -165,6 +166,18 @@ export default function Icon({ name, size = 14, ...props }: IconProps) {
           <circle cx="6" cy="19" r="2" />
           <path d="M6 7v10" />
           <path d="M8 13h4a6 6 0 0 0 6-5" />
+        </>
+      )}
+      {name === "git-folder" && (
+        <>
+          <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+          <g className="icon-git-folder-mark" stroke="currentColor" strokeWidth="2.2">
+            <circle cx="9" cy="9" r="1.5" fill="currentColor" stroke="none" />
+            <circle cx="15" cy="9.5" r="1.5" fill="currentColor" stroke="none" />
+            <circle cx="9" cy="16" r="1.5" fill="currentColor" stroke="none" />
+            <path d="M9 10.5v4" />
+            <path d="M9 12h2a4 4 0 0 0 4-4" />
+          </g>
         </>
       )}
       {name === "help-circle" && (

@@ -14,16 +14,16 @@ use super::chat_history::{self, CodexThreadDetailsPage, ProjectChatHistory};
 use super::domain::{
     generated_named_id, validate_absolute_clean_path, ActionId, ActionStatus, ApplyPolicy,
     BindingState, BundleId, BundleIdentity, BundleKind, BundleManifest, BundleRecipe,
-    BundleSnapshot, CapturedWith,
-    DependencyAction, DependencyActionKind, DependencyApplicationRecord, DependencyApplyReceipt,
-    DependencyPlan, DraftProfileSelection, DraftRepositoryChoice, DraftStorageSelection,
-    LocalProjectId, LocalProjectRegistration, LocalProviderProfileId, MachineProjectState,
-    MaterializationId, MaterializationRecord, MaterializationStatus, PlanId, ProjectBinding,
-    ProjectSetupDraft, ProjectStorageLink, Provenance, Provider, ProviderProfile, RecipeBase,
-    RecipeEntry, ReplicaId, ResourceDescriptor, ResourceId, ResourceKind, ResourceScope,
-    RestoreActionType, RestorePlan, SetupDraftId, SetupTransaction, StorageConfigV3, StorageId,
-    StorageKind, SyncConfigV3, DEPENDENCY_PLAN_SCHEMA_V1, SETUP_DRAFT_SCHEMA_V1,
-    SETUP_TRANSACTION_SCHEMA_V1,
+    BundleSnapshot, CapturedWith, DependencyAction, DependencyActionKind,
+    DependencyApplicationRecord, DependencyApplyReceipt, DependencyPlan, DraftProfileSelection,
+    DraftRepositoryChoice, DraftStorageSelection, LocalProjectId, LocalProjectRegistration,
+    LocalProviderProfileId, MachineProjectState, MaterializationId, MaterializationRecord,
+    MaterializationStatus, PlanId, ProjectBinding, ProjectFileSyncEligibility,
+    ProjectFileSyncEligibilityState, ProjectSetupDraft, ProjectStorageLink, Provenance, Provider,
+    ProviderProfile, RecipeBase, RecipeEntry, ReplicaId, ResourceDescriptor, ResourceId,
+    ResourceKind, ResourceScope, RestoreActionKind, RestoreActionType, RestorePlan, SetupDraftId,
+    SetupTransaction, StorageConfigV3, StorageId, StorageKind, SyncConfigV3,
+    DEPENDENCY_PLAN_SCHEMA_V1, SETUP_DRAFT_SCHEMA_V1, SETUP_TRANSACTION_SCHEMA_V1,
 };
 use super::global_inventory;
 use super::persistence::V3Repository;
@@ -203,6 +203,78 @@ pub struct ResourceInventory {
     pub warnings: Vec<String>,
 }
 
+#[derive(Serialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectContentEntryType {
+    File,
+    Directory,
+    Blocked,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ProjectContentEntry {
+    pub descriptor: ResourceDescriptor,
+    pub entry_type: ProjectContentEntryType,
+    pub relative_path: String,
+    pub logical_path: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub size: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_mtime: Option<u64>,
+    pub state: String,
+    pub local_present: bool,
+    pub storage_present: bool,
+    pub base_present: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_digest: Option<String>,
+    pub selected_in_recipe: bool,
+    pub newly_discovered: bool,
+    pub selected_after_scan: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning_code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warning_digest: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct ProjectContentInventory {
+    pub local_project_id: LocalProjectId,
+    pub storage_id: StorageId,
+    pub project_root: String,
+    pub eligibility: ProjectFileSyncEligibility,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_generation: Option<u64>,
+    pub preference_revision: u64,
+    #[serde(default)]
+    pub excluded_resource_ids: Vec<ResourceId>,
+    #[serde(default)]
+    pub entries: Vec<ProjectContentEntry>,
+    pub ignored_count: usize,
+    pub blocked_count: usize,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+    pub scanned_at: u64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ProjectContentPushReview {
+    review_token: Option<String>,
+    removal_ids: BTreeSet<ResourceId>,
+    acknowledged_warning_digests: BTreeSet<String>,
+}
+
 #[derive(Serialize, Clone, Debug)]
 pub struct ProjectDiscovery {
     pub project_root: String,
@@ -265,6 +337,64 @@ pub struct ResourceStatusReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub generation: Option<u64>,
     pub statuses: Vec<BundleResourceStatus>,
+    #[serde(default)]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+pub struct CapabilityProfileContext {
+    pub provider: Provider,
+    pub profile_id: LocalProviderProfileId,
+    pub display_name: String,
+    pub path: String,
+    pub shared_project_count: usize,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct CapabilityStatusItem {
+    #[serde(flatten)]
+    pub descriptor: ResourceDescriptor,
+    pub category: String,
+    pub state: String,
+    pub local_present: bool,
+    pub storage_present: bool,
+    pub selected_in_recipe: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
+    #[serde(default)]
+    pub logical_paths: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_digest: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub local_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub provided_skills: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Serialize, Clone, Debug)]
+pub struct CapabilityStatusReport {
+    pub project_id: LocalProjectId,
+    pub project_name: String,
+    #[serde(default)]
+    pub profiles: Vec<CapabilityProfileContext>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_id: Option<StorageId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generation: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_generation: Option<u64>,
+    pub compared_at: u64,
+    pub items: Vec<CapabilityStatusItem>,
     #[serde(default)]
     pub warnings: Vec<String>,
 }
@@ -781,11 +911,7 @@ pub async fn validate_codex_thread_ownership(
 ) -> Result<(), String> {
     let repository = repository(&app)?;
     run_blocking(move || {
-        chat_history::validate_codex_thread_ownership(
-            &repository,
-            &local_project_id,
-            &thread_id,
-        )
+        chat_history::validate_codex_thread_ownership(&repository, &local_project_id, &thread_id)
     })
     .await
 }
@@ -1110,6 +1236,19 @@ pub async fn get_bundle_inventory(
 }
 
 #[tauri::command]
+pub async fn inspect_project_files(
+    app: tauri::AppHandle,
+    local_project_id: LocalProjectId,
+    storage_id: StorageId,
+) -> Result<ProjectContentInventory, String> {
+    let repository = repository(&app)?;
+    run_blocking(move || {
+        inspect_project_files_with_repository(&repository, &local_project_id, &storage_id)
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn list_remote_bundles(
     app: tauri::AppHandle,
     storage_id: StorageId,
@@ -1203,6 +1342,23 @@ pub async fn get_bundle_status(
 }
 
 #[tauri::command]
+pub async fn get_project_capability_status(
+    app: tauri::AppHandle,
+    local_project_id: LocalProjectId,
+    storage_id: Option<StorageId>,
+) -> Result<CapabilityStatusReport, String> {
+    let repository = repository(&app)?;
+    run_blocking(move || {
+        get_project_capability_status_with_repository(
+            &repository,
+            &local_project_id,
+            storage_id.as_ref(),
+        )
+    })
+    .await
+}
+
+#[tauri::command]
 pub async fn get_project_thread_sync_comparison(
     app: tauri::AppHandle,
     local_project_id: LocalProjectId,
@@ -1225,6 +1381,9 @@ pub async fn push_bundle(
     local_project_id: LocalProjectId,
     storage_id: StorageId,
     recipe: Option<BundleRecipe>,
+    project_content_review_token: Option<String>,
+    project_content_removal_ids: Option<Vec<ResourceId>>,
+    acknowledged_warning_digests: Option<Vec<String>>,
 ) -> Result<ProjectOperationResult, String> {
     let repository = repository(&app)?;
     let (project, storage) =
@@ -1250,7 +1409,23 @@ pub async fn push_bundle(
                 .map(|count| format!("   Scanning {} resources selected for this storage…", count))
                 .unwrap_or_else(|| "   Scanning selected project resources…".to_string()),
         );
-        push_bundle_with_recipe_with_repository(&repository, &local_project_id, &storage_id, recipe)
+        push_bundle_reviewed_with_repository(
+            &repository,
+            &local_project_id,
+            &storage_id,
+            recipe,
+            ProjectContentPushReview {
+                review_token: project_content_review_token,
+                removal_ids: project_content_removal_ids
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+                acknowledged_warning_digests: acknowledged_warning_digests
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect(),
+            },
+        )
     })
     .await;
     match &result {
@@ -1954,6 +2129,592 @@ fn discover_project_at(
     })
 }
 
+#[derive(Clone)]
+struct ProjectContentVersion {
+    descriptor: ResourceDescriptor,
+    entry_type: ProjectContentEntryType,
+    relative_path: String,
+    logical_path: String,
+    size: Option<u64>,
+    mode: Option<u32>,
+    source_mtime: Option<u64>,
+    digest: String,
+}
+
+fn inspect_project_files_with_repository(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    storage_id: &StorageId,
+) -> Result<ProjectContentInventory, String> {
+    let config = repository.load_config()?;
+    let project = config
+        .project(local_project_id)
+        .cloned()
+        .ok_or_else(|| format!("unknown local project '{}'", local_project_id))?;
+    require_project_link(&config, &project, storage_id)?;
+    let link = config
+        .links
+        .iter()
+        .find(|link| link.local_project_id == *local_project_id && link.storage_id == *storage_id)
+        .cloned()
+        .ok_or_else(|| "project storage link disappeared".to_string())?;
+    let binding = repository
+        .load_bindings()?
+        .active_for(local_project_id)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "project '{}' is not mapped on this machine",
+                local_project_id
+            )
+        })?;
+    let eligibility = project_file_sync_eligibility(&binding);
+    let (_, engine) = storage_engine(repository, storage_id)?;
+    let remote = engine.inspect_optional(&project.bundle_id)?;
+    let remote_versions = remote
+        .as_ref()
+        .map(|snapshot| project_content_versions(&snapshot.manifest))
+        .transpose()?
+        .unwrap_or_default();
+    let mut warnings = Vec::new();
+    let (base_versions, base_unavailable) = match project.recipe_bases.get(storage_id) {
+        Some(base) => match base.commit_id.as_deref() {
+            Some(commit_id) => match engine.inspect_manifest_version(
+                &project.bundle_id,
+                base.generation,
+                commit_id,
+                &base.manifest_sha256,
+            ) {
+                Ok(manifest) => (project_content_versions(&manifest)?, false),
+                Err(error) => {
+                    warnings.push(format!(
+                        "Reviewed project-content base is unavailable: {}",
+                        error
+                    ));
+                    (BTreeMap::new(), true)
+                }
+            },
+            None => {
+                warnings
+                    .push("Reviewed project-content base has no immutable commit ID".to_string());
+                (BTreeMap::new(), true)
+            }
+        },
+        None => (BTreeMap::new(), false),
+    };
+    let effective_recipe = link
+        .recipe
+        .clone()
+        .unwrap_or_else(|| project.recipe.clone());
+    let selected_ids = effective_recipe.selected_ids();
+    let preferences = link.project_content_preferences.clone();
+
+    let mut local_versions = BTreeMap::<ResourceId, ProjectContentVersion>::new();
+    let mut local_blocked_versions = BTreeMap::<ResourceId, ProjectContentVersion>::new();
+    let mut local_blockers = BTreeMap::<ResourceId, String>::new();
+    let mut local_warnings = BTreeMap::<ResourceId, String>::new();
+    let mut ignored_count = 0;
+    let mut blocked_count = 0;
+    if eligibility.state == ProjectFileSyncEligibilityState::Eligible {
+        let mut request = capture_request_for_binding(repository, &binding)?;
+        request.include_project_content = true;
+        let discovered = provider_capture::discover_project(&request)?;
+        ignored_count = discovered.ignored_count;
+        blocked_count = discovered.blocked_count;
+        warnings.extend(discovered.warnings.clone());
+        let candidates = discovered
+            .resources
+            .into_iter()
+            .filter(|candidate| {
+                matches!(
+                    candidate.kind,
+                    CaptureResourceKind::ProjectContentFile
+                        | CaptureResourceKind::ProjectContentDirectory
+                )
+            })
+            .collect::<Vec<_>>();
+        let local_inventory = inventory_from_candidates(
+            binding.project_root.clone(),
+            Some(project.bundle_id.clone()),
+            &candidates,
+            BundleRecipe::default(),
+            Vec::new(),
+        )?;
+        for item in local_inventory.resources {
+            let resource_id = item.descriptor.resource_id.clone();
+            let relative_path = item
+                .descriptor
+                .metadata
+                .get("_local_relative_path")
+                .cloned()
+                .or_else(|| match &item.descriptor.provenance {
+                    Provenance::ProjectLocal { relative_path } => Some(relative_path.clone()),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    format!("project-content resource '{}' lacks a path", resource_id)
+                })?;
+            if let Some(reason) = item.blocked_reason {
+                local_blockers.insert(resource_id.clone(), reason);
+                local_blocked_versions.insert(
+                    resource_id,
+                    ProjectContentVersion {
+                        logical_path: format!("project/{}", relative_path),
+                        relative_path,
+                        entry_type: ProjectContentEntryType::Blocked,
+                        size: None,
+                        mode: None,
+                        source_mtime: None,
+                        descriptor: item.descriptor,
+                        digest: String::new(),
+                    },
+                );
+                continue;
+            }
+            let entry_type = match item.descriptor.kind {
+                ResourceKind::ProjectContentFile => ProjectContentEntryType::File,
+                ResourceKind::ProjectContentDirectory => ProjectContentEntryType::Directory,
+                _ => continue,
+            };
+            let digest = item
+                .descriptor
+                .metadata
+                .get("_local_review_digest")
+                .cloned()
+                .ok_or_else(|| {
+                    format!(
+                        "project-content resource '{}' lacks a review digest",
+                        resource_id
+                    )
+                })?;
+            if let Some(warning) = item.descriptor.metadata.get("_local_warning_code") {
+                local_warnings.insert(resource_id.clone(), warning.clone());
+            }
+            local_versions.insert(
+                resource_id,
+                ProjectContentVersion {
+                    logical_path: format!("project/{}", relative_path),
+                    relative_path,
+                    entry_type,
+                    size: parse_optional_metadata_u64(&item.descriptor, "_local_size")?,
+                    mode: parse_optional_metadata_u32(&item.descriptor, "_local_mode")?,
+                    source_mtime: parse_optional_metadata_u64(
+                        &item.descriptor,
+                        "_local_source_mtime",
+                    )?,
+                    descriptor: item.descriptor,
+                    digest,
+                },
+            );
+        }
+    }
+
+    let all_ids = local_versions
+        .keys()
+        .chain(local_blocked_versions.keys())
+        .chain(local_blockers.keys())
+        .chain(remote_versions.keys())
+        .chain(base_versions.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut entries = Vec::with_capacity(all_ids.len());
+    for resource_id in all_ids {
+        let local = local_versions.get(&resource_id);
+        let local_blocked = local_blocked_versions.get(&resource_id);
+        let remote_version = remote_versions.get(&resource_id);
+        let base = base_versions.get(&resource_id);
+        let blocked_reason = local_blockers.get(&resource_id).cloned();
+        let representative = local.or(local_blocked).or(remote_version).or(base);
+        let Some(representative) = representative else {
+            continue;
+        };
+        let local_digest = local.map(|version| version.digest.clone());
+        let storage_digest = remote_version.map(|version| version.digest.clone());
+        let base_digest = base.map(|version| version.digest.clone());
+        let state = if blocked_reason.is_some() {
+            "blocked"
+        } else if base_unavailable
+            && (remote_version.is_some() || selected_ids.contains(&resource_id))
+        {
+            "unknown"
+        } else {
+            classify_project_content_state(
+                local_digest.as_deref(),
+                storage_digest.as_deref(),
+                base_digest.as_deref(),
+            )
+        };
+        let selected_in_recipe = selected_ids.contains(&resource_id);
+        let newly_discovered = local.is_some() && remote_version.is_none() && !selected_in_recipe;
+        let selected_after_scan = newly_discovered
+            && blocked_reason.is_none()
+            && !preferences.excluded_resource_ids.contains(&resource_id);
+        let warning_code = local_warnings.get(&resource_id).cloned();
+        let warning_digest = warning_code.as_ref().and_then(|warning| {
+            local_digest
+                .as_ref()
+                .map(|digest| project_content_warning_digest(&resource_id, digest, warning))
+        });
+        entries.push(ProjectContentEntry {
+            descriptor: representative.descriptor.clone(),
+            entry_type: if blocked_reason.is_some() {
+                ProjectContentEntryType::Blocked
+            } else {
+                representative.entry_type
+            },
+            relative_path: representative.relative_path.clone(),
+            logical_path: representative.logical_path.clone(),
+            size: local
+                .or(local_blocked)
+                .or(remote_version)
+                .and_then(|version| version.size),
+            mode: local
+                .or(local_blocked)
+                .or(remote_version)
+                .and_then(|version| version.mode),
+            source_mtime: local
+                .or(local_blocked)
+                .or(remote_version)
+                .and_then(|version| version.source_mtime),
+            state: state.to_string(),
+            local_present: local.is_some() || local_blocked.is_some(),
+            storage_present: remote_version.is_some(),
+            base_present: base.is_some(),
+            local_digest: local_digest.clone(),
+            storage_digest,
+            base_digest,
+            review_digest: local_digest,
+            selected_in_recipe,
+            newly_discovered,
+            selected_after_scan,
+            blocked_reason,
+            warning_code,
+            warning_digest,
+        });
+    }
+    entries.sort_by(|left, right| {
+        left.relative_path.cmp(&right.relative_path).then_with(|| {
+            project_content_entry_rank(left.entry_type)
+                .cmp(&project_content_entry_rank(right.entry_type))
+        })
+    });
+    warnings.sort();
+    warnings.dedup();
+    let review_token =
+        (eligibility.state == ProjectFileSyncEligibilityState::Eligible).then(|| {
+            project_content_review_token(
+                &binding,
+                &eligibility,
+                remote.as_ref(),
+                preferences.revision,
+                &entries,
+            )
+        });
+    Ok(ProjectContentInventory {
+        local_project_id: local_project_id.clone(),
+        storage_id: storage_id.clone(),
+        project_root: binding.project_root,
+        eligibility,
+        review_token,
+        storage_generation: remote.as_ref().map(|snapshot| snapshot.head.generation),
+        preference_revision: preferences.revision,
+        excluded_resource_ids: preferences.excluded_resource_ids.into_iter().collect(),
+        entries,
+        ignored_count,
+        blocked_count,
+        warnings,
+        scanned_at: now_secs(),
+    })
+}
+
+fn project_content_entry_rank(entry_type: ProjectContentEntryType) -> u8 {
+    match entry_type {
+        ProjectContentEntryType::Directory => 0,
+        ProjectContentEntryType::File => 1,
+        ProjectContentEntryType::Blocked => 2,
+    }
+}
+
+fn parse_optional_metadata_u64(
+    descriptor: &ResourceDescriptor,
+    key: &str,
+) -> Result<Option<u64>, String> {
+    descriptor
+        .metadata
+        .get(key)
+        .map(|value| {
+            value.parse::<u64>().map_err(|error| {
+                format!(
+                    "resource '{}' has invalid {}: {}",
+                    descriptor.resource_id, key, error
+                )
+            })
+        })
+        .transpose()
+}
+
+fn parse_optional_metadata_u32(
+    descriptor: &ResourceDescriptor,
+    key: &str,
+) -> Result<Option<u32>, String> {
+    descriptor
+        .metadata
+        .get(key)
+        .map(|value| {
+            value.parse::<u32>().map_err(|error| {
+                format!(
+                    "resource '{}' has invalid {}: {}",
+                    descriptor.resource_id, key, error
+                )
+            })
+        })
+        .transpose()
+}
+
+fn project_content_versions(
+    manifest: &BundleManifest,
+) -> Result<BTreeMap<ResourceId, ProjectContentVersion>, String> {
+    let mut versions = BTreeMap::new();
+    for (logical_path, entry) in &manifest.files {
+        let Some(descriptor) = manifest.resources.get(&entry.resource_id) else {
+            continue;
+        };
+        if descriptor.kind != ResourceKind::ProjectContentFile {
+            continue;
+        }
+        let relative_path = project_content_relative_path(logical_path)?;
+        let mode = entry.mode.unwrap_or(0o600) & 0o777;
+        let version = ProjectContentVersion {
+            descriptor: descriptor.clone(),
+            entry_type: ProjectContentEntryType::File,
+            logical_path: logical_path.to_string(),
+            relative_path: relative_path.clone(),
+            size: Some(entry.size),
+            mode: Some(mode),
+            source_mtime: Some(entry.source_mtime),
+            digest: project_content_version_digest("file", &relative_path, &entry.sha256, mode),
+        };
+        if versions
+            .insert(entry.resource_id.clone(), version)
+            .is_some()
+        {
+            return Err(format!(
+                "project-content resource '{}' owns more than one entry",
+                entry.resource_id
+            ));
+        }
+    }
+    for (logical_path, entry) in &manifest.directories {
+        let Some(descriptor) = manifest.resources.get(&entry.resource_id) else {
+            continue;
+        };
+        if descriptor.kind != ResourceKind::ProjectContentDirectory {
+            continue;
+        }
+        let relative_path = project_content_relative_path(logical_path)?;
+        let mode = entry.mode.unwrap_or(0o700) & 0o777;
+        let version = ProjectContentVersion {
+            descriptor: descriptor.clone(),
+            entry_type: ProjectContentEntryType::Directory,
+            logical_path: logical_path.to_string(),
+            relative_path: relative_path.clone(),
+            size: None,
+            mode: Some(mode),
+            source_mtime: Some(entry.source_mtime),
+            digest: project_content_version_digest("dir", &relative_path, "", mode),
+        };
+        if versions
+            .insert(entry.resource_id.clone(), version)
+            .is_some()
+        {
+            return Err(format!(
+                "project-content resource '{}' owns more than one entry",
+                entry.resource_id
+            ));
+        }
+    }
+    Ok(versions)
+}
+
+fn project_content_relative_path(
+    logical_path: &super::domain::LogicalPath,
+) -> Result<String, String> {
+    logical_path
+        .as_str()
+        .strip_prefix("project/")
+        .filter(|relative| !relative.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("project-content path '{}' is invalid", logical_path))
+}
+
+fn project_content_version_digest(
+    entry_type: &str,
+    relative_path: &str,
+    content_sha256: &str,
+    mode: u32,
+) -> String {
+    let digest = Sha256::digest(
+        format!(
+            "{}\0{}\0{}\0{:03o}",
+            entry_type,
+            relative_path,
+            content_sha256,
+            mode & 0o777
+        )
+        .as_bytes(),
+    );
+    hex_digest(&digest)
+}
+
+fn project_content_ancestor_paths(relative_path: &str) -> Vec<String> {
+    let components = relative_path.split('/').collect::<Vec<_>>();
+    (1..components.len())
+        .map(|end| components[..end].join("/"))
+        .collect()
+}
+
+fn classify_project_content_state(
+    local: Option<&str>,
+    storage: Option<&str>,
+    base: Option<&str>,
+) -> &'static str {
+    match (local, storage, base) {
+        (Some(local), Some(storage), _) if local == storage => "synced",
+        (Some(_), None, None) => "local_only",
+        (None, Some(_), None) => "storage_only",
+        (Some(local), Some(storage), Some(base)) if storage == base && local != base => {
+            "local_ahead"
+        }
+        (Some(local), Some(storage), Some(base)) if local == base && storage != base => {
+            "storage_ahead"
+        }
+        (Some(_), Some(_), _) => "diverged",
+        (None, Some(storage), Some(base)) if storage == base => "missing",
+        (None, Some(_), Some(_)) => "storage_ahead",
+        (Some(local), None, Some(base)) if local == base => "storage_ahead",
+        (Some(_), None, Some(_)) => "diverged",
+        (None, None, Some(_)) => "storage_ahead",
+        (None, None, None) => "unknown",
+    }
+}
+
+fn project_content_review_token(
+    binding: &ProjectBinding,
+    eligibility: &ProjectFileSyncEligibility,
+    remote: Option<&BundleSnapshot>,
+    preference_revision: u64,
+    entries: &[ProjectContentEntry],
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"project-content-review-v1\0");
+    hasher.update(binding.local_project_id.as_str().as_bytes());
+    hasher.update(binding.replica_id.as_str().as_bytes());
+    hasher.update(binding.revision.to_be_bytes());
+    hasher.update(format!("{:?}", eligibility.state).as_bytes());
+    hasher.update(preference_revision.to_be_bytes());
+    if let Some(remote) = remote {
+        hasher.update(remote.head.generation.to_be_bytes());
+        hasher.update(remote.head.commit_id.as_bytes());
+        hasher.update(remote.head.manifest_sha256.as_bytes());
+    }
+    for entry in entries {
+        hasher.update(entry.descriptor.resource_id.as_str().as_bytes());
+        hasher.update(entry.relative_path.as_bytes());
+        hasher.update(entry.state.as_bytes());
+        if let Some(digest) = &entry.review_digest {
+            hasher.update(digest.as_bytes());
+        }
+        if let Some(reason) = &entry.blocked_reason {
+            hasher.update(reason.as_bytes());
+        }
+        if let Some(warning) = &entry.warning_code {
+            hasher.update(warning.as_bytes());
+        }
+    }
+    hex_digest(&hasher.finalize())
+}
+
+fn project_content_warning_digest(
+    resource_id: &ResourceId,
+    review_digest: &str,
+    warning_code: &str,
+) -> String {
+    let digest = Sha256::digest(
+        format!(
+            "project-content-warning-v1\0{}\0{}\0{}",
+            resource_id, review_digest, warning_code
+        )
+        .as_bytes(),
+    );
+    hex_digest(&digest)
+}
+
+fn project_file_sync_eligibility(binding: &ProjectBinding) -> ProjectFileSyncEligibility {
+    let root = Path::new(&binding.project_root);
+    let canonical = match fs::canonicalize(root) {
+        Ok(canonical) => canonical,
+        Err(error) => {
+            return ProjectFileSyncEligibility {
+                state: ProjectFileSyncEligibilityState::Unknown,
+                reason: format!("Project folder cannot be resolved: {}", error),
+                detected_root: None,
+            }
+        }
+    };
+    if canonical != PathBuf::from(&binding.canonical_project_root) {
+        return ProjectFileSyncEligibility {
+            state: ProjectFileSyncEligibilityState::Unknown,
+            reason: "Project binding resolves to a different folder".to_string(),
+            detected_root: None,
+        };
+    }
+    match std::process::Command::new("git")
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .arg("-C")
+        .arg(&canonical)
+        .args(["rev-parse", "--show-toplevel"])
+        .output()
+    {
+        Ok(output) if output.status.success() => {
+            let detected = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            ProjectFileSyncEligibility {
+                state: ProjectFileSyncEligibilityState::GitManaged,
+                reason: "Git manages files in this project folder".to_string(),
+                detected_root: (!detected.is_empty()).then_some(detected),
+            }
+        }
+        Ok(output)
+            if String::from_utf8_lossy(&output.stderr)
+                .to_ascii_lowercase()
+                .contains("not a git repository") =>
+        {
+            ProjectFileSyncEligibility {
+                state: ProjectFileSyncEligibilityState::Eligible,
+                reason: "Project folder is not inside a Git work tree".to_string(),
+                detected_root: None,
+            }
+        }
+        Ok(output) => ProjectFileSyncEligibility {
+            state: ProjectFileSyncEligibilityState::Unknown,
+            reason: format!(
+                "Git eligibility probe failed with status {}",
+                output
+                    .status
+                    .code()
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ),
+            detected_root: None,
+        },
+        Err(error) => ProjectFileSyncEligibility {
+            state: ProjectFileSyncEligibilityState::Unknown,
+            reason: format!("Git eligibility probe could not run: {}", error),
+            detected_root: None,
+        },
+    }
+}
+
 fn get_bundle_inventory_with_repository(
     repository: &V3Repository,
     local_project_id: &LocalProjectId,
@@ -2212,6 +2973,8 @@ fn capture_resource_kind(
 ) -> ResourceKind {
     match kind {
         CaptureResourceKind::ProjectFile => ResourceKind::ProjectFile,
+        CaptureResourceKind::ProjectContentFile => ResourceKind::ProjectContentFile,
+        CaptureResourceKind::ProjectContentDirectory => ResourceKind::ProjectContentDirectory,
         CaptureResourceKind::ProjectSettings => ResourceKind::Setting,
         CaptureResourceKind::Conversation => match provider {
             Some(CaptureProvider::Claude) => ResourceKind::ClaudeConversation,
@@ -2245,6 +3008,7 @@ fn resource_category(kind: ResourceKind) -> &'static str {
         | ResourceKind::ProjectMemory => "conversations",
         ResourceKind::ProjectSkill | ResourceKind::StandaloneSkill => "skills",
         ResourceKind::Plugin => "plugins",
+        ResourceKind::ProjectContentFile | ResourceKind::ProjectContentDirectory => "project_files",
         ResourceKind::McpServer | ResourceKind::Hook | ResourceKind::Requirement => "tools",
         _ => "project_setup",
     }
@@ -2452,17 +3216,14 @@ struct ThreadVersion {
 }
 
 fn is_codex_thread_resource(resource_id: &ResourceId, kind: ResourceKind) -> bool {
-    kind == ResourceKind::CodexConversation
-        && resource_id.as_str().starts_with("codex:session:")
+    kind == ResourceKind::CodexConversation && resource_id.as_str().starts_with("codex:session:")
 }
 
 fn manifest_thread_versions(manifest: &BundleManifest) -> BTreeMap<ResourceId, ThreadVersion> {
     manifest
         .resources
         .iter()
-        .filter(|(resource_id, descriptor)| {
-            is_codex_thread_resource(resource_id, descriptor.kind)
-        })
+        .filter(|(resource_id, descriptor)| is_codex_thread_resource(resource_id, descriptor.kind))
         .map(|(resource_id, descriptor)| {
             let updated_at = manifest
                 .files
@@ -2540,7 +3301,12 @@ fn get_project_thread_sync_comparison_with_repository(
         .load_bindings()?
         .active_for(local_project_id)
         .cloned()
-        .ok_or_else(|| format!("project '{}' is not mapped on this machine", local_project_id))?;
+        .ok_or_else(|| {
+            format!(
+                "project '{}' is not mapped on this machine",
+                local_project_id
+            )
+        })?;
 
     let capture_request = capture_request_for_binding(repository, &binding)?;
     let discovered = provider_capture::discover_project(&capture_request)?;
@@ -2556,7 +3322,10 @@ fn get_project_thread_sync_comparison_with_repository(
         .map(|candidate| {
             Ok((
                 ResourceId::parse(candidate.resource_id.clone())?,
-                (candidate.display_name.clone(), candidate.display_name.clone()),
+                (
+                    candidate.display_name.clone(),
+                    candidate.display_name.clone(),
+                ),
             ))
         })
         .collect::<Result<BTreeMap<_, _>, String>>()?;
@@ -2670,7 +3439,10 @@ fn get_project_thread_sync_comparison_with_repository(
         let local_digest = local.and_then(|version| version.digest.as_deref());
         let storage_digest = remote.and_then(|version| version.digest.as_deref());
         let base_resource_known = base_manifest.is_some()
-            && (base_version.is_none() || base_version.and_then(|version| version.digest.as_deref()).is_some());
+            && (base_version.is_none()
+                || base_version
+                    .and_then(|version| version.digest.as_deref())
+                    .is_some());
         let incomplete = unavailable.contains(&resource_id)
             || (local_present && local_digest.is_none())
             || (storage_present && storage_digest.is_none());
@@ -2684,9 +3456,7 @@ fn get_project_thread_sync_comparison_with_repository(
                 base_version.and_then(|version| version.digest.as_deref()),
             )
         };
-        let descriptor = local
-            .or(remote)
-            .or(base_version);
+        let descriptor = local.or(remote).or(base_version);
         let local_descriptor = local_descriptors.get(&resource_id);
         let thread_id = descriptor
             .map(|version| version.thread_id.clone())
@@ -2835,6 +3605,427 @@ fn get_bundle_status_with_repository(
     })
 }
 
+fn is_capability_kind(kind: ResourceKind) -> bool {
+    matches!(
+        kind,
+        ResourceKind::ProjectSkill | ResourceKind::StandaloneSkill | ResourceKind::Plugin
+    )
+}
+
+fn capability_state_name(state: ThreadSyncState) -> &'static str {
+    match state {
+        ThreadSyncState::Synced => "synced",
+        ThreadSyncState::LocalOnly => "local_only",
+        ThreadSyncState::LocalAhead => "local_ahead",
+        ThreadSyncState::StorageOnly => "storage_only",
+        ThreadSyncState::StorageAhead => "storage_ahead",
+        ThreadSyncState::Diverged => "diverged",
+        ThreadSyncState::Unknown => "unknown",
+    }
+}
+
+fn descriptor_capability_digest(descriptor: Option<&ResourceDescriptor>) -> Option<String> {
+    let descriptor = descriptor?;
+    if descriptor.kind != ResourceKind::Plugin {
+        return descriptor.metadata.get("content_sha256").cloned();
+    }
+
+    // Plugin payloads remain installer-owned. Compare only normalized,
+    // portable installation intent; observed versions are diagnostic and may
+    // legitimately resolve differently on two machines.
+    let mut hasher = Sha256::new();
+    hasher.update(descriptor.resource_id.as_str().as_bytes());
+    if let Some(provider) = descriptor.provider {
+        hasher.update(provider_name(provider).as_bytes());
+    }
+    for key in [
+        "plugin_marketplace",
+        "plugin_source_type",
+        "plugin_source",
+        "dependency_program",
+        "dependency_argv_json",
+    ] {
+        if let Some(value) = descriptor.metadata.get(key) {
+            hasher.update((key.len() as u64).to_be_bytes());
+            hasher.update(key.as_bytes());
+            hasher.update((value.len() as u64).to_be_bytes());
+            hasher.update(value.as_bytes());
+        }
+    }
+    Some(hex_digest(hasher.finalize().as_slice()))
+}
+
+fn classify_capability_sync_state(
+    local_digest: Option<&str>,
+    storage_digest: Option<&str>,
+    base_known: bool,
+    base_digest: Option<&str>,
+) -> ThreadSyncState {
+    let state = classify_thread_sync_state(local_digest, storage_digest, base_known, base_digest);
+    if state == ThreadSyncState::Unknown && local_digest.is_some() && storage_digest.is_some() {
+        ThreadSyncState::Diverged
+    } else {
+        state
+    }
+}
+
+fn descriptor_version(descriptor: Option<&ResourceDescriptor>) -> Option<String> {
+    descriptor.and_then(|descriptor| descriptor.metadata.get("plugin_observed_version").cloned())
+}
+
+fn descriptor_provided_skills(descriptor: Option<&ResourceDescriptor>) -> Vec<String> {
+    descriptor
+        .and_then(|descriptor| descriptor.metadata.get("plugin_provided_skills_json"))
+        .and_then(|value| serde_json::from_str::<Vec<String>>(value).ok())
+        .unwrap_or_default()
+}
+
+fn get_project_capability_status_with_repository(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    storage_id: Option<&StorageId>,
+) -> Result<CapabilityStatusReport, String> {
+    let config = repository.load_config()?;
+    let project = config
+        .project(local_project_id)
+        .cloned()
+        .ok_or_else(|| format!("unknown local project '{}'", local_project_id))?;
+    let machine = repository.load_bindings()?;
+    let binding = machine
+        .active_for(local_project_id)
+        .cloned()
+        .ok_or_else(|| {
+            format!(
+                "project '{}' is not mapped on this machine",
+                local_project_id
+            )
+        })?;
+
+    let mut warnings = Vec::new();
+    let mut profiles = Vec::new();
+    for (provider, profile_id) in &binding.profile_ids {
+        let Some(profile) = machine
+            .profiles
+            .iter()
+            .find(|candidate| &candidate.profile_id == profile_id)
+        else {
+            warnings.push(format!("provider profile '{}' is unavailable", profile_id));
+            continue;
+        };
+        let shared_project_count = machine
+            .bindings
+            .iter()
+            .filter(|candidate| {
+                candidate.state == BindingState::Active
+                    && candidate.profile_ids.values().any(|id| id == profile_id)
+            })
+            .map(|candidate| candidate.local_project_id.clone())
+            .collect::<BTreeSet<_>>()
+            .len();
+        profiles.push(CapabilityProfileContext {
+            provider: *provider,
+            profile_id: profile_id.clone(),
+            display_name: profile.display_name.clone(),
+            path: profile.path.clone(),
+            shared_project_count,
+        });
+    }
+    profiles.sort_by(|left, right| {
+        left.provider
+            .cmp(&right.provider)
+            .then_with(|| left.display_name.cmp(&right.display_name))
+    });
+
+    let capture_request = capture_request_for_binding(repository, &binding)?;
+    let discovered = provider_capture::discover_project(&capture_request)?;
+    let inventory = inventory_from_candidates(
+        binding.project_root.clone(),
+        Some(project.bundle_id.clone()),
+        &discovered.resources,
+        project.recipe.clone(),
+        discovered.warnings.clone(),
+    )?;
+    warnings.extend(inventory.warnings.clone());
+
+    let selected_capabilities = discovered
+        .resources
+        .iter()
+        .filter(|candidate| {
+            matches!(
+                candidate.kind,
+                CaptureResourceKind::Skill
+                    | CaptureResourceKind::StandaloneSkill
+                    | CaptureResourceKind::Plugin
+            )
+        })
+        .map(|candidate| candidate.resource_id.clone())
+        .collect::<BTreeSet<_>>();
+    let captured =
+        match provider_capture::capture_selected(&capture_request, &selected_capabilities) {
+            Ok(captured) => captured,
+            Err(error) => {
+                warnings.push(format!(
+                    "Skill and plugin content could not be fully compared: {error}"
+                ));
+                provider_capture::CapturedResources::default()
+            }
+        };
+    warnings.extend(captured.warnings.clone());
+    let local_captured = provider_capture::domain_resources(&captured)?;
+    let unavailable = captured
+        .unavailable_resource_ids
+        .iter()
+        .map(|resource_id| ResourceId::parse(resource_id.clone()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
+
+    let mut local_inventory = inventory
+        .resources
+        .into_iter()
+        .filter(|resource| is_capability_kind(resource.descriptor.kind))
+        .map(|mut resource| {
+            if let Some(captured) = local_captured.get(&resource.descriptor.resource_id) {
+                resource.descriptor = captured.clone();
+            }
+            (resource.descriptor.resource_id.clone(), resource)
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let mut storage_name = None;
+    let mut current = None;
+    let mut base_manifest = None;
+    let mut effective_recipe = project.recipe.clone();
+    let mut storage_comparison_available = false;
+    let base_generation = storage_id
+        .and_then(|storage_id| project.recipe_bases.get(storage_id))
+        .map(|base| base.generation);
+
+    if let Some(storage_id) = storage_id {
+        require_project_link(&config, &project, storage_id)?;
+        storage_name = config
+            .storages
+            .iter()
+            .find(|storage| storage.id == *storage_id)
+            .map(|storage| storage.name.clone());
+        effective_recipe = config
+            .links
+            .iter()
+            .find(|link| {
+                link.local_project_id == *local_project_id && link.storage_id == *storage_id
+            })
+            .and_then(|link| link.recipe.clone())
+            .unwrap_or_else(|| project.recipe.clone());
+
+        match storage_engine(repository, storage_id) {
+            Ok((_, engine)) => match engine.inspect_optional(&project.bundle_id) {
+                Ok(snapshot) => {
+                    current = snapshot;
+                    storage_comparison_available = true;
+                    if let Some(base) = project.recipe_bases.get(storage_id) {
+                        if base.binding_revision != Some(binding.revision) {
+                            warnings.push(
+                                "The project folder or agent profile changed after the last reviewed sync; skill and plugin direction is unavailable until the next Pull or Push."
+                                    .to_string(),
+                            );
+                        } else if current.as_ref().is_some_and(|snapshot| {
+                            snapshot.head.generation == base.generation
+                                && snapshot.head.manifest_sha256 == base.manifest_sha256
+                        }) {
+                            base_manifest =
+                                current.as_ref().map(|snapshot| snapshot.manifest.clone());
+                        } else if let Some(commit_id) = base.commit_id.as_deref() {
+                            match engine.inspect_manifest_version(
+                                &project.bundle_id,
+                                base.generation,
+                                commit_id,
+                                &base.manifest_sha256,
+                            ) {
+                                Ok(manifest) => base_manifest = Some(manifest),
+                                Err(error) => warnings.push(format!(
+                                    "The reviewed skill and plugin base could not be loaded: {error}"
+                                )),
+                            }
+                        } else {
+                            warnings.push(
+                                "The reviewed base predates directional comparison; Pull or Push once to establish it."
+                                    .to_string(),
+                            );
+                        }
+                    }
+                }
+                Err(error) => warnings.push(format!(
+                    "Skills and plugins could not be compared with storage: {error}"
+                )),
+            },
+            Err(error) => warnings.push(format!(
+                "Skills and plugins could not be compared with storage: {error}"
+            )),
+        }
+    }
+
+    let remote_resources = current
+        .as_ref()
+        .map(|snapshot| {
+            snapshot
+                .manifest
+                .resources
+                .iter()
+                .filter(|(_, descriptor)| is_capability_kind(descriptor.kind))
+                .map(|(resource_id, descriptor)| (resource_id.clone(), descriptor.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let base_resources = base_manifest
+        .as_ref()
+        .map(|manifest| {
+            manifest
+                .resources
+                .iter()
+                .filter(|(_, descriptor)| is_capability_kind(descriptor.kind))
+                .map(|(resource_id, descriptor)| (resource_id.clone(), descriptor.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let mut remote_paths = BTreeMap::<ResourceId, Vec<String>>::new();
+    if let Some(snapshot) = &current {
+        for (path, file) in &snapshot.manifest.files {
+            if remote_resources.contains_key(&file.resource_id) {
+                remote_paths
+                    .entry(file.resource_id.clone())
+                    .or_default()
+                    .push(path.as_str().to_string());
+            }
+        }
+    }
+
+    let resource_ids = local_inventory
+        .keys()
+        .chain(remote_resources.keys())
+        .chain(base_resources.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut items = Vec::new();
+    for resource_id in resource_ids {
+        let local_inventory_resource = local_inventory.remove(&resource_id);
+        let local_descriptor = local_captured.get(&resource_id).or_else(|| {
+            local_inventory_resource
+                .as_ref()
+                .map(|resource| &resource.descriptor)
+        });
+        let remote_descriptor = remote_resources.get(&resource_id);
+        let base_descriptor = base_resources.get(&resource_id);
+        let local_present = local_inventory_resource.is_some();
+        let storage_present = remote_descriptor.is_some();
+        if !local_present && !storage_present {
+            continue;
+        }
+        let descriptor = local_descriptor
+            .or(remote_descriptor)
+            .or(base_descriptor)
+            .cloned()
+            .ok_or_else(|| format!("capability '{}' has no descriptor", resource_id))?;
+        let blocked_reason = local_inventory_resource
+            .as_ref()
+            .and_then(|resource| resource.blocked_reason.clone());
+        let local_digest = descriptor_capability_digest(local_descriptor);
+        let storage_digest = descriptor_capability_digest(remote_descriptor);
+        let base_digest = descriptor_capability_digest(base_descriptor);
+        let incomplete = unavailable.contains(&resource_id)
+            || (local_present && local_digest.is_none())
+            || (storage_present && storage_digest.is_none());
+        let state = if blocked_reason.is_some() {
+            "blocked"
+        } else if !storage_comparison_available {
+            "not_compared"
+        } else if incomplete {
+            "unknown"
+        } else {
+            let base_resource_known =
+                base_manifest.is_some() && (base_descriptor.is_none() || base_digest.is_some());
+            capability_state_name(classify_capability_sync_state(
+                local_digest.as_deref(),
+                storage_digest.as_deref(),
+                base_resource_known,
+                base_digest.as_deref(),
+            ))
+        };
+        let local_version = descriptor_version(local_descriptor);
+        let storage_version = descriptor_version(remote_descriptor);
+        let enabled = local_descriptor
+            .and_then(|descriptor| descriptor.metadata.get("plugin_enabled"))
+            .and_then(|value| value.parse::<bool>().ok());
+        let mut provided_skills = descriptor_provided_skills(local_descriptor);
+        provided_skills.extend(descriptor_provided_skills(remote_descriptor));
+        provided_skills.sort();
+        provided_skills.dedup();
+        let message = blocked_reason.clone().or_else(|| {
+            if descriptor.kind == ResourceKind::Plugin && enabled == Some(false) {
+                Some("Installed locally but disabled in the provider configuration".to_string())
+            } else if descriptor.kind == ResourceKind::Plugin
+                && local_version.is_some()
+                && storage_version.is_some()
+                && local_version != storage_version
+            {
+                Some(
+                    "Observed plugin versions differ; native installation may resolve a newer version"
+                        .to_string(),
+                )
+            } else {
+                None
+            }
+        });
+        let logical_paths = local_inventory_resource
+            .as_ref()
+            .map(|resource| resource.logical_paths.clone())
+            .filter(|paths| !paths.is_empty())
+            .or_else(|| remote_paths.get(&resource_id).cloned())
+            .unwrap_or_default();
+
+        items.push(CapabilityStatusItem {
+            category: resource_category(descriptor.kind).to_string(),
+            descriptor,
+            state: state.to_string(),
+            local_present,
+            storage_present,
+            selected_in_recipe: effective_recipe.entries.contains_key(&resource_id),
+            blocked_reason,
+            logical_paths,
+            local_digest,
+            storage_digest,
+            local_version,
+            storage_version,
+            enabled,
+            provided_skills,
+            message,
+        });
+    }
+    items.sort_by(|left, right| {
+        left.category
+            .cmp(&right.category)
+            .then_with(|| left.descriptor.provider.cmp(&right.descriptor.provider))
+            .then_with(|| {
+                left.descriptor
+                    .display_name
+                    .to_lowercase()
+                    .cmp(&right.descriptor.display_name.to_lowercase())
+            })
+    });
+    warnings.sort();
+    warnings.dedup();
+
+    Ok(CapabilityStatusReport {
+        project_id: project.local_project_id,
+        project_name: project.local_alias.unwrap_or(project.display_name),
+        profiles,
+        storage_id: storage_id.cloned(),
+        storage_name,
+        generation: current.as_ref().map(|snapshot| snapshot.head.generation),
+        base_generation,
+        compared_at: now_secs(),
+        items,
+        warnings,
+    })
+}
+
 #[cfg(test)]
 fn push_bundle_with_repository(
     repository: &V3Repository,
@@ -2844,11 +4035,28 @@ fn push_bundle_with_repository(
     push_bundle_with_recipe_with_repository(repository, local_project_id, storage_id, None)
 }
 
+#[cfg(test)]
 fn push_bundle_with_recipe_with_repository(
     repository: &V3Repository,
     local_project_id: &LocalProjectId,
     storage_id: &StorageId,
     requested_recipe: Option<BundleRecipe>,
+) -> Result<ProjectOperationResult, String> {
+    push_bundle_reviewed_with_repository(
+        repository,
+        local_project_id,
+        storage_id,
+        requested_recipe,
+        ProjectContentPushReview::default(),
+    )
+}
+
+fn push_bundle_reviewed_with_repository(
+    repository: &V3Repository,
+    local_project_id: &LocalProjectId,
+    storage_id: &StorageId,
+    requested_recipe: Option<BundleRecipe>,
+    project_content_review: ProjectContentPushReview,
 ) -> Result<ProjectOperationResult, String> {
     let config = repository.load_config()?;
     let mut project = config
@@ -2856,11 +4064,14 @@ fn push_bundle_with_recipe_with_repository(
         .cloned()
         .ok_or_else(|| format!("unknown local project '{}'", local_project_id))?;
     require_project_link(&config, &project, storage_id)?;
-    let stored_destination_recipe = config
+    let stored_link = config
         .links
         .iter()
         .find(|link| link.local_project_id == *local_project_id && link.storage_id == *storage_id)
-        .and_then(|link| link.recipe.clone());
+        .cloned()
+        .ok_or_else(|| "project storage link disappeared".to_string())?;
+    let stored_destination_recipe = stored_link.recipe.clone();
+    let expected_preference_revision = stored_link.project_content_preferences.revision;
     let binding = repository
         .load_bindings()?
         .active_for(local_project_id)
@@ -2879,18 +4090,176 @@ fn push_bundle_with_recipe_with_repository(
         &project.local_project_id,
         &discovered.resources,
     )?;
-    let push_recipe = match requested_recipe {
-        Some(mut requested) => {
+    let mut push_recipe = match requested_recipe {
+        Some(requested) => {
             requested.validate()?;
-            requested.revision = match &stored_destination_recipe {
-                Some(current) if current.entries == requested.entries => current.revision,
-                Some(current) => current.revision.saturating_add(1),
-                None => 1,
-            };
             requested
         }
         None => project.recipe.clone(),
     };
+    let stored_generic_entries = stored_destination_recipe
+        .as_ref()
+        .map(|recipe| {
+            recipe
+                .entries
+                .iter()
+                .filter(|(resource_id, _)| {
+                    super::domain::is_project_content_resource_id(resource_id)
+                })
+                .map(|(resource_id, entry)| (resource_id.clone(), entry.clone()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    for resource_id in &project_content_review.removal_ids {
+        if !stored_generic_entries.contains_key(resource_id) {
+            return Err(format!(
+                "project-content removal '{}' is not currently stored for this destination",
+                resource_id
+            ));
+        }
+        if push_recipe.entries.contains_key(resource_id) {
+            return Err(format!(
+                "project-content removal '{}' is also selected for publication",
+                resource_id
+            ));
+        }
+    }
+    for (resource_id, entry) in &stored_generic_entries {
+        if !push_recipe.entries.contains_key(resource_id)
+            && !project_content_review.removal_ids.contains(resource_id)
+        {
+            push_recipe
+                .entries
+                .insert(resource_id.clone(), entry.clone());
+        }
+    }
+
+    let requested_generic_ids = push_recipe
+        .entries
+        .keys()
+        .filter(|resource_id| super::domain::is_project_content_resource_id(resource_id))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let generic_selection_changed = requested_generic_ids
+        != stored_generic_entries
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+        || !project_content_review.removal_ids.is_empty();
+    let mut reviewed_inventory = None;
+    if let Some(review_token) = project_content_review.review_token.as_deref() {
+        let inventory =
+            inspect_project_files_with_repository(repository, local_project_id, storage_id)?;
+        if inventory.eligibility.state != ProjectFileSyncEligibilityState::Eligible {
+            return Err(inventory.eligibility.reason);
+        }
+        if inventory.review_token.as_deref() != Some(review_token) {
+            return Err(
+                "project files changed after Scan; rescan and review them before pushing"
+                    .to_string(),
+            );
+        }
+        let entries_by_id = inventory
+            .entries
+            .iter()
+            .map(|entry| (entry.descriptor.resource_id.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        for resource_id in requested_generic_ids.clone() {
+            let entry = entries_by_id.get(&resource_id).ok_or_else(|| {
+                format!(
+                    "selected project-content resource '{}' was not in the reviewed scan",
+                    resource_id
+                )
+            })?;
+            if entry.blocked_reason.is_some() {
+                return Err(format!(
+                    "selected project-content resource '{}' is blocked",
+                    resource_id
+                ));
+            }
+            if !entry.local_present && !stored_generic_entries.contains_key(&resource_id) {
+                return Err(format!(
+                    "new project-content resource '{}' disappeared after review",
+                    resource_id
+                ));
+            }
+            if let Some(warning_digest) = &entry.warning_digest {
+                if entry.local_present
+                    && !project_content_review
+                        .acknowledged_warning_digests
+                        .contains(warning_digest)
+                {
+                    return Err(format!(
+                        "project-content warning for '{}' requires explicit acknowledgement",
+                        entry.relative_path
+                    ));
+                }
+            }
+            if entry.entry_type == ProjectContentEntryType::File && entry.local_present {
+                for ancestor in project_content_ancestor_paths(&entry.relative_path) {
+                    let required = inventory.entries.iter().find(|candidate| {
+                        candidate.entry_type == ProjectContentEntryType::Directory
+                            && candidate.relative_path == ancestor
+                    });
+                    let required = required.ok_or_else(|| {
+                        format!(
+                            "selected file '{}' lacks reviewed directory '{}'",
+                            entry.relative_path, ancestor
+                        )
+                    })?;
+                    let required_id = required.descriptor.resource_id.clone();
+                    push_recipe
+                        .entries
+                        .entry(required_id.clone())
+                        .or_insert(RecipeEntry {
+                            resource_id: required_id,
+                            apply_policy: ApplyPolicy::ExplicitReview,
+                            required: true,
+                        });
+                }
+            }
+        }
+        for removed_directory in project_content_review.removal_ids.iter().filter_map(|id| {
+            entries_by_id
+                .get(id)
+                .filter(|entry| entry.entry_type == ProjectContentEntryType::Directory)
+        }) {
+            if inventory.entries.iter().any(|candidate| {
+                candidate.storage_present
+                    && candidate
+                        .relative_path
+                        .starts_with(&format!("{}/", removed_directory.relative_path))
+                    && push_recipe
+                        .entries
+                        .contains_key(&candidate.descriptor.resource_id)
+            }) {
+                return Err(format!(
+                    "directory '{}' cannot be removed while stored descendants remain selected",
+                    removed_directory.relative_path
+                ));
+            }
+        }
+        reviewed_inventory = Some(inventory);
+    } else if generic_selection_changed {
+        return Err(
+            "Scan and review Project files before changing stored project content".to_string(),
+        );
+    }
+
+    push_recipe.validate()?;
+    push_recipe.revision = match &stored_destination_recipe {
+        Some(current) if current.entries == push_recipe.entries => current.revision,
+        Some(current) => current.revision.saturating_add(1),
+        None => 1,
+    };
+    let mut capture_request = capture_request;
+    capture_request.include_project_content = reviewed_inventory.is_some();
+    if capture_request.include_project_content {
+        let eligibility = project_file_sync_eligibility(&binding);
+        if eligibility.state != ProjectFileSyncEligibilityState::Eligible {
+            return Err(eligibility.reason);
+        }
+    }
     let capture = provider_capture::capture_recipe(&capture_request, &push_recipe)?;
     let (_, engine) = storage_engine(repository, storage_id)?;
     let expected_head = match (
@@ -2993,7 +4362,46 @@ fn push_bundle_with_recipe_with_repository(
                 link.local_project_id == *local_project_id && link.storage_id == *storage_id
             })
             .ok_or_else(|| "project storage link was removed while publishing".to_string())?;
+        if current_link.recipe != stored_destination_recipe
+            || current_link.project_content_preferences.revision != expected_preference_revision
+        {
+            return Err(
+                "project-file choices changed while publishing; remote head was written, refresh before pushing again"
+                    .to_string(),
+            );
+        }
         current_link.recipe = Some(push_recipe.clone());
+        if let Some(inventory) = &reviewed_inventory {
+            let previous_exclusions = current_link
+                .project_content_preferences
+                .excluded_resource_ids
+                .clone();
+            let mut exclusions = previous_exclusions.clone();
+            for entry in &inventory.entries {
+                if !entry.local_present || entry.entry_type == ProjectContentEntryType::Blocked {
+                    continue;
+                }
+                if push_recipe
+                    .entries
+                    .contains_key(&entry.descriptor.resource_id)
+                {
+                    exclusions.remove(&entry.descriptor.resource_id);
+                } else {
+                    exclusions.insert(entry.descriptor.resource_id.clone());
+                }
+            }
+            exclusions.extend(project_content_review.removal_ids.iter().cloned());
+            if exclusions != previous_exclusions {
+                current_link.project_content_preferences.revision = current_link
+                    .project_content_preferences
+                    .revision
+                    .saturating_add(1);
+                current_link
+                    .project_content_preferences
+                    .excluded_resource_ids = exclusions;
+            }
+            current_link.project_content_preferences.validate()?;
+        }
         current.revision = current.revision.saturating_add(1);
         current.updated_at = pushed_at;
         Ok(())
@@ -3036,7 +4444,9 @@ fn plan_bundle_restore_with_repository(
     }
     require_codex_conversation_paths_ready(repository, &binding.local_project_id)?;
     let (engine, fetched) = fetch_from_storage(repository, storage_id, bundle_id)?;
-    let plan = engine.build_restore_plan(&fetched, &binding, now_secs())?;
+    let mut plan = engine.build_restore_plan(&fetched, &binding, now_secs())?;
+    plan.project_content_eligibility = Some(project_file_sync_eligibility(&binding));
+    plan.validate()?;
     repository.save_restore_plan(&plan)?;
     Ok(plan)
 }
@@ -3049,6 +4459,22 @@ fn apply_bundle_restore_with_repository(
     let plan = repository.load_restore_plan(plan_id)?;
     let binding = current_binding_for_restore_plan(repository, &plan)?;
     let approved = unique_approved_actions(&approved_action_ids, &plan.actions)?;
+    let approves_project_content = plan.actions.iter().any(|action| {
+        approved.contains(&action.action_id)
+            && matches!(
+                &action.kind,
+                RestoreActionKind::WriteProjectFile { .. }
+                    | RestoreActionKind::EnsureProjectDirectory { .. }
+                    | RestoreActionKind::DeleteProjectFile { .. }
+                    | RestoreActionKind::DeleteProjectDirectory { .. }
+            )
+    });
+    if approves_project_content {
+        let eligibility = project_file_sync_eligibility(&binding);
+        if eligibility.state != ProjectFileSyncEligibilityState::Eligible {
+            return Err(eligibility.reason);
+        }
+    }
     if repository
         .load_materializations()?
         .records
@@ -3071,19 +4497,29 @@ fn apply_bundle_restore_with_repository(
         &repository.backups_dir()?,
         applied_at,
     )?;
-    let files_complete = applied.receipts.iter().all(|receipt| {
-        !matches!(
-            receipt.action_type,
+    let files_complete = applied
+        .receipts
+        .iter()
+        .all(|receipt| match receipt.action_type {
+            RestoreActionType::WriteProjectFile
+            | RestoreActionType::EnsureProjectDirectory
+            | RestoreActionType::DeleteProjectFile
+            | RestoreActionType::DeleteProjectDirectory => {
+                matches!(
+                    receipt.status,
+                    ActionStatus::Applied | ActionStatus::Skipped
+                )
+            }
             RestoreActionType::WriteFile
-                | RestoreActionType::MergeFile
-                | RestoreActionType::MaterializeConversation
-                | RestoreActionType::InstallCustomSkill
-                | RestoreActionType::OverwriteCustomSkill
-                | RestoreActionType::ReviewHook
-                | RestoreActionType::ReviewMcp
-                | RestoreActionType::ApplySetting
-        ) || receipt.status == ActionStatus::Applied
-    });
+            | RestoreActionType::MergeFile
+            | RestoreActionType::MaterializeConversation
+            | RestoreActionType::InstallCustomSkill
+            | RestoreActionType::OverwriteCustomSkill
+            | RestoreActionType::ReviewHook
+            | RestoreActionType::ReviewMcp
+            | RestoreActionType::ApplySetting => receipt.status == ActionStatus::Applied,
+            _ => true,
+        });
     let status = if files_complete {
         MaterializationStatus::Complete
     } else {
@@ -3118,9 +4554,10 @@ fn apply_bundle_restore_with_repository(
         materializations.records.push(record);
         Ok(())
     })?;
-    let overall_success = !applied.receipts.iter().any(|receipt| {
-        matches!(receipt.status, ActionStatus::Failed | ActionStatus::Blocked)
-    });
+    let overall_success = !applied
+        .receipts
+        .iter()
+        .any(|receipt| matches!(receipt.status, ActionStatus::Failed | ActionStatus::Blocked));
     if files_complete {
         repository.mutate_config(|config| {
             let project = config
@@ -3851,12 +5288,30 @@ fn capture_request_for_binding(
         .map(|other| PathBuf::from(other.canonical_project_root))
         .filter(|root| root.starts_with(&resolved_project) && root != &resolved_project)
         .collect();
-    Ok(capture_request_with_global_inventory(
+    let mut request = capture_request_with_global_inventory(
         resolved_project,
         binding.codex_home.as_ref().map(PathBuf::from),
         binding.claude_home.as_ref().map(PathBuf::from),
         excluded_project_roots,
-    ))
+    );
+    let config = repository.load_config()?;
+    request
+        .excluded_content_roots
+        .push(repository.root().to_path_buf());
+    request.excluded_content_roots.extend(
+        config
+            .storages
+            .iter()
+            .filter(|storage| storage.kind == StorageKind::Local)
+            .map(|storage| PathBuf::from(&storage.local_dir)),
+    );
+    if let Some(home) = &binding.codex_home {
+        request.excluded_content_roots.push(PathBuf::from(home));
+    }
+    if let Some(home) = &binding.claude_home {
+        request.excluded_content_roots.push(PathBuf::from(home));
+    }
+    Ok(request)
 }
 
 /// Build a capture request whose global plugin and custom-skill candidates
@@ -3890,6 +5345,8 @@ fn capture_request_with_global_inventory(
         standalone_skills,
         global_plugins,
         blocked_global_skills,
+        include_project_content: false,
+        excluded_content_roots: Vec::new(),
     }
 }
 
@@ -4248,6 +5705,7 @@ fn save_project_link_with_repository(
             storage_id: request.storage_id.clone(),
             bundle_id: project.bundle_id.clone(),
             recipe: None,
+            project_content_preferences: Default::default(),
             pinned: request.pinned,
             created_at: now_secs(),
         };
@@ -4258,12 +5716,15 @@ fn save_project_link_with_repository(
             // Preserve creation time while updating user intent.
             let created_at = existing.created_at;
             let recipe = existing.recipe.clone();
+            let project_content_preferences = existing.project_content_preferences.clone();
             *existing = link.clone();
             existing.created_at = created_at;
             existing.recipe = recipe.clone();
+            existing.project_content_preferences = project_content_preferences.clone();
             let mut returned = link;
             returned.created_at = created_at;
             returned.recipe = recipe;
+            returned.project_content_preferences = project_content_preferences;
             Ok(returned)
         } else {
             config.links.push(link.clone());
@@ -4432,6 +5893,7 @@ fn connect_project_to_remote_bundle_with_repository(
                 storage_id: request.storage_id.clone(),
                 bundle_id: new_bundle_id.clone(),
                 recipe: None,
+                project_content_preferences: Default::default(),
                 pinned: request.pinned,
                 created_at: now_secs(),
             });
@@ -5628,6 +7090,7 @@ fn build_setup_transaction(
             storage_id: resolved.storage.id.clone(),
             bundle_id: bundle_id.clone(),
             recipe: None,
+            project_content_preferences: Default::default(),
             pinned: true,
             created_at: now,
         })
@@ -6843,7 +8306,9 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::project_sync_v3::domain::{RestoreActionKind, StorageConfigV3, StorageKind};
+    use crate::project_sync_v3::domain::{
+        RestoreActionKind, StorageConfigV3, StorageKind, TombstoneTarget,
+    };
 
     #[test]
     fn routine_history_scan_logs_are_throttled_per_project() {
@@ -6934,6 +8399,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn capability_status_marks_two_unbased_versions_for_review() {
+        assert_eq!(
+            classify_capability_sync_state(Some("local"), Some("storage"), false, None),
+            ThreadSyncState::Diverged
+        );
+        assert_eq!(
+            classify_capability_sync_state(Some("same"), Some("same"), false, None),
+            ThreadSyncState::Synced
+        );
+        assert_eq!(
+            classify_capability_sync_state(Some("local"), None, false, None),
+            ThreadSyncState::LocalOnly
+        );
+    }
+
+    #[test]
+    fn plugin_status_compares_portable_intent_not_observed_version() {
+        let plugin = |source: &str, version: &str| ResourceDescriptor {
+            resource_id: ResourceId::parse("codex:plugin:tools").unwrap(),
+            kind: ResourceKind::Plugin,
+            provider: Some(Provider::Codex),
+            scope: ResourceScope::Dependency,
+            display_name: "tools".to_string(),
+            provenance: Provenance::Plugin {
+                provider: Provider::Codex,
+                plugin_id: "tools".to_string(),
+            },
+            apply_policy: ApplyPolicy::ExplicitInstall,
+            relative_cwd: None,
+            codec_version: 1,
+            metadata: BTreeMap::from([
+                ("plugin_source_type".to_string(), "git".to_string()),
+                ("plugin_source".to_string(), source.to_string()),
+                ("plugin_observed_version".to_string(), version.to_string()),
+                (
+                    "dependency_argv_json".to_string(),
+                    "[\"plugin\",\"add\",\"tools\"]".to_string(),
+                ),
+            ]),
+        };
+        let first = plugin("https://example.test/tools.git", "1.0.0");
+        let newer_observation = plugin("https://example.test/tools.git", "2.0.0");
+        let different_source = plugin("https://mirror.test/tools.git", "2.0.0");
+
+        assert_eq!(
+            descriptor_capability_digest(Some(&first)),
+            descriptor_capability_digest(Some(&newer_observation))
+        );
+        assert_ne!(
+            descriptor_capability_digest(Some(&first)),
+            descriptor_capability_digest(Some(&different_source))
+        );
+    }
+
     fn repository(temp: &tempfile::TempDir) -> V3Repository {
         V3Repository::from_home_dir(temp.path()).unwrap()
     }
@@ -6960,6 +8480,577 @@ mod tests {
         )
         .unwrap()
         .profile_id
+    }
+
+    fn add_local_storage(repo: &V3Repository, storage_id: &StorageId, storage_root: &Path) {
+        std::fs::create_dir_all(storage_root).unwrap();
+        let mut config = repo.load_config().unwrap();
+        config.storages.push(StorageConfigV3 {
+            id: storage_id.clone(),
+            name: "Project content store".to_string(),
+            kind: StorageKind::Local,
+            bucket: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            account_id: String::new(),
+            s3_endpoint: String::new(),
+            region: String::new(),
+            local_dir: storage_root.to_string_lossy().into_owned(),
+            included_default_exclusions: Vec::new(),
+            supports_conditional_writes: None,
+        });
+        repo.save_config(config).unwrap();
+    }
+
+    fn bind_and_link_test_replica(
+        repo: &V3Repository,
+        project: &LocalProjectRegistration,
+        storage_id: &StorageId,
+        project_root: &Path,
+        codex_home: &Path,
+    ) -> ProjectBinding {
+        std::fs::create_dir_all(project_root).unwrap();
+        let profile_id = add_profile(repo, Provider::Codex, codex_home);
+        let binding = save_project_binding_with_repository(
+            repo,
+            SaveProjectBindingRequest {
+                local_project_id: project.local_project_id.clone(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, profile_id)]),
+                expected_revision: None,
+            },
+        )
+        .unwrap();
+        save_project_link_with_repository(
+            repo,
+            SaveProjectLinkRequest {
+                local_project_id: project.local_project_id.clone(),
+                storage_id: storage_id.clone(),
+                pinned: true,
+            },
+        )
+        .unwrap();
+        repo.load_bindings()
+            .unwrap()
+            .active_for(&project.local_project_id)
+            .cloned()
+            .unwrap_or(binding)
+    }
+
+    fn reviewed_project_content_recipe(inventory: &ProjectContentInventory) -> BundleRecipe {
+        let mut recipe = BundleRecipe::default();
+        for entry in &inventory.entries {
+            if entry.local_present && entry.blocked_reason.is_none() && entry.selected_after_scan {
+                let resource_id = entry.descriptor.resource_id.clone();
+                recipe.entries.insert(
+                    resource_id.clone(),
+                    RecipeEntry {
+                        resource_id,
+                        apply_policy: ApplyPolicy::ExplicitReview,
+                        required: entry.entry_type == ProjectContentEntryType::Directory,
+                    },
+                );
+            }
+        }
+        recipe
+    }
+
+    #[test]
+    fn project_content_nested_tree_and_empty_directory_round_trip_then_delete_safely() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp);
+        let storage_id = StorageId::parse("project-files-store").unwrap();
+        add_local_storage(&repo, &storage_id, &temp.path().join("store"));
+
+        let source = register(&repo);
+        let source_root = temp.path().join("machine-a/project");
+        std::fs::create_dir_all(source_root.join("docs/specs")).unwrap();
+        std::fs::create_dir_all(source_root.join("docs/empty")).unwrap();
+        std::fs::write(source_root.join("docs/specs/a.md"), b"portable spec\n").unwrap();
+        std::fs::write(source_root.join("docs/file_b.md"), b"original b\n").unwrap();
+        std::fs::write(source_root.join("excluded.txt"), b"do not publish\n").unwrap();
+        bind_and_link_test_replica(
+            &repo,
+            &source,
+            &storage_id,
+            &source_root,
+            &temp.path().join("machine-a/codex"),
+        );
+
+        let scanned =
+            inspect_project_files_with_repository(&repo, &source.local_project_id, &storage_id)
+                .unwrap();
+        assert_eq!(
+            scanned.eligibility.state,
+            ProjectFileSyncEligibilityState::Eligible
+        );
+        assert!(scanned
+            .entries
+            .iter()
+            .all(|entry| entry.selected_after_scan));
+        let excluded_id = scanned
+            .entries
+            .iter()
+            .find(|entry| entry.relative_path == "excluded.txt")
+            .unwrap()
+            .descriptor
+            .resource_id
+            .clone();
+        let mut recipe = reviewed_project_content_recipe(&scanned);
+        recipe.entries.remove(&excluded_id);
+        let selected_ids = recipe.entries.keys().cloned().collect::<BTreeSet<_>>();
+        let pushed = push_bundle_reviewed_with_repository(
+            &repo,
+            &source.local_project_id,
+            &storage_id,
+            Some(recipe),
+            ProjectContentPushReview {
+                review_token: scanned.review_token.clone(),
+                removal_ids: BTreeSet::new(),
+                acknowledged_warning_digests: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+        assert!(pushed.success, "{}", pushed.message);
+
+        let (_, engine) = storage_engine(&repo, &storage_id).unwrap();
+        let first_snapshot = engine.inspect(&source.bundle_id).unwrap();
+        assert!(first_snapshot.manifest.files.contains_key(
+            &super::super::domain::LogicalPath::parse("project/docs/specs/a.md").unwrap()
+        ));
+        assert!(!first_snapshot.manifest.files.contains_key(
+            &super::super::domain::LogicalPath::parse("project/excluded.txt").unwrap()
+        ));
+        for directory in ["project/docs", "project/docs/specs", "project/docs/empty"] {
+            assert!(first_snapshot
+                .manifest
+                .directories
+                .contains_key(&super::super::domain::LogicalPath::parse(directory).unwrap()));
+        }
+        let config_after_push = repo.load_config().unwrap();
+        let source_link = config_after_push
+            .links
+            .iter()
+            .find(|link| {
+                link.local_project_id == source.local_project_id && link.storage_id == storage_id
+            })
+            .unwrap();
+        assert!(source_link
+            .project_content_preferences
+            .excluded_resource_ids
+            .contains(&excluded_id));
+        let relinked = save_project_link_with_repository(
+            &repo,
+            SaveProjectLinkRequest {
+                local_project_id: source.local_project_id.clone(),
+                storage_id: storage_id.clone(),
+                pinned: false,
+            },
+        )
+        .unwrap();
+        assert!(relinked
+            .project_content_preferences
+            .excluded_resource_ids
+            .contains(&excluded_id));
+        let rescanned =
+            inspect_project_files_with_repository(&repo, &source.local_project_id, &storage_id)
+                .unwrap();
+        let excluded = rescanned
+            .entries
+            .iter()
+            .find(|entry| entry.descriptor.resource_id == excluded_id)
+            .unwrap();
+        assert!(!excluded.selected_after_scan);
+        assert!(!excluded.selected_in_recipe);
+        let other_storage_id = StorageId::parse("project-files-other-store").unwrap();
+        add_local_storage(&repo, &other_storage_id, &temp.path().join("other-store"));
+        save_project_link_with_repository(
+            &repo,
+            SaveProjectLinkRequest {
+                local_project_id: source.local_project_id.clone(),
+                storage_id: other_storage_id.clone(),
+                pinned: true,
+            },
+        )
+        .unwrap();
+        let other_destination_scan = inspect_project_files_with_repository(
+            &repo,
+            &source.local_project_id,
+            &other_storage_id,
+        )
+        .unwrap();
+        assert!(
+            other_destination_scan
+                .entries
+                .iter()
+                .find(|entry| entry.descriptor.resource_id == excluded_id)
+                .unwrap()
+                .selected_after_scan
+        );
+
+        let git_race_target = register(&repo);
+        let git_race_root = temp.path().join("machine-git-race/project");
+        let git_race_binding = bind_and_link_test_replica(
+            &repo,
+            &git_race_target,
+            &storage_id,
+            &git_race_root,
+            &temp.path().join("machine-git-race/codex"),
+        );
+        let git_race_plan = plan_bundle_restore_with_repository(
+            &repo,
+            &storage_id,
+            &git_race_target.bundle_id,
+            &git_race_binding,
+        )
+        .unwrap();
+        assert_eq!(
+            git_race_plan
+                .project_content_eligibility
+                .as_ref()
+                .unwrap()
+                .state,
+            ProjectFileSyncEligibilityState::Eligible
+        );
+        let git = std::process::Command::new("git")
+            .arg("init")
+            .arg(&git_race_root)
+            .output()
+            .unwrap();
+        assert!(git.status.success());
+        let error = apply_bundle_restore_with_repository(
+            &repo,
+            &git_race_plan.plan_id,
+            git_race_plan
+                .actions
+                .iter()
+                .map(|action| action.action_id.clone())
+                .collect(),
+        )
+        .unwrap_err();
+        assert!(error.contains("Git"), "{error}");
+        assert!(!git_race_root.join("docs/specs/a.md").exists());
+
+        let target = register(&repo);
+        let target_root = temp.path().join("machine-b/project");
+        let target_binding = bind_and_link_test_replica(
+            &repo,
+            &target,
+            &storage_id,
+            &target_root,
+            &temp.path().join("machine-b/codex"),
+        );
+        let restore = plan_bundle_restore_with_repository(
+            &repo,
+            &storage_id,
+            &target.bundle_id,
+            &target_binding,
+        )
+        .unwrap();
+        assert_eq!(
+            restore
+                .actions
+                .iter()
+                .filter(|action| matches!(
+                    action.kind,
+                    RestoreActionKind::EnsureProjectDirectory { .. }
+                ))
+                .count(),
+            3
+        );
+        assert_eq!(
+            restore
+                .actions
+                .iter()
+                .filter(|action| matches!(action.kind, RestoreActionKind::WriteProjectFile { .. }))
+                .count(),
+            2
+        );
+        assert!(restore
+            .actions
+            .iter()
+            .all(|action| action.requires_explicit_approval));
+        let approved = restore
+            .actions
+            .iter()
+            .map(|action| action.action_id.clone())
+            .collect();
+        let applied =
+            apply_bundle_restore_with_repository(&repo, &restore.plan_id, approved).unwrap();
+        assert!(applied.success, "{}", applied.message);
+        assert_eq!(
+            std::fs::read(target_root.join("docs/specs/a.md")).unwrap(),
+            b"portable spec\n"
+        );
+        assert_eq!(
+            std::fs::read(target_root.join("docs/file_b.md")).unwrap(),
+            b"original b\n"
+        );
+        assert!(target_root.join("docs/empty").is_dir());
+
+        std::fs::remove_file(source_root.join("docs/specs/a.md")).unwrap();
+        std::fs::remove_file(source_root.join("docs/file_b.md")).unwrap();
+        std::fs::remove_dir(source_root.join("docs/specs")).unwrap();
+        std::fs::remove_dir(source_root.join("docs/empty")).unwrap();
+        std::fs::remove_dir(source_root.join("docs")).unwrap();
+        let removal_scan =
+            inspect_project_files_with_repository(&repo, &source.local_project_id, &storage_id)
+                .unwrap();
+        assert!(removal_scan
+            .entries
+            .iter()
+            .filter(|entry| selected_ids.contains(&entry.descriptor.resource_id))
+            .all(|entry| !entry.local_present));
+        let mut removal_recipe = repo
+            .load_config()
+            .unwrap()
+            .links
+            .iter()
+            .find(|link| {
+                link.local_project_id == source.local_project_id && link.storage_id == storage_id
+            })
+            .and_then(|link| link.recipe.clone())
+            .unwrap();
+        for resource_id in &selected_ids {
+            removal_recipe.entries.remove(resource_id);
+        }
+        push_bundle_reviewed_with_repository(
+            &repo,
+            &source.local_project_id,
+            &storage_id,
+            Some(removal_recipe),
+            ProjectContentPushReview {
+                review_token: removal_scan.review_token.clone(),
+                removal_ids: selected_ids.clone(),
+                acknowledged_warning_digests: BTreeSet::new(),
+            },
+        )
+        .unwrap();
+
+        let deletion_snapshot = engine.inspect(&source.bundle_id).unwrap();
+        assert!(deletion_snapshot.manifest.files.is_empty());
+        assert!(deletion_snapshot.manifest.directories.is_empty());
+        assert_eq!(
+            deletion_snapshot
+                .manifest
+                .tombstones
+                .values()
+                .filter(|tombstone| matches!(
+                    tombstone.target,
+                    TombstoneTarget::ProjectContentFile { .. }
+                ))
+                .count(),
+            2
+        );
+        assert_eq!(
+            deletion_snapshot
+                .manifest
+                .tombstones
+                .values()
+                .filter(|tombstone| matches!(
+                    tombstone.target,
+                    TombstoneTarget::ProjectContentDirectory { .. }
+                ))
+                .count(),
+            3
+        );
+
+        let deletion_plan = plan_bundle_restore_with_repository(
+            &repo,
+            &storage_id,
+            &target.bundle_id,
+            &target_binding,
+        )
+        .unwrap();
+        assert_eq!(
+            deletion_plan
+                .actions
+                .iter()
+                .filter(|action| matches!(action.kind, RestoreActionKind::DeleteProjectFile { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            deletion_plan
+                .actions
+                .iter()
+                .filter(|action| matches!(
+                    action.kind,
+                    RestoreActionKind::DeleteProjectDirectory { .. }
+                ))
+                .count(),
+            3
+        );
+        let approved = deletion_plan
+            .actions
+            .iter()
+            .map(|action| action.action_id.clone())
+            .collect();
+        std::fs::write(target_root.join("docs/file_b.md"), b"locally changed b\n").unwrap();
+        let deleted =
+            apply_bundle_restore_with_repository(&repo, &deletion_plan.plan_id, approved).unwrap();
+        assert!(
+            !deleted.success,
+            "a changed local file or non-empty directory was removed"
+        );
+        assert!(!target_root.join("docs/specs/a.md").exists());
+        assert_eq!(
+            std::fs::read(target_root.join("docs/file_b.md")).unwrap(),
+            b"locally changed b\n"
+        );
+        assert!(target_root.join("docs").is_dir());
+        let backup_contains_file = walkdir::WalkDir::new(repo.backups_dir().unwrap())
+            .into_iter()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.file_type().is_file())
+            .any(|entry| std::fs::read(entry.path()).ok().as_deref() == Some(b"portable spec\n"));
+        assert!(
+            backup_contains_file,
+            "the deleted file did not receive a recoverable backup"
+        );
+
+        std::fs::remove_file(target_root.join("docs/file_b.md")).unwrap();
+        let retry = plan_bundle_restore_with_repository(
+            &repo,
+            &storage_id,
+            &target.bundle_id,
+            &target_binding,
+        )
+        .unwrap();
+        let retry_approved = retry
+            .actions
+            .iter()
+            .filter(|action| {
+                matches!(
+                    action.kind,
+                    RestoreActionKind::DeleteProjectDirectory { .. }
+                )
+            })
+            .map(|action| action.action_id.clone())
+            .collect();
+        let retried =
+            apply_bundle_restore_with_repository(&repo, &retry.plan_id, retry_approved).unwrap();
+        assert!(retried.success, "{}", retried.message);
+        assert!(!target_root.join("docs").exists());
+    }
+
+    #[test]
+    fn initializing_git_after_project_content_review_rejects_push_without_a_head() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp);
+        let storage_id = StorageId::parse("git-race-store").unwrap();
+        add_local_storage(&repo, &storage_id, &temp.path().join("store"));
+        let project = register(&repo);
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(project_root.join("notes.md"), b"notes").unwrap();
+        bind_and_link_test_replica(
+            &repo,
+            &project,
+            &storage_id,
+            &project_root,
+            &temp.path().join("codex"),
+        );
+        let scanned =
+            inspect_project_files_with_repository(&repo, &project.local_project_id, &storage_id)
+                .unwrap();
+        assert_eq!(
+            scanned.eligibility.state,
+            ProjectFileSyncEligibilityState::Eligible
+        );
+        let git = std::process::Command::new("git")
+            .arg("init")
+            .arg(&project_root)
+            .output()
+            .unwrap();
+        assert!(git.status.success());
+        let error = push_bundle_reviewed_with_repository(
+            &repo,
+            &project.local_project_id,
+            &storage_id,
+            Some(reviewed_project_content_recipe(&scanned)),
+            ProjectContentPushReview {
+                review_token: scanned.review_token,
+                removal_ids: BTreeSet::new(),
+                acknowledged_warning_digests: BTreeSet::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(error.contains("Git"), "{error}");
+        let (_, engine) = storage_engine(&repo, &storage_id).unwrap();
+        assert!(engine.read_head(&project.bundle_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn project_content_warning_and_review_tokens_are_bound_to_exact_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = repository(&temp);
+        let storage_id = StorageId::parse("warning-review-store").unwrap();
+        add_local_storage(&repo, &storage_id, &temp.path().join("store"));
+        let project = register(&repo);
+        let project_root = temp.path().join("project");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::write(project_root.join("notes.txt"), b"sample ghp_test_value_one").unwrap();
+        bind_and_link_test_replica(
+            &repo,
+            &project,
+            &storage_id,
+            &project_root,
+            &temp.path().join("codex"),
+        );
+
+        let first =
+            inspect_project_files_with_repository(&repo, &project.local_project_id, &storage_id)
+                .unwrap();
+        let first_warning = first.entries[0].warning_digest.clone().unwrap();
+        let recipe = reviewed_project_content_recipe(&first);
+        let missing_ack = push_bundle_reviewed_with_repository(
+            &repo,
+            &project.local_project_id,
+            &storage_id,
+            Some(recipe.clone()),
+            ProjectContentPushReview {
+                review_token: first.review_token.clone(),
+                removal_ids: BTreeSet::new(),
+                acknowledged_warning_digests: BTreeSet::new(),
+            },
+        )
+        .unwrap_err();
+        assert!(missing_ack.contains("acknowledgement"));
+
+        std::fs::write(project_root.join("notes.txt"), b"sample ghp_test_value_two").unwrap();
+        let stale = push_bundle_reviewed_with_repository(
+            &repo,
+            &project.local_project_id,
+            &storage_id,
+            Some(recipe),
+            ProjectContentPushReview {
+                review_token: first.review_token,
+                removal_ids: BTreeSet::new(),
+                acknowledged_warning_digests: BTreeSet::from([first_warning.clone()]),
+            },
+        )
+        .unwrap_err();
+        assert!(stale.contains("changed after Scan"), "{stale}");
+
+        let refreshed =
+            inspect_project_files_with_repository(&repo, &project.local_project_id, &storage_id)
+                .unwrap();
+        let refreshed_warning = refreshed.entries[0].warning_digest.clone().unwrap();
+        assert_ne!(first_warning, refreshed_warning);
+        let published = push_bundle_reviewed_with_repository(
+            &repo,
+            &project.local_project_id,
+            &storage_id,
+            Some(reviewed_project_content_recipe(&refreshed)),
+            ProjectContentPushReview {
+                review_token: refreshed.review_token,
+                removal_ids: BTreeSet::new(),
+                acknowledged_warning_digests: BTreeSet::from([refreshed_warning]),
+            },
+        )
+        .unwrap();
+        assert!(published.success);
     }
 
     #[test]
@@ -7556,12 +9647,10 @@ mod tests {
         })
         .unwrap();
 
-        assert!(remove_project_link_with_repository(
-            &repo,
-            &project.local_project_id,
-            &storage_id,
-        )
-        .unwrap());
+        assert!(
+            remove_project_link_with_repository(&repo, &project.local_project_id, &storage_id,)
+                .unwrap()
+        );
         let mut config = repo.load_config().unwrap();
         assert!(config.links.is_empty());
         assert!(!config.projects[0].recipe_bases.contains_key(&storage_id));
@@ -7576,6 +9665,92 @@ mod tests {
             &storage_id,
         )
         .unwrap());
+    }
+
+    #[test]
+    fn linked_local_only_project_publishes_with_an_unselected_blocked_skill() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = V3Repository::from_home_dir(temp.path().join("home")).unwrap();
+        let storage_id = StorageId::parse("local-only-publish").unwrap();
+        let mut config = repo.load_config().unwrap();
+        config.storages.push(StorageConfigV3 {
+            id: storage_id.clone(),
+            name: "Local-only destination".to_string(),
+            kind: StorageKind::Local,
+            bucket: String::new(),
+            access_key_id: String::new(),
+            secret_access_key: String::new(),
+            account_id: String::new(),
+            s3_endpoint: String::new(),
+            region: String::new(),
+            local_dir: temp.path().join("store").to_string_lossy().into_owned(),
+            included_default_exclusions: Vec::new(),
+            supports_conditional_writes: None,
+        });
+        repo.save_config(config).unwrap();
+
+        let project = register(&repo);
+        let project_root = temp.path().join("project");
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(codex_home.join("skills/_backup/openai-docs")).unwrap();
+        std::fs::write(
+            codex_home.join("skills/_backup/openai-docs/SKILL.md"),
+            "---\nname: openai-docs\n---\n",
+        )
+        .unwrap();
+        let profile_id = add_profile(&repo, Provider::Codex, &codex_home);
+        save_project_binding_with_repository(
+            &repo,
+            SaveProjectBindingRequest {
+                local_project_id: project.local_project_id.clone(),
+                project_root: project_root.to_string_lossy().into_owned(),
+                profile_ids: BTreeMap::from([(Provider::Codex, profile_id)]),
+                expected_revision: None,
+            },
+        )
+        .unwrap();
+        save_project_link_with_repository(
+            &repo,
+            SaveProjectLinkRequest {
+                local_project_id: project.local_project_id.clone(),
+                storage_id: storage_id.clone(),
+                pinned: true,
+            },
+        )
+        .unwrap();
+
+        let inventory =
+            get_bundle_inventory_with_repository(&repo, &project.local_project_id).unwrap();
+        let blocked = inventory
+            .resources
+            .iter()
+            .find(|resource| resource.descriptor.display_name == "_backup")
+            .unwrap();
+        assert!(blocked.blocked_reason.is_some());
+        assert!(!inventory
+            .recipe
+            .entries
+            .contains_key(&blocked.descriptor.resource_id));
+
+        let status = get_project_capability_status_with_repository(
+            &repo,
+            &project.local_project_id,
+            Some(&storage_id),
+        )
+        .unwrap();
+        assert!(status.items.iter().any(|item| {
+            item.descriptor.resource_id == blocked.descriptor.resource_id
+                && item.state == "blocked"
+                && !item.selected_in_recipe
+        }));
+
+        let result =
+            push_bundle_with_repository(&repo, &project.local_project_id, &storage_id).unwrap();
+        assert_eq!(result.generation, Some(1));
+        let remote = list_remote_bundle_snapshots_with_repository(&repo, &storage_id).unwrap();
+        assert_eq!(remote.len(), 1);
+        assert_eq!(remote[0].bundle_id, project.bundle_id);
     }
 
     #[test]
@@ -8277,6 +10452,21 @@ mod tests {
             .results
             .iter()
             .any(|result| result.resource_id == resource_id));
+        let source_status = get_project_capability_status_with_repository(
+            &repo,
+            &source.local_project_id,
+            Some(&storage_id),
+        )
+        .unwrap();
+        let source_skill_status = source_status
+            .items
+            .iter()
+            .find(|item| item.descriptor.resource_id == resource_id)
+            .expect("source status should include the custom skill");
+        assert_eq!(source_skill_status.state, "synced");
+        assert!(source_skill_status.local_present);
+        assert!(source_skill_status.storage_present);
+        assert_eq!(source_status.profiles[0].shared_project_count, 1);
 
         // Machine B: Pull plans by effective identity but pins the original
         // physical directory as the mutation target.
@@ -8312,6 +10502,20 @@ mod tests {
             },
         )
         .unwrap();
+        let before_status = get_project_capability_status_with_repository(
+            &repo,
+            &target.local_project_id,
+            Some(&storage_id),
+        )
+        .unwrap();
+        let missing_skill = before_status
+            .items
+            .iter()
+            .find(|item| item.descriptor.resource_id == resource_id)
+            .expect("target status should include the stored custom skill");
+        assert_eq!(missing_skill.state, "storage_only");
+        assert!(!missing_skill.local_present);
+        assert!(missing_skill.storage_present);
         let target_binding = repo
             .load_bindings()
             .unwrap()
@@ -8359,6 +10563,20 @@ mod tests {
             get_bundle_readiness_with_repository(&repo, &storage_id, &bundle_id, &target_binding)
                 .unwrap();
         assert_eq!(readiness.state, "ready");
+        let after_status = get_project_capability_status_with_repository(
+            &repo,
+            &target.local_project_id,
+            Some(&storage_id),
+        )
+        .unwrap();
+        let installed_skill = after_status
+            .items
+            .iter()
+            .find(|item| item.descriptor.resource_id == resource_id)
+            .expect("installed skill should remain visible in status");
+        assert_eq!(installed_skill.state, "synced");
+        assert!(installed_skill.local_present);
+        assert!(installed_skill.storage_present);
     }
 
     #[test]

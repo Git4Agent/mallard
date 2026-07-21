@@ -23,6 +23,7 @@ export const RESOURCE_GROUPS: Array<{
   { id: "project_setup", label: "Project setup", description: "Instructions and provider-supported project configuration" },
   { id: "skills", label: "Skills", description: "Project skills and selected standalone skills" },
   { id: "plugins", label: "Plugins", description: "Portable install intent; payloads and caches never sync" },
+  { id: "project_files", label: "Project files", description: "Exact files and folders selected from a non-Git project" },
   { id: "tools", label: "Tools & hooks", description: "MCP servers, hooks, commands, and environment requirements" },
 ];
 
@@ -39,6 +40,8 @@ const CATEGORY_BY_KIND: Record<string, ProjectResourceCategory> = {
   instruction: "project_setup",
   instructions: "project_setup",
   project_file: "project_setup",
+  project_content_file: "project_files",
+  project_content_directory: "project_files",
   project_config: "project_setup",
   project_settings: "project_setup",
   setting: "project_setup",
@@ -61,7 +64,7 @@ const CATEGORY_BY_KIND: Record<string, ProjectResourceCategory> = {
 
 export function categoryFor(resource: ProjectResourceDescriptor): ProjectResourceCategory {
   const explicit = resource.category;
-  if (explicit === "conversations" || explicit === "project_setup" || explicit === "skills" || explicit === "plugins" || explicit === "tools") {
+  if (explicit === "conversations" || explicit === "project_setup" || explicit === "skills" || explicit === "plugins" || explicit === "project_files" || explicit === "tools") {
     return explicit;
   }
   return CATEGORY_BY_KIND[resource.kind.toLowerCase()] ?? "project_setup";
@@ -83,7 +86,11 @@ export function recipeWithSelection(
   return {
     ...recipe,
     entries: Object.fromEntries(resources
-      .filter((resource) => selected.has(resource.resource_id) && resource.apply_policy !== "never")
+      .filter((resource) => (
+        selected.has(resource.resource_id)
+        && !resource.blocked_reason
+        && resource.apply_policy !== "never"
+      ))
       .map((resource) => [resource.resource_id, recipe.entries[resource.resource_id] ?? {
         resource_id: resource.resource_id,
         apply_policy: resource.apply_policy,

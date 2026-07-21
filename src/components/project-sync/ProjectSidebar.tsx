@@ -38,7 +38,6 @@ interface Props {
   activityOpen: boolean;
   unreadLogs: number;
   onSelectProject: (projectId: string) => void;
-  onConfigureProject: (projectId: string) => void;
   onRemoveProject: (projectId: string) => void;
   onSelectDraft: (draftId: string) => void;
   onDiscardDraft: (draftId: string) => void;
@@ -64,7 +63,6 @@ export default function ProjectSidebar({
   activityOpen,
   unreadLogs,
   onSelectProject,
-  onConfigureProject,
   onRemoveProject,
   onSelectDraft,
   onDiscardDraft,
@@ -142,6 +140,7 @@ export default function ProjectSidebar({
           type="button"
           className="active"
           onClick={() => activeProjectId && onSelectProject(activeProjectId)}
+          disabled={busy}
         >
           <Icon name="folder" size={15} /> Projects
         </button>
@@ -176,7 +175,7 @@ export default function ProjectSidebar({
                 type="button"
                 className="sidebar-section-action"
                 onClick={onRefresh}
-                disabled={loading}
+                disabled={loading || busy}
                 title="Refresh projects"
                 aria-label="Refresh projects"
               >
@@ -205,6 +204,7 @@ export default function ProjectSidebar({
                   type="button"
                   className="sidebar-profile-main"
                   onClick={() => onSelectDraft(draft.draft_id)}
+                  disabled={busy}
                   title={draft.last_error
                     ? `${draft.project_root} — last attempt failed: ${draft.last_error}`
                     : `${draft.project_root} — resumable setup draft`}
@@ -239,7 +239,7 @@ export default function ProjectSidebar({
             {loading && projects.length === 0 && drafts.length === 0 ? (
               <div className="sidebar-msg">Loading projects…</div>
             ) : projects.length === 0 && drafts.length === 0 ? (
-              <button type="button" className="v3-sidebar-empty" onClick={onAddProject}>
+              <button type="button" className="v3-sidebar-empty" onClick={onAddProject} disabled={busy}>
                 <Icon name="plus" size={15} /> Add your first project
               </button>
             ) : projects.map((project) => {
@@ -255,31 +255,23 @@ export default function ProjectSidebar({
                     type="button"
                     className="sidebar-profile-main"
                     onClick={() => onSelectProject(project.local_project_id)}
+                    disabled={busy}
+                    aria-label={project.is_git_repository === true ? `${label}, Git repository` : label}
                     title={[
+                      project.is_git_repository === true ? "Git repository" : null,
                       aliased ? `Repo: ${project.display_name}` : null,
                       project.project_root ?? null,
                     ].filter(Boolean).join("\n") || label}
                   >
-                    <Icon name="folder" size={15} />
+                    <Icon
+                      name={project.is_git_repository === true ? "git-folder" : "folder"}
+                      size={16}
+                      className={project.is_git_repository === true ? "v3-project-git-icon" : "v3-project-folder-icon"}
+                    />
                     <span>{label}</span>
-                    {project.is_git_repository === true && (
-                      <span className="v3-repository-kind" title="Git repository">
-                        <Icon name="git-branch" size={10} />
-                        git
-                      </span>
-                    )}
                     {profileRequired && <Icon name="alert-triangle" size={12} className="v3-sidebar-profile-warning" />}
                   </button>
                   <div className="sidebar-profile-actions">
-                    <button
-                      type="button"
-                      onClick={() => onConfigureProject(project.local_project_id)}
-                      disabled={busy}
-                      title={`Project settings for ${label}`}
-                      aria-label={`Project settings for ${label}`}
-                    >
-                      <Icon name="settings" size={13} />
-                    </button>
                     <button
                       type="button"
                       className="sidebar-profile-remove"
@@ -324,6 +316,7 @@ export default function ProjectSidebar({
               type="button"
               className="sidebar-section-action sidebar-add-action"
               onClick={onAddStorage}
+              disabled={busy}
               title="Add storage"
               aria-label="Add storage"
             >
@@ -343,6 +336,7 @@ export default function ProjectSidebar({
                     type="button"
                     className="sidebar-profile-main"
                     onClick={() => onOpenStorage(storage.id)}
+                    disabled={busy}
                     title={`Configure ${storageName}`}
                   >
                     <Icon name={storage.kind === "local" ? "drive" : "cloud"} size={16} />
@@ -381,7 +375,7 @@ export default function ProjectSidebar({
       </div>
 
       <div className="v3-sidebar-footer">
-        <button type="button" onClick={onOpenLegacy}>
+        <button type="button" onClick={onOpenLegacy} disabled={busy}>
           <Icon name="computer" size={14} /> Legacy profiles
         </button>
       </div>

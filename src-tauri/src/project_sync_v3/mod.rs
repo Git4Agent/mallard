@@ -1,4 +1,4 @@
-//! Clean-break, project-scoped synchronization (schema 3).
+//! Project-scoped synchronization with schema-3 local state and schema-4 bundles.
 //!
 //! Local schema-3 state is isolated below the application-data `v3`
 //! directory. Nothing in this module reads or rewrites schema-2 profile

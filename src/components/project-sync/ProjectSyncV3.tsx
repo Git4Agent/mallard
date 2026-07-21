@@ -14,6 +14,7 @@ import type {
   BundleRecipe,
   BundleReadiness,
   BundleSnapshotSummary,
+  CapabilityStatusReport,
   CodexConversationPathAudit,
   DependencyPlan,
   DependencyResult,
@@ -21,6 +22,7 @@ import type {
   LocalProjectSummary,
   LogLine,
   ProjectBinding,
+  ProjectContentInventory,
   ProjectDetail,
   ProjectProvider,
   ProjectStorageLink,
@@ -32,6 +34,7 @@ import type {
   SetupDraftSummary,
   StorageConfigV3,
   SyncConfigV3,
+  ThreadSyncComparison,
 } from "../../types";
 import Icon from "../Icons";
 import LogPanel, { ACTIVITY_LOG_TYPES } from "../LogPanel";
@@ -39,10 +42,16 @@ import BundleConnectionDialog from "./BundleConnectionDialog";
 import LogManagerDialog from "./LogManagerDialog";
 import ProjectBindingEditor, { type ProjectBindingDraft } from "./ProjectBindingEditor";
 import ProjectLinksWorkspace from "./ProjectLinksWorkspace";
-import PushResourceWorkspace from "./PushResourceWorkspace";
+import PushResourceWorkspace, {
+  includeRequiredProjectContentDirectories,
+  nextPushReviewStep,
+  pushReviewBlockingCount,
+  sanitizePushSelection,
+} from "./PushResourceWorkspace";
 import ProjectSetupWorkspace, { type SetupCompletion } from "./ProjectSetupWorkspace";
 import ProjectSidebar from "./ProjectSidebar";
 import RestorePlanView from "./RestorePlanView";
+import { syncReviewSteps, type SyncReviewStep } from "./SyncReviewTabs";
 import { projectSyncApi } from "./api";
 import {
   applyPullReview,
@@ -124,10 +133,34 @@ interface PendingPush {
   projectId: string;
   storageId: string;
   projectName: string;
+  project: LocalProjectSummary;
+  binding: ProjectBinding | null;
   storage: StorageConfigV3;
   inventory: ResourceInventoryModel;
   savedRecipe: BundleRecipe | null;
   projectDefaults: Set<string>;
+  threadComparison?: ThreadSyncComparison | null;
+  capabilityReport?: CapabilityStatusReport | null;
+  projectContentInventory: ProjectContentInventory | null;
+  projectContentScanned: boolean;
+  showProjectFiles: boolean;
+}
+
+function pushResources(pending: PendingPush): ReturnType<typeof inventoryResources> {
+  const resources = inventoryResources(pending.inventory);
+  const byId = new Map(resources.map((resource) => [resource.resource_id, resource]));
+  for (const entry of pending.projectContentInventory?.entries ?? []) {
+    byId.set(entry.descriptor.resource_id, {
+      ...entry.descriptor,
+      category: "project_files",
+      logical_paths: [entry.logical_path],
+      default_selected: entry.selected_in_recipe || entry.selected_after_scan,
+      selected_by_default: entry.selected_in_recipe || entry.selected_after_scan,
+      blocked_reason: entry.blocked_reason,
+      description: entry.relative_path,
+    });
+  }
+  return [...byId.values()];
 }
 
 function upsertProject(
@@ -197,10 +230,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     | { mode: "close"; requestId: number }
     | null
   >(null);
-  const [projectEditorRequest, setProjectEditorRequest] = useState<
-    { mode: "toggle" | "close"; projectId: string; requestId: number } | null
-  >(null);
-
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -209,7 +238,11 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
   const [pendingBundleConnection, setPendingBundleConnection] = useState<PendingBundleConnection | null>(null);
   const [pendingPush, setPendingPush] = useState<PendingPush | null>(null);
   const [pushSelected, setPushSelected] = useState<Set<string>>(new Set());
+  const [pushProjectContentRemovals, setPushProjectContentRemovals] = useState<Set<string>>(new Set());
+  const [pushWarningAcknowledgements, setPushWarningAcknowledgements] = useState<Set<string>>(new Set());
+  const [projectContentLoading, setProjectContentLoading] = useState(false);
   const [pushError, setPushError] = useState<string | null>(null);
+  const [pushReviewStep, setPushReviewStep] = useState<SyncReviewStep>("history");
   const [logLines, setLogLines] = useState<LogLine[]>([]);
   const [logTypeFilters, setLogTypeFilters] = useState<ActivityLogType[]>(() => [...ACTIVITY_LOG_TYPES]);
   const [logLevelFilter, setLogLevelFilter] = useState<ActivityLogLevel | "all">("all");
@@ -644,6 +677,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       setDetail(null);
       setInventory(null);
     }
+    setHistoryRefreshEpoch((epoch) => epoch + 1);
   };
 
   const selectProject = async (projectId: string, preferredStorage?: string | null) => {
@@ -705,11 +739,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     if (restorePlan) closePullReview();
     setStorageEditorRequest((current) => ({
       mode: "close",
-      requestId: (current?.requestId ?? 0) + 1,
-    }));
-    setProjectEditorRequest((current) => ({
-      mode: "close",
-      projectId: "",
       requestId: (current?.requestId ?? 0) + 1,
     }));
   };
@@ -869,6 +898,10 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
 
   const openPushChooser = async (projectId: string, storageId: string) => {
     if (restorePlan) closePullReview();
+    setPushReviewStep("history");
+    setPushProjectContentRemovals(new Set());
+    setPushWarningAcknowledgements(new Set());
+    setProjectContentLoading(false);
     setBusy(true);
     setError(null);
     setPushError(null);
@@ -884,16 +917,79 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       if (!link) throw new Error("This project is no longer linked to the selected storage.");
 
       const savedRecipe = link.recipe ?? null;
+      const [threadComparisonResult, capabilityReportResult] = await Promise.allSettled([
+        nextDetail.binding?.profile_ids.codex
+          ? projectSyncApi.getThreadSyncComparison(projectId, storageId)
+          : Promise.resolve(null),
+        nextDetail.binding
+          ? projectSyncApi.getCapabilityStatus(projectId, storageId)
+          : Promise.resolve(null),
+      ]);
+      const nextResources = inventoryResources(nextInventory);
+      const nextThreadComparison = threadComparisonResult.status === "fulfilled"
+        ? threadComparisonResult.value
+        : undefined;
+      const nextCapabilityReport = capabilityReportResult.status === "fulfilled"
+        ? capabilityReportResult.value
+        : undefined;
+      const isGitRepository = repositoryKinds[projectId] ?? false;
+      let lockedProjectContentInventory: ProjectContentInventory | null = null;
+      if (isGitRepository && nextDetail.binding) {
+        try {
+          const inspected = await projectSyncApi.inspectProjectFiles(projectId, storageId);
+          if (inspected.entries.length > 0) lockedProjectContentInventory = inspected;
+        } catch {
+          // A Git project without stored generic content keeps the normal four-step review.
+        }
+      }
+      const projectDefaults = sanitizePushSelection(
+        recipeSelection(nextInventory.recipe),
+        nextResources,
+        nextThreadComparison,
+        nextCapabilityReport,
+      );
+      const initialSelection = sanitizePushSelection(
+        savedRecipe ? recipeSelection(savedRecipe) : projectDefaults,
+        nextResources,
+        nextThreadComparison,
+        nextCapabilityReport,
+      );
+      const projectSummary: LocalProjectSummary = {
+        local_project_id: nextDetail.project.local_project_id,
+        bundle_id: nextDetail.project.bundle_id,
+        display_name: nextDetail.project.display_name,
+        local_alias: nextDetail.project.local_alias,
+        revision: nextDetail.project.revision,
+        repository_fingerprint: nextDetail.project.repository_fingerprint,
+        project_root: nextDetail.binding?.project_root ?? null,
+        canonical_project_root: nextDetail.binding?.canonical_project_root ?? null,
+        profile_ids: nextDetail.binding?.profile_ids ?? {},
+        profile_names: [...new Set(Object.values(nextDetail.binding?.profile_ids ?? {})
+          .map((profileId) => profiles.find((profile) => profile.profile_id === profileId)?.display_name)
+          .filter((name): name is string => Boolean(name)))],
+        providers: [...new Set(nextResources.flatMap((resource) => resource.provider ? [resource.provider] : []))],
+        resource_count: nextResources.length,
+        selected_resource_count: Object.keys(nextDetail.project.recipe.entries).length,
+        linked_storage_ids: nextDetail.links.map((candidate) => candidate.storage_id),
+        is_git_repository: isGitRepository,
+      };
       setPendingPush({
         projectId,
         storageId,
         projectName: projectLabel(nextDetail.project),
+        project: projectSummary,
+        binding: nextDetail.binding ?? null,
         storage,
         inventory: nextInventory,
         savedRecipe,
-        projectDefaults: recipeSelection(nextInventory.recipe),
+        projectDefaults,
+        threadComparison: nextThreadComparison,
+        capabilityReport: nextCapabilityReport,
+        projectContentInventory: lockedProjectContentInventory,
+        projectContentScanned: lockedProjectContentInventory !== null,
+        showProjectFiles: !isGitRepository || lockedProjectContentInventory !== null,
       });
-      setPushSelected(savedRecipe ? recipeSelection(savedRecipe) : new Set());
+      setPushSelected(initialSelection);
       setActiveProjectId(projectId);
       setActiveStorageByProject((current) => ({ ...current, [projectId]: storageId }));
     } catch (reason) {
@@ -911,20 +1007,89 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     }
   };
 
+  const scanPendingProjectFiles = async () => {
+    const pending = pendingPush;
+    if (!pending || projectContentLoading) return;
+    setProjectContentLoading(true);
+    setPushError(null);
+    try {
+      const inspected = await projectSyncApi.inspectProjectFiles(pending.projectId, pending.storageId);
+      setPendingPush((current) => {
+        if (!current || current.projectId !== pending.projectId || current.storageId !== pending.storageId) {
+          return current;
+        }
+        const previousGenericIds = new Set((current.projectContentInventory?.entries ?? [])
+          .map((entry) => entry.descriptor.resource_id));
+        const inspectedIds = new Set(inspected.entries.map((entry) => entry.descriptor.resource_id));
+        setPushSelected((currentSelection) => {
+          const next = new Set(currentSelection);
+          for (const resourceId of previousGenericIds) {
+            if (!inspectedIds.has(resourceId)) next.delete(resourceId);
+          }
+          for (const entry of inspected.entries) {
+            const resourceId = entry.descriptor.resource_id;
+            const wasSelected = currentSelection.has(resourceId);
+            const shouldSelect = !pushProjectContentRemovals.has(resourceId) && (
+              wasSelected || entry.selected_in_recipe || entry.selected_after_scan
+            );
+            if (shouldSelect) next.add(resourceId);
+            else next.delete(resourceId);
+          }
+          return includeRequiredProjectContentDirectories(inspected, next);
+        });
+        setPushWarningAcknowledgements((currentAcknowledgements) => {
+          const currentWarningDigests = new Set(inspected.entries
+            .map((entry) => entry.warning_digest)
+            .filter((digest): digest is string => Boolean(digest)));
+          return new Set([...currentAcknowledgements].filter((digest) => currentWarningDigests.has(digest)));
+        });
+        const nextDefaults = new Set(current.projectDefaults);
+        inspected.entries.forEach((entry) => {
+          if (entry.selected_in_recipe || entry.selected_after_scan) {
+            nextDefaults.add(entry.descriptor.resource_id);
+          }
+        });
+        return {
+          ...current,
+          projectContentInventory: inspected,
+          projectContentScanned: true,
+          showProjectFiles: true,
+          projectDefaults: includeRequiredProjectContentDirectories(inspected, nextDefaults),
+        };
+      });
+    } catch (reason) {
+      setPushError(errorMessage(reason));
+    } finally {
+      setProjectContentLoading(false);
+    }
+  };
+
   const publishProject = async (
     projectId: string,
     storageId: string,
     recipe: BundleRecipe,
+    projectContentReviewToken: string | null = null,
+    projectContentRemovalIds: string[] = [],
+    acknowledgedWarningDigests: string[] = [],
   ) => {
     openActivity();
     setBusy(true);
     setError(null);
     setPushError(null);
     try {
-      const result = await projectSyncApi.pushBundle(projectId, storageId, recipe);
+      const result = await projectSyncApi.pushBundle(
+        projectId,
+        storageId,
+        recipe,
+        projectContentReviewToken,
+        projectContentRemovalIds,
+        acknowledgedWarningDigests,
+      );
       setNotice(result.message);
       setHistoryRefreshEpoch((epoch) => epoch + 1);
       setPendingPush(null);
+      setPushProjectContentRemovals(new Set());
+      setPushWarningAcknowledgements(new Set());
       setActiveProjectId(projectId);
       setActiveStorageByProject((current) => ({ ...current, [projectId]: storageId }));
       const { nextConfig } = await loadShell();
@@ -940,14 +1105,31 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
 
   const publishPendingPush = async () => {
     if (!pendingPush) return;
-    const resources = inventoryResources(pendingPush.inventory);
+    const resources = pushResources(pendingPush);
     const baseRecipe = pendingPush.savedRecipe ?? {
       ...pendingPush.inventory.recipe,
       revision: 0,
       entries: {},
     };
-    const recipe = recipeWithSelection(baseRecipe, resources, pushSelected);
-    await publishProject(pendingPush.projectId, pendingPush.storageId, recipe);
+    const safeSelection = sanitizePushSelection(
+      pushSelected,
+      resources,
+      pendingPush.threadComparison,
+      pendingPush.capabilityReport,
+      pendingPush.projectContentInventory,
+    );
+    const recipe = recipeWithSelection(baseRecipe, resources, safeSelection);
+    for (const resourceId of pushProjectContentRemovals) delete recipe.entries[resourceId];
+    await publishProject(
+      pendingPush.projectId,
+      pendingPush.storageId,
+      recipe,
+      pendingPush.projectContentInventory?.eligibility.state === "eligible"
+        ? pendingPush.projectContentInventory.review_token ?? null
+        : null,
+      [...pushProjectContentRemovals],
+      [...pushWarningAcknowledgements],
+    );
   };
 
   const saveRemap = async (nextBinding: ProjectBindingDraft) => {
@@ -1186,7 +1368,10 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       if (pending.reason === "link") {
         await saveStorageLink(pending.projectId, pending.storageId);
       } else {
-        setNotice("Kept the local-only repo identity. Push will publish it as a separate remote project.");
+        setPendingBundleConnection(null);
+        setNotice("Kept the local-only repo identity. Review Push to publish it as a separate remote project.");
+        await openPushChooser(pending.projectId, pending.storageId);
+        return;
       }
       setPendingBundleConnection(null);
     } catch (reason) {
@@ -1311,9 +1496,12 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
       );
       if (result.restoreResult) {
         setRestoreResult(result.restoreResult);
-        if (result.restoreResult.success) setHistoryRefreshEpoch((epoch) => epoch + 1);
       }
       if (result.dependencyResult) setDependencyResult(result.dependencyResult);
+      if (result.restoreResult?.success
+        || (result.dependencyResult?.applied_action_ids?.length ?? 0) > 0) {
+        setHistoryRefreshEpoch((epoch) => epoch + 1);
+      }
       if (result.readiness) setReadiness(result.readiness);
       if (result.error) setRestoreError(result.error);
 
@@ -1529,22 +1717,69 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     }));
   };
 
+  const safePushSelection = pendingPush
+    ? sanitizePushSelection(
+      pushSelected,
+      pushResources(pendingPush),
+      pendingPush.threadComparison,
+      pendingPush.capabilityReport,
+      pendingPush.projectContentInventory,
+    )
+    : pushSelected;
+  const pendingPushBlockingCount = pendingPush
+    ? pushReviewBlockingCount(
+      safePushSelection,
+      pendingPush.threadComparison,
+      pendingPush.capabilityReport,
+      pendingPush.projectContentInventory,
+      pushWarningAcknowledgements,
+    )
+    : 0;
+  const pendingPushSteps = syncReviewSteps(pendingPush?.showProjectFiles ?? false);
   const inlineStorageReview = pendingPush ? {
     kind: "push" as const,
     projectId: pendingPush.projectId,
     storageId: pendingPush.storageId,
+    onContinue: () => {
+      if (pushReviewStep === "review") {
+        void publishPendingPush();
+        return;
+      }
+      setPushReviewStep(nextPushReviewStep(pushReviewStep, pendingPushSteps));
+    },
+    continueDisabled: pushReviewStep === "review"
+      && ((safePushSelection.size === 0 && pushProjectContentRemovals.size === 0)
+        || pendingPushBlockingCount > 0
+        || projectContentLoading),
     onClose: () => {
       if (busy) return;
       setPendingPush(null);
       setPushError(null);
+      setPushProjectContentRemovals(new Set());
+      setPushWarningAcknowledgements(new Set());
     },
     content: (
       <PushResourceWorkspace
-        resources={inventoryResources(pendingPush.inventory)}
+        resources={pushResources(pendingPush)}
         selected={pushSelected}
         projectDefaults={pendingPush.projectDefaults}
-        busy={busy}
+        busy={busy || projectContentLoading}
         error={pushError}
+        project={pendingPush.project}
+        binding={pendingPush.binding}
+        storageId={pendingPush.storageId}
+        storageName={pendingPush.storage.name}
+        refreshEpoch={historyRefreshEpoch}
+        threadComparison={pendingPush.threadComparison}
+        capabilityReport={pendingPush.capabilityReport}
+        projectContentInventory={pendingPush.projectContentInventory}
+        projectContentScanned={pendingPush.projectContentScanned}
+        projectContentLoading={projectContentLoading}
+        projectContentRemovals={pushProjectContentRemovals}
+        acknowledgedWarningDigests={pushWarningAcknowledgements}
+        showProjectFiles={pendingPush.showProjectFiles}
+        activeStep={pushReviewStep}
+        onStepChange={setPushReviewStep}
         onToggle={(resourceId) => setPushSelected((current) => {
           const next = new Set(current);
           if (next.has(resourceId)) next.delete(resourceId);
@@ -1552,13 +1787,54 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
           return next;
         })}
         onUseProjectDefaults={() => setPushSelected(new Set(pendingPush.projectDefaults))}
-        onClear={() => setPushSelected(new Set())}
+        onSelectionChange={setPushSelected}
+        onScanProjectFiles={() => void scanPendingProjectFiles()}
+        onToggleProjectContentRemoval={(resourceId) => {
+          setPushProjectContentRemovals((current) => {
+            const next = new Set(current);
+            if (next.has(resourceId)) {
+              next.delete(resourceId);
+              const entry = pendingPush.projectContentInventory?.entries.find((candidate) => (
+                candidate.descriptor.resource_id === resourceId
+              ));
+              if (entry?.selected_in_recipe) {
+                setPushSelected((selection) => new Set(selection).add(resourceId));
+              }
+            } else {
+              next.add(resourceId);
+              setPushSelected((selection) => {
+                const selected = new Set(selection);
+                selected.delete(resourceId);
+                return selected;
+              });
+            }
+            return next;
+          });
+        }}
+        onToggleProjectContentWarning={(warningDigest) => setPushWarningAcknowledgements((current) => {
+          const next = new Set(current);
+          if (next.has(warningDigest)) next.delete(warningDigest);
+          else next.add(warningDigest);
+          return next;
+        })}
+        onClear={() => setPushSelected(new Set((pendingPush.projectContentInventory?.entries ?? [])
+          .filter((entry) => entry.storage_present && !pushProjectContentRemovals.has(entry.descriptor.resource_id))
+          .map((entry) => entry.descriptor.resource_id)))}
         onClose={() => {
           if (busy) return;
           setPendingPush(null);
           setPushError(null);
+          setPushProjectContentRemovals(new Set());
+          setPushWarningAcknowledgements(new Set());
         }}
         onPush={() => void publishPendingPush()}
+        onPull={() => {
+          setPendingPush(null);
+          setPushError(null);
+          setPushProjectContentRemovals(new Set());
+          setPushWarningAcknowledgements(new Set());
+          void beginProjectRestore(pendingPush.projectId, pendingPush.storageId);
+        }}
       />
     ),
   } : restorePlan && restoreBinding ? {
@@ -1569,6 +1845,8 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
     content: (
       <RestorePlanView
         embedded
+        project={projects.find((candidate) => candidate.local_project_id === restoreBinding.local_project_id) ?? undefined}
+        storageName={config.storages.find((storage) => storage.id === restorePlan.storage_id)?.name ?? null}
         projectName={restoreProjectName}
         profileLabel={restoreProfileLabel}
         plan={restorePlan}
@@ -1610,7 +1888,7 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
         activeProjectId={activeProjectId}
         activeStorageId={activeStorageSettingsId}
         loading={loading}
-        busy={busy}
+        busy={busy || !!inlineStorageReview}
         activityOpen={activityOpen}
         unreadLogs={unreadLogs}
         onSelectProject={(id) => {
@@ -1618,17 +1896,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
           closeWorkspaceSettings();
           if (restorePlan) closePullReview();
           void selectProject(id);
-        }}
-        onConfigureProject={(projectId) => {
-          setSetupDraftId(null);
-          setPendingPush(null);
-          setPushError(null);
-          if (restorePlan) closePullReview();
-          setProjectEditorRequest((current) => ({
-            mode: "toggle",
-            projectId,
-            requestId: (current?.requestId ?? 0) + 1,
-          }));
         }}
         onRemoveProject={(id) => void removeProject(id)}
         onToggleActivity={() => {
@@ -1721,7 +1988,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
             conversationPathAudits={conversationPathAudits}
             conversationPathAuditErrors={conversationPathAuditErrors}
             conversationPathAuditLoading={conversationPathAuditLoading}
-            onSelectProject={(projectId, storageId) => selectProject(projectId, storageId)}
             onSelectStorage={(projectId, storageId) => selectStorage(projectId, storageId)}
             onLinkStorage={(projectId, storageId) => linkStorage(projectId, storageId)}
             onUnlinkStorage={(projectId, storageId) => unlinkStorage(projectId, storageId)}
@@ -1736,8 +2002,6 @@ export default function ProjectSyncV3({ theme, onThemeChange, onOpenLegacy }: Pr
             storageEditorRequest={storageEditorRequest}
             onStorageEditorRequestHandled={() => setStorageEditorRequest(null)}
             onStorageEditorChange={setActiveStorageSettingsId}
-            projectEditorRequest={projectEditorRequest}
-            onProjectEditorRequestHandled={() => setProjectEditorRequest(null)}
             historyRefreshEpoch={historyRefreshEpoch}
             inlineStorageReview={inlineStorageReview}
             newProjectSetup={setupDraftId ? (

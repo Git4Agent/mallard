@@ -3,12 +3,21 @@ import type {
   BundleReadiness,
   DependencyPlan,
   DependencyResult,
+  LocalProjectSummary,
   ProjectBinding,
   RestorePlan,
   RestoreResult,
 } from "../../types";
 import Icon from "../Icons";
-import { compactProjectPath, providerLabel } from "./model";
+import ProjectChatHistoryPage from "./ProjectChatHistoryPage";
+import ProjectFilesReviewPage, { type ProjectFileReviewRow } from "./ProjectFilesReviewPage";
+import SkillsPluginStatusPage from "./SkillsPluginStatusPage";
+import SyncReviewTabs, {
+  type SyncReviewStep,
+  syncReviewSteps,
+  useSyncReviewScroll,
+} from "./SyncReviewTabs";
+import { providerLabel } from "./model";
 import type { PullApplyPhase, PullReviewSelection } from "./pullReviewFlow";
 import {
   buildPullReviewItems,
@@ -16,7 +25,9 @@ import {
   defaultSelected,
   dependencyActionIds,
   itemKindLabel,
+  includeRequiredPullProjectDirectories,
   pendingIds,
+  requiredPullProjectDirectoryIds,
   requiresApproval,
   restoreActionIds,
   type PullReviewItem,
@@ -24,6 +35,8 @@ import {
 
 interface Props {
   projectName: string;
+  project?: LocalProjectSummary;
+  storageName?: string | null;
   profileLabel: string;
   plan: RestorePlan;
   binding: ProjectBinding;
@@ -39,10 +52,19 @@ interface Props {
   busy: boolean;
   error: string | null;
   embedded?: boolean;
+  initialStep?: SyncReviewStep;
   onApply: (selection: PullReviewSelection) => void;
   onRefresh: () => void;
   onBack: () => void;
 }
+
+const STEP_LABELS: Record<SyncReviewStep, string> = {
+  history: "Git & sessions",
+  skills: "Skills",
+  plugins: "Plugins",
+  project_files: "Project files",
+  review: "Review",
+};
 
 function phaseIndex(phase: PullApplyPhase): number {
   if (phase === "restoring") return 0;
@@ -249,7 +271,8 @@ function ItemList({
 
 export default function RestorePlanView({
   projectName,
-  profileLabel,
+  project,
+  storageName = "storage",
   plan,
   binding,
   dependencyPlan,
@@ -264,14 +287,37 @@ export default function RestorePlanView({
   busy,
   error,
   embedded = false,
+  initialStep = "history",
   onApply,
   onRefresh,
   onBack,
 }: Props) {
   const items = useMemo(() => buildPullReviewItems(plan, dependencyPlan), [plan, dependencyPlan]);
+  const conversationItems = useMemo(
+    () => items.filter((item) => itemKindLabel(item) === "Conversation"),
+    [items],
+  );
+  const skillItems = useMemo(() => items.filter((item) => item.toolKind === "custom_skill"), [items]);
+  const pluginItems = useMemo(() => items.filter((item) => item.toolKind === "plugin"), [items]);
+  const projectContentItems = useMemo(
+    () => items.filter((item) => item.category === "project_content"),
+    [items],
+  );
+  const otherItems = useMemo(() => items.filter((item) => (
+    itemKindLabel(item) !== "Conversation"
+    && item.toolKind !== "custom_skill"
+    && item.toolKind !== "plugin"
+    && item.category !== "project_content"
+  )), [items]);
   const projectItems = useMemo(() => items.filter((item) => item.category === "project_data"), [items]);
   const globalItems = useMemo(() => items.filter((item) => item.category === "global_tool"), [items]);
+  const showProjectFiles = plan.project_content_eligibility?.state === "eligible" || projectContentItems.length > 0;
+  const reviewSteps = useMemo(() => syncReviewSteps(showProjectFiles), [showProjectFiles]);
   const knownItems = useRef(new Set<string>());
+  const [activeStep, setActiveStep] = useState<SyncReviewStep>(() => (
+    syncReviewSteps(showProjectFiles).includes(initialStep) ? initialStep : "review"
+  ));
+  const { scrollRef, rememberScrollPosition } = useSyncReviewScroll(activeStep);
   const [selected, setSelected] = useState<Set<string>>(() => new Set(
     items.filter(defaultSelected).map((item) => item.resourceId),
   ));
@@ -286,7 +332,7 @@ export default function RestorePlanView({
         if (!knownItems.current.has(item.resourceId) && defaultSelected(item)) next.add(item.resourceId);
         if (failedResourceIds.has(item.resourceId)) next.add(item.resourceId);
       }
-      return next;
+      return includeRequiredPullProjectDirectories(items, next);
     });
     knownItems.current = currentIds;
   }, [items, completedResourceIds, failedResourceIds]);
@@ -296,7 +342,19 @@ export default function RestorePlanView({
     [items, selected, completedActionIds, completedResourceIds],
   );
   const selectedCount = selection.resourceIds.length;
+  const pendingProjectContentDecisionCount = projectContentItems.filter((item) => (
+    pendingIds(item, completedActionIds).length > 0 && !completedResourceIds.has(item.resourceId)
+  )).length;
   const hasResult = phase === "complete" || restoreResult !== null || dependencyResult !== null;
+
+  useEffect(() => {
+    if (phase !== "idle" || hasResult) setActiveStep("review");
+  }, [hasResult, phase]);
+
+  useEffect(() => {
+    if (!reviewSteps.includes(activeStep)) setActiveStep("review");
+  }, [activeStep, reviewSteps]);
+
   const failureCount = (restoreResult?.failed_actions?.length ?? 0) + (dependencyResult?.failed_actions?.length ?? 0);
   const skippedTools = globalItems.filter((item) => (
     !selected.has(item.resourceId) && !completedResourceIds.has(item.resourceId)
@@ -334,62 +392,157 @@ export default function RestorePlanView({
           ? `Apply ${selectedCount} remaining change${selectedCount === 1 ? "" : "s"}`
           : hasResult
             ? "Review complete"
-        : `Apply ${selectedCount} change${selectedCount === 1 ? "" : "s"}`;
+        : selectedCount === 0 && pendingProjectContentDecisionCount > 0
+          ? `Keep ${pendingProjectContentDecisionCount} project entr${pendingProjectContentDecisionCount === 1 ? "y" : "ies"} local`
+          : `Apply ${selectedCount} change${selectedCount === 1 ? "" : "s"}`;
 
+  const requiredProjectDirectories = requiredPullProjectDirectoryIds(items, selected);
+  const projectContentEligible = plan.project_content_eligibility?.state === "eligible";
   const toggle = (resourceId: string) => setSelected((current) => {
+    const item = items.find((candidate) => candidate.resourceId === resourceId);
+    if (item?.category === "project_content") {
+      if (!projectContentEligible || requiredPullProjectDirectoryIds(items, current).has(resourceId)) {
+        return current;
+      }
+    }
     const next = new Set(current);
     if (next.has(resourceId)) next.delete(resourceId);
     else next.add(resourceId);
-    return next;
+    return includeRequiredPullProjectDirectories(items, next);
   });
-  const selectItems = (chosen: PullReviewItem[]) => setSelected((current) => {
-    const next = new Set(current);
-    for (const item of chosen) {
-      if (pendingIds(item, completedActionIds).length > 0 && !completedResourceIds.has(item.resourceId)) {
-        next.add(item.resourceId);
-      }
-    }
-    return next;
-  });
-  const clearItems = (chosen: PullReviewItem[]) => setSelected((current) => {
-    const next = new Set(current);
-    for (const item of chosen) next.delete(item.resourceId);
-    return next;
-  });
-  const pendingProjectItems = projectItems.filter((item) => (
-    pendingIds(item, completedActionIds).length > 0 && !completedResourceIds.has(item.resourceId)
-  ));
-  const pendingGlobalItems = globalItems.filter((item) => (
-    pendingIds(item, completedActionIds).length > 0 && !completedResourceIds.has(item.resourceId)
-  ));
-  const allProjectItemsSelected = pendingProjectItems.length > 0 && pendingProjectItems.every((item) => selected.has(item.resourceId));
-  const allGlobalItemsSelected = pendingGlobalItems.length > 0 && pendingGlobalItems.every((item) => selected.has(item.resourceId));
   const dependencyMessages = (dependencyPlan?.blockers?.length ?? 0) + (dependencyPlan?.warnings?.length ?? 0);
+  const recommendedIds = new Set(items.filter(defaultSelected).map((item) => item.resourceId));
+  const stepItems = activeStep === "history"
+    ? conversationItems
+    : activeStep === "skills"
+      ? skillItems
+      : activeStep === "plugins"
+        ? pluginItems
+        : activeStep === "project_files"
+          ? projectContentItems
+        : items;
+  const pendingStepItems = stepItems.filter((item) => (
+    pendingIds(item, completedActionIds).length > 0 && !completedResourceIds.has(item.resourceId)
+  ));
+  const stepMatchesRecommended = pendingStepItems.every((item) => (
+    selected.has(item.resourceId) === recommendedIds.has(item.resourceId)
+  ));
+  const useRecommended = () => setSelected((current) => {
+    if (activeStep === "review") return includeRequiredPullProjectDirectories(items, new Set(recommendedIds));
+    const next = new Set(current);
+    for (const item of stepItems) {
+      next.delete(item.resourceId);
+      if (recommendedIds.has(item.resourceId)) next.add(item.resourceId);
+    }
+    return includeRequiredPullProjectDirectories(items, next);
+  });
+  const clearStep = () => setSelected((current) => {
+    if (activeStep === "review") return new Set();
+    const next = new Set(current);
+    for (const item of stepItems) next.delete(item.resourceId);
+    return next;
+  });
+  const selectedIn = (chosen: PullReviewItem[]) => chosen.filter((item) => selected.has(item.resourceId)).length;
+  const counts = {
+    history: selectedIn(conversationItems),
+    skills: selectedIn(skillItems),
+    plugins: selectedIn(pluginItems),
+    project_files: selectedIn(projectContentItems),
+    review: selectedCount,
+  };
+  const warningSteps = new Set<SyncReviewStep>();
+  const approvalItems = items.filter((item) => (
+    item.category !== "project_content"
+    && requiresApproval(item)
+    && !selected.has(item.resourceId)
+    && !completedResourceIds.has(item.resourceId)
+  ));
+  for (const item of approvalItems) {
+    if (itemKindLabel(item) === "Conversation") warningSteps.add("history");
+    else if (item.toolKind === "custom_skill") warningSteps.add("skills");
+    else if (item.toolKind === "plugin") warningSteps.add("plugins");
+    warningSteps.add("review");
+  }
+  if (dependencyMessages > 0 || failureCount > 0) warningSteps.add("review");
+  if (projectContentItems.length > 0 && !projectContentEligible) {
+    warningSteps.add("project_files");
+    warningSteps.add("review");
+  }
+  const selectableIds = (chosen: PullReviewItem[]) => new Set(chosen
+    .filter((item) => pendingIds(item, completedActionIds).length > 0 && !completedResourceIds.has(item.resourceId))
+    .map((item) => item.resourceId));
+  const conversationIds = selectableIds(conversationItems);
+  const skillIds = selectableIds(skillItems);
+  const pluginIds = selectableIds(pluginItems);
+  const stepIndex = reviewSteps.indexOf(activeStep);
+  const goBack = () => setActiveStep(reviewSteps[Math.max(0, stepIndex - 1)]);
+  const goNext = () => setActiveStep(reviewSteps[Math.min(reviewSteps.length - 1, stepIndex + 1)]);
+  const projectContentRows: ProjectFileReviewRow[] = projectContentItems
+    .filter((item) => item.projectContentPath && item.projectContentEntryType)
+    .map((item) => {
+      const action = item.restoreActions[0];
+      return {
+        resourceId: item.resourceId,
+        relativePath: item.projectContentPath!,
+        entryType: item.projectContentEntryType!,
+        state: item.projectContentOperation ?? "needs_review",
+        mode: action && "mode" in action.kind ? action.kind.mode : action?.expected_target_mode,
+        sourceMtime: action && "source_mtime" in action.kind ? action.kind.source_mtime : null,
+        localPresent: Boolean(action?.expected_target_sha256 || action?.expected_target_mode != null),
+        storagePresent: item.projectContentOperation !== "delete_file" && item.projectContentOperation !== "delete_directory",
+        operation: item.projectContentOperation ?? undefined,
+      };
+    });
+  const pendingProjectContentItems = projectContentItems.filter((item) => (
+    pendingIds(item, completedActionIds).length > 0 && !completedResourceIds.has(item.resourceId)
+  ));
+  const keptLocalProjectContent = pendingProjectContentItems.filter((item) => !selected.has(item.resourceId)).length;
 
   const ReviewContainer = embedded ? "section" : "main";
 
   return (
     <ReviewContainer
-      className={embedded ? "v3-inline-action-review v3-inline-pull-review" : "v3-main v3-pull-review-workspace"}
+      className={embedded ? "v3-inline-action-review v3-inline-pull-review v3-sync-review-workspace" : "v3-main v3-pull-review-workspace v3-sync-review-workspace"}
       aria-labelledby="v3-pull-review-title"
     >
-      <header className={embedded ? "v3-inline-action-header v3-inline-pull-header" : "v3-pull-review-header"}>
+      <header className={embedded ? "v3-inline-action-header v3-inline-pull-header v3-sync-review-header" : "v3-pull-review-header v3-sync-review-header"}>
         {!embedded && (
           <button type="button" className="btn btn-ghost v3-pull-back" onClick={onBack} disabled={busy}>
             <Icon name="chevron-left" size={15} /> Back to {projectName}
           </button>
         )}
         <div className={embedded ? "v3-inline-action-heading" : "v3-pull-review-heading"}>
-          <div>
+          <div className={embedded ? "v3-sync-review-title" : undefined}>
             {embedded
-              ? <h2 id="v3-pull-review-title">Pull changes</h2>
+              ? <h2 id="v3-pull-review-title">Pull review</h2>
               : <h1 id="v3-pull-review-title">Restore {projectName}</h1>}
-            <p className="v3-pull-review-meta">
-              <span>{compactProjectPath(binding.project_root)}</span>
-              <span aria-hidden="true">·</span>
-              <span>Generation {plan.generation}</span>
-            </p>
+            {embedded
+              ? <span className="v3-sync-review-hint">Choose changes to apply</span>
+              : (
+                <p className="v3-pull-review-meta">
+                  <span>{`Choose changes from ${storageName || "storage"} to apply to this machine.`}</span>
+                </p>
+              )}
           </div>
+        </div>
+        <div className="v3-push-resource-actions">
+          <button
+            type="button"
+            className="btn btn-ghost"
+            onClick={useRecommended}
+            disabled={busy || finalReady || pendingStepItems.length === 0 || stepMatchesRecommended}
+            title="Restore the recommended safe selection"
+          >
+            Recommended ({activeStep === "review" ? recommendedIds.size : stepItems.filter((item) => recommendedIds.has(item.resourceId)).length})
+          </button>
+          <button
+            type="button"
+            className="btn btn-ghost"
+            onClick={clearStep}
+            disabled={busy || finalReady || selectedIn(stepItems) === 0}
+          >
+            Clear
+          </button>
         </div>
         {embedded && (
           <button
@@ -404,52 +557,43 @@ export default function RestorePlanView({
         )}
       </header>
 
-      <div className={embedded ? "v3-pull-review-content v3-inline-action-content" : "v3-pull-review-content"}>
-        {phase !== "idle" && (
-          <PhaseProgress
-            phase={phase}
-            ready={finalReady}
-            restoreFailed={failedProjectItems.length > 0}
-            installFailed={failedTools.length > 0}
-          />
-        )}
+      <SyncReviewTabs
+        activeStep={activeStep}
+        counts={counts}
+        steps={reviewSteps}
+        warningSteps={warningSteps}
+        disabled={busy}
+        onChange={setActiveStep}
+      />
 
-        {hasResult && (
-          <section className={`v3-pull-outcome${finalReady ? " success" : " warning"}`} aria-live="polite">
-            <Icon name={finalReady ? "check-circle" : "alert-triangle"} size={20} />
-            <div>
-              <h2>{outcomeTitle}</h2>
-              <ul>
-                {completedProjectItems.length > 0 && <li>{completedProjectItems.length} project data change{completedProjectItems.length === 1 ? "" : "s"} restored</li>}
-                {completedSkills.length > 0 && <li>{completedSkills.length} custom skill{completedSkills.length === 1 ? "" : "s"} restored</li>}
-                {completedPlugins.length > 0 && <li>{completedPlugins.map((item) => item.title).join(", ")} installed</li>}
-                {finalReady && <li>Project is ready</li>}
-              </ul>
-            </div>
-          </section>
-        )}
-
-        {projectItems.length > 0 && (
-          <section className="v3-pull-section" aria-labelledby="v3-pull-project-data">
-            <div className="v3-pull-section-heading">
-              <span className="v3-pull-section-icon"><Icon name="folder" size={16} /></span>
-              <div>
-                <h2 id="v3-pull-project-data">Project files</h2>
-                <p>Backups are created before existing files are replaced.</p>
-              </div>
-              {pendingProjectItems.length > 0 && (
-                <button
-                  type="button"
-                  className="btn btn-ghost v3-pull-group-action"
-                  disabled={busy || finalReady}
-                  onClick={() => allProjectItemsSelected ? clearItems(projectItems) : selectItems(projectItems)}
-                >
-                  {allProjectItemsSelected ? "Clear" : "Select all"}
-                </button>
-              )}
-            </div>
+      <div
+        id={`sync-review-${activeStep}-panel`}
+        className={embedded ? "v3-pull-review-content v3-inline-action-content v3-sync-review-content" : "v3-pull-review-content v3-sync-review-content"}
+        role="tabpanel"
+        aria-labelledby={`sync-review-${activeStep}-tab`}
+      >
+        <div
+          ref={scrollRef}
+          className="v3-inline-action-scroll v3-sync-review-scroll"
+          onScroll={rememberScrollPosition}
+        >
+          {activeStep === "history" && conversationItems.length > 0 && project && binding.profile_ids.codex ? (
+            <ProjectChatHistoryPage
+              embedded
+              project={project}
+              binding={binding}
+              refreshEpoch={0}
+              activeStorageId={plan.storage_id}
+              activeStorageName={storageName}
+              selectionMode="pull"
+              selectedResourceIds={selected}
+              selectableResourceIds={conversationIds}
+              selectionDisabled={busy || finalReady}
+              onToggleResource={toggle}
+            />
+          ) : activeStep === "history" && conversationItems.length > 0 ? (
             <ItemList
-              items={projectItems}
+              items={conversationItems}
               selected={selected}
               completedActionIds={completedActionIds}
               completedResourceIds={completedResourceIds}
@@ -459,98 +603,198 @@ export default function RestorePlanView({
               disabled={busy || finalReady}
               onToggle={toggle}
             />
-          </section>
-        )}
+          ) : activeStep === "history" ? (
+            <div className="v3-pull-empty"><Icon name="check-circle" size={16} /><span><strong>No session changes</strong><small>Sessions already match this storage.</small></span></div>
+          ) : null}
 
-        {(supportLoading || globalItems.length > 0 || dependencyMessages > 0) && (
-          <section className="v3-pull-section" aria-labelledby="v3-pull-global-tools">
-            <div className="v3-pull-section-heading">
-              <span className="v3-pull-section-icon"><Icon name="folder" size={16} /></span>
-              <div>
-                <h2 id="v3-pull-global-tools">Tools</h2>
-                <p>Install into {profileLabel}</p>
-              </div>
-              {pendingGlobalItems.length > 0 && (
-                <button
-                  type="button"
-                  className="btn btn-ghost v3-pull-group-action"
-                  disabled={busy || finalReady || supportLoading}
-                  onClick={() => allGlobalItemsSelected ? clearItems(globalItems) : selectItems(globalItems)}
-                >
-                  {allGlobalItemsSelected ? "Clear" : "Select all"}
-                </button>
-              )}
-            </div>
-            <ItemList
-              items={globalItems}
-              selected={selected}
-              completedActionIds={completedActionIds}
-              completedResourceIds={completedResourceIds}
-              failedResourceIds={failedResourceIds}
-              phase={phase}
-              supportLoading={supportLoading}
-              disabled={busy || finalReady}
-              onToggle={toggle}
+          {activeStep === "skills" && skillItems.length > 0 && project ? (
+            <SkillsPluginStatusPage
+              view="skills"
+              project={project}
+              binding={binding}
+              refreshEpoch={0}
+              activeStorageId={plan.storage_id}
+              activeStorageName={storageName}
+              onOpenProjectSettings={() => undefined}
+              selectionMode="pull"
+              selectedResourceIds={selected}
+              selectableResourceIds={skillIds}
+              selectionDisabled={busy || finalReady}
+              onToggleResource={toggle}
             />
-            {supportLoading && <div className="v3-pull-support-loading"><Icon name="refresh" className="icon-spin" size={14} /> Checking installers…</div>}
-            {(dependencyPlan?.blockers ?? []).map((blocker) => <div key={blocker} className="v3-callout error"><Icon name="alert-triangle" size={15} /> {blocker}</div>)}
-            {(dependencyPlan?.warnings ?? []).map((warning) => <div key={warning} className="v3-callout"><Icon name="alert-triangle" size={15} /> {warning}</div>)}
-          </section>
-        )}
+          ) : activeStep === "skills" && skillItems.length > 0 ? (
+            <ItemList items={skillItems} selected={selected} completedActionIds={completedActionIds} completedResourceIds={completedResourceIds} failedResourceIds={failedResourceIds} phase={phase} supportLoading={supportLoading} disabled={busy || finalReady} onToggle={toggle} />
+          ) : activeStep === "skills" ? (
+            <div className="v3-pull-empty"><Icon name="check-circle" size={16} /><span><strong>No skill changes</strong><small>Skills already match this storage.</small></span></div>
+          ) : null}
 
-        {!supportLoading && items.length === 0 && (
-          <div className="v3-pull-empty">
-            <Icon name="check-circle" size={16} />
-            <span><strong>Nothing to pull</strong><small>This project already matches the selected generation.</small></span>
-          </div>
-        )}
+          {activeStep === "plugins" && pluginItems.length > 0 && project ? (
+            <SkillsPluginStatusPage
+              view="plugins"
+              project={project}
+              binding={binding}
+              refreshEpoch={0}
+              activeStorageId={plan.storage_id}
+              activeStorageName={storageName}
+              onOpenProjectSettings={() => undefined}
+              selectionMode="pull"
+              selectedResourceIds={selected}
+              selectableResourceIds={pluginIds}
+              selectionDisabled={busy || finalReady}
+              onToggleResource={toggle}
+            />
+          ) : activeStep === "plugins" && pluginItems.length > 0 ? (
+            <ItemList items={pluginItems} selected={selected} completedActionIds={completedActionIds} completedResourceIds={completedResourceIds} failedResourceIds={failedResourceIds} phase={phase} supportLoading={supportLoading} disabled={busy || finalReady} onToggle={toggle} />
+          ) : activeStep === "plugins" ? (
+            <div className="v3-pull-empty"><Icon name="check-circle" size={16} /><span><strong>No plugin changes</strong><small>Plugins already match this storage.</small></span></div>
+          ) : null}
 
-        {((readiness?.issues.length ?? 0) > 0 || (hasResult && !finalReady)) && (
-          <section className="v3-pull-section" aria-labelledby="v3-pull-readiness">
-            <div className="v3-pull-section-heading">
-              <span className="v3-pull-section-icon"><Icon name="check-circle" size={16} /></span>
-              <div>
-                <h2 id="v3-pull-readiness">Readiness</h2>
-                <p>{readiness?.issues.length ?? 0} check{readiness?.issues.length === 1 ? "" : "s"} may still need attention after pull.</p>
-              </div>
-              <button type="button" className="btn btn-ghost" onClick={onRefresh} disabled={busy}><Icon name="refresh" size={13} /> Recheck</button>
-            </div>
-            <div className="v3-readiness-list">
-              {(readiness?.issues ?? []).map((issue) => (
-                <div key={issue.issue_id} className={`severity-${issue.severity ?? "info"}`}>
-                  <Icon name={issue.severity === "error" ? "alert-triangle" : "check-circle"} size={14} />
-                  <span><strong>{issue.title}</strong><small>{issue.detail}</small></span>
-                  {issue.provider && <em>{providerLabel(issue.provider)}</em>}
-                </div>
+          {activeStep === "project_files" && (
+            <ProjectFilesReviewPage
+              mode="pull"
+              eligibility={plan.project_content_eligibility ?? {
+                state: "unknown",
+                reason: "Project-file eligibility was not recorded in this Pull plan.",
+              }}
+              rows={projectContentRows}
+              selectedIds={selected}
+              requiredIds={requiredProjectDirectories}
+              disabled={busy || finalReady}
+              onSelectSafe={() => setSelected((current) => includeRequiredPullProjectDirectories(
+                items,
+                new Set([
+                  ...current,
+                  ...projectContentItems
+                    .filter((item) => item.projectContentOperation === "add" || item.projectContentOperation === "create_directory")
+                    .map((item) => item.resourceId),
+                ]),
               ))}
-              {(readiness?.issues.length ?? 0) === 0 && (
-                <div className="severity-info">
-                  <Icon name="refresh" size={14} />
-                  <span><strong>Readiness is not confirmed</strong><small>Recheck after resolving the message above or selecting remaining setup items.</small></span>
+              onToggle={toggle}
+              onBulkToggle={(resourceIds, shouldSelect) => setSelected((current) => {
+                if (!projectContentEligible) return current;
+                const next = new Set(current);
+                resourceIds.forEach((resourceId) => {
+                  if (shouldSelect) next.add(resourceId);
+                  else if (!requiredPullProjectDirectoryIds(items, next).has(resourceId)) next.delete(resourceId);
+                });
+                return includeRequiredPullProjectDirectories(items, next);
+              })}
+            />
+          )}
+
+          {activeStep === "review" && (
+            <div className="v3-sync-review-summary">
+              {phase !== "idle" && (
+                <PhaseProgress phase={phase} ready={finalReady} restoreFailed={failedProjectItems.length > 0} installFailed={failedTools.length > 0} />
+              )}
+              {hasResult && (
+                <section className={`v3-pull-outcome${finalReady ? " success" : " warning"}`} aria-live="polite">
+                  <Icon name={finalReady ? "check-circle" : "alert-triangle"} size={20} />
+                  <div>
+                    <h2>{outcomeTitle}</h2>
+                    <ul>
+                      {completedProjectItems.length > 0 && <li>{completedProjectItems.length} project data change{completedProjectItems.length === 1 ? "" : "s"} restored</li>}
+                      {completedSkills.length > 0 && <li>{completedSkills.length} custom skill{completedSkills.length === 1 ? "" : "s"} restored</li>}
+                      {completedPlugins.length > 0 && <li>{completedPlugins.map((item) => item.title).join(", ")} installed</li>}
+                      {finalReady && <li>Project is ready</li>}
+                    </ul>
+                  </div>
+                </section>
+              )}
+
+              <div className="v3-sync-review-summary-meta"><Icon name="download" size={14} /><span>{embedded ? `Generation ${plan.generation}` : `${storageName || "Storage"} · Generation ${plan.generation}`}</span></div>
+              <button type="button" onClick={() => setActiveStep("history")}>
+                <span><Icon name="git-branch" size={15} /><strong>Sessions</strong></span>
+                <span>{counts.history} selected<Icon name="chevron-right" size={13} /></span>
+              </button>
+              <button type="button" onClick={() => setActiveStep("skills")}>
+                <span><Icon name="folder" size={15} /><strong>Skills</strong></span>
+                <span>{counts.skills} selected<Icon name="chevron-right" size={13} /></span>
+              </button>
+              <button type="button" onClick={() => setActiveStep("plugins")}>
+                <span><Icon name="link" size={15} /><strong>Plugins</strong></span>
+                <span>{counts.plugins} selected<Icon name="chevron-right" size={13} /></span>
+              </button>
+              {showProjectFiles && (
+                <button type="button" onClick={() => setActiveStep("project_files")}>
+                  <span><Icon name="file" size={15} /><strong>Project files</strong></span>
+                  <span>{counts.project_files} apply · {keptLocalProjectContent} keep local<Icon name="chevron-right" size={13} /></span>
+                </button>
+              )}
+
+              {(otherItems.length > 0 || supportLoading) && (
+                <details className="v3-sync-review-other">
+                  <summary>
+                    <span><Icon name="settings" size={15} /><strong>Agent setup & tools</strong></span>
+                    <span>{selectedIn(otherItems)} selected<Icon name="chevron-right" size={13} /></span>
+                  </summary>
+                  <ItemList items={otherItems} selected={selected} completedActionIds={completedActionIds} completedResourceIds={completedResourceIds} failedResourceIds={failedResourceIds} phase={phase} supportLoading={supportLoading} disabled={busy || finalReady} onToggle={toggle} />
+                  {supportLoading && <div className="v3-pull-support-loading"><Icon name="refresh" className="icon-spin" size={14} /> Checking installers…</div>}
+                </details>
+              )}
+
+              {(dependencyPlan?.blockers ?? []).map((blocker) => <div key={blocker} className="v3-callout error"><Icon name="alert-triangle" size={15} /> {blocker}</div>)}
+              {(dependencyPlan?.warnings ?? []).map((warning) => <div key={warning} className="v3-callout"><Icon name="alert-triangle" size={15} /> {warning}</div>)}
+              {approvalItems.length > 0 && (
+                <div className="v3-callout v3-sync-review-blocker">
+                  <Icon name="alert-triangle" size={15} />
+                  <span><strong>Needs approval</strong>{approvalItems.length} optional setup change{approvalItems.length === 1 ? " is" : "s are"} not selected.</span>
                 </div>
               )}
-            </div>
-          </section>
-        )}
 
-        {error && <div className="v3-callout error v3-pull-error" role="alert"><Icon name="alert-triangle" size={15} /> {error}</div>}
-        <ResultDetails restoreResult={restoreResult} dependencyResult={dependencyResult} />
+              {!supportLoading && items.length === 0 && (
+                <div className="v3-pull-empty"><Icon name="check-circle" size={16} /><span><strong>Nothing to pull</strong><small>This project already matches the selected generation.</small></span></div>
+              )}
+
+              {((readiness?.issues.length ?? 0) > 0 || (hasResult && !finalReady)) && (
+                <section className="v3-pull-section" aria-labelledby="v3-pull-readiness">
+                  <div className="v3-pull-section-heading">
+                    <span className="v3-pull-section-icon"><Icon name="check-circle" size={16} /></span>
+                    <div><h2 id="v3-pull-readiness">Readiness</h2><p>{readiness?.issues.length ?? 0} check{readiness?.issues.length === 1 ? "" : "s"} may still need attention after pull.</p></div>
+                    <button type="button" className="btn btn-ghost" onClick={onRefresh} disabled={busy}><Icon name="refresh" size={13} /> Recheck</button>
+                  </div>
+                  <div className="v3-readiness-list">
+                    {(readiness?.issues ?? []).map((issue) => (
+                      <div key={issue.issue_id} className={`severity-${issue.severity ?? "info"}`}>
+                        <Icon name={issue.severity === "error" ? "alert-triangle" : "check-circle"} size={14} />
+                        <span><strong>{issue.title}</strong><small>{issue.detail}</small></span>
+                        {issue.provider && <em>{providerLabel(issue.provider)}</em>}
+                      </div>
+                    ))}
+                    {(readiness?.issues.length ?? 0) === 0 && (
+                      <div className="severity-info"><Icon name="refresh" size={14} /><span><strong>Readiness is not confirmed</strong><small>Recheck after resolving the message above or selecting remaining setup items.</small></span></div>
+                    )}
+                  </div>
+                </section>
+              )}
+
+              {error && <div className="v3-callout error v3-pull-error" role="alert"><Icon name="alert-triangle" size={15} /> {error}</div>}
+              <ResultDetails restoreResult={restoreResult} dependencyResult={dependencyResult} />
+            </div>
+          )}
+        </div>
       </div>
 
-      <footer className={embedded ? "v3-pull-apply-bar v3-inline-action-footer" : "v3-pull-apply-bar"}>
+      <footer className={embedded ? "v3-pull-apply-bar v3-inline-action-footer v3-sync-review-footer" : "v3-pull-apply-bar v3-sync-review-footer"}>
         <span>
           <strong>{hasResult ? outcomeTitle : `${selectedCount} selected`}</strong>
-          <small>{hasResult ? "Review the result above or return to the project." : "Nothing changes until you apply."}</small>
+          <small>{hasResult ? "Review the result above or return to the project." : `${recommendedIds.size} safe change${recommendedIds.size === 1 ? "" : "s"} selected by default.`}</small>
         </span>
-        <button
-          type="button"
-          className="btn btn-primary v3-pull-apply-button"
-          disabled={busy || selectedCount === 0 || finalReady}
-          onClick={() => onApply(selection)}
-        >
-          {busy && <Icon name="refresh" size={16} className="icon-spin" />}
-          {buttonLabel}
-        </button>
+        {stepIndex > 0 && activeStep !== "review" && <button type="button" className="btn btn-ghost" onClick={goBack} disabled={busy}>Back</button>}
+        {activeStep !== "review" ? (
+          <button type="button" className="btn btn-primary" onClick={goNext} disabled={busy}>
+            Next: {STEP_LABELS[reviewSteps[Math.min(stepIndex + 1, reviewSteps.length - 1)]]}
+            <Icon name="chevron-right" size={14} />
+          </button>
+        ) : (
+          <>
+            {stepIndex > 0 && <button type="button" className="btn btn-ghost" onClick={goBack} disabled={busy}>Back</button>}
+            <button type="button" className="btn btn-primary v3-pull-apply-button" disabled={busy || (selectedCount === 0 && pendingProjectContentDecisionCount === 0) || finalReady} onClick={() => onApply(selection)}>
+              {busy && <Icon name="refresh" size={16} className="icon-spin" />}
+              {buttonLabel}
+            </button>
+          </>
+        )}
       </footer>
     </ReviewContainer>
   );

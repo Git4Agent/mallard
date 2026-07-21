@@ -16,6 +16,7 @@ const CATEGORY_ICON: Record<ProjectResourceCategory, "activity" | "settings" | "
   project_setup: "settings",
   skills: "folder",
   plugins: "link",
+  project_files: "folder",
   tools: "settings",
 };
 

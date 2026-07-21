@@ -106,9 +106,15 @@ export async function applyPullReview(
   let readiness: BundleReadiness | null = null;
   let executionError: string | null = null;
   let failedPhase: PullReviewApplyResult["failedPhase"] = null;
+  const hasProjectContentDecisions = restorePlan.actions.some((action) => (
+    action.kind.kind === "write_project_file"
+    || action.kind.kind === "ensure_project_directory"
+    || action.kind.kind === "delete_project_file"
+    || action.kind.kind === "delete_project_directory"
+  ));
 
   onPhase("restoring");
-  if (selection.restoreActionIds.length > 0) {
+  if (selection.restoreActionIds.length > 0 || hasProjectContentDecisions) {
     try {
       restoreResult = await api.applyRestore(restorePlan.plan_id, selection.restoreActionIds);
     } catch (reason) {

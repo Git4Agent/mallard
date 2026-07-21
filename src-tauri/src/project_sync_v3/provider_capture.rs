@@ -1,4 +1,4 @@
-//! Project-scoped discovery and capture for schema 3 bundles.
+//! Project-scoped discovery and capture for schema-4 bundles.
 //!
 //! This module deliberately has no Tauri or cloud dependency. It converts
 //! provider state and the explicit project allowlist into stable logical
@@ -35,6 +35,8 @@ pub enum Provider {
 #[serde(rename_all = "snake_case")]
 pub enum CaptureResourceKind {
     ProjectFile,
+    ProjectContentFile,
+    ProjectContentDirectory,
     ProjectSettings,
     Conversation,
     Memory,
@@ -119,6 +121,10 @@ pub struct ProjectInventory {
     pub resources: Vec<ResourceCandidate>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    #[serde(default)]
+    pub ignored_count: usize,
+    #[serde(default)]
+    pub blocked_count: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -132,6 +138,14 @@ pub struct CapturedFile {
     pub mode: u32,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CapturedDirectory {
+    pub logical_path: String,
+    pub resource_id: String,
+    pub source_mtime: u64,
+    pub mode: u32,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct CapturedResource {
     pub descriptor: ResourceCandidate,
@@ -142,6 +156,7 @@ pub struct CapturedResource {
 pub struct CapturedResources {
     pub resources: BTreeMap<String, CapturedResource>,
     pub files: BTreeMap<String, CapturedFile>,
+    pub directories: BTreeMap<String, CapturedDirectory>,
     pub dependency_actions: Vec<DependencyAction>,
     pub unavailable_resource_ids: Vec<String>,
     pub warnings: Vec<String>,
@@ -179,6 +194,12 @@ pub struct CaptureRequest {
     /// Skill candidates the ownership classifier refused; surfaced as blocked
     /// resources so the UI can show the evidence, never captured.
     pub blocked_global_skills: Vec<global_inventory::BlockedSkillCandidate>,
+    /// Ordinary project content is intentionally lazy. Normal setup and
+    /// provider inventory leave this false; the explicit Project files scan
+    /// and a reviewed Push turn it on.
+    pub include_project_content: bool,
+    /// Additional canonical roots that generic discovery must not enter.
+    pub excluded_content_roots: Vec<PathBuf>,
 }
 
 impl CaptureRequest {
@@ -192,6 +213,8 @@ impl CaptureRequest {
             standalone_skills: Vec::new(),
             global_plugins: Vec::new(),
             blocked_global_skills: Vec::new(),
+            include_project_content: false,
+            excluded_content_roots: Vec::new(),
         }
     }
 }
@@ -207,6 +230,12 @@ struct SourceFile {
 }
 
 #[derive(Clone, Debug)]
+struct SourceDirectory {
+    physical_path: PathBuf,
+    logical_path: String,
+}
+
+#[derive(Clone, Debug)]
 struct DiscoveredResource {
     descriptor: ResourceCandidate,
     files: Vec<SourceFile>,
@@ -215,7 +244,10 @@ struct DiscoveredResource {
 #[derive(Clone, Debug)]
 struct Discovery {
     resources: BTreeMap<String, DiscoveredResource>,
+    directories: BTreeMap<String, SourceDirectory>,
     warnings: Vec<String>,
+    ignored_count: usize,
+    blocked_count: usize,
 }
 
 /// Discover resources without retaining file bytes. Absolute source paths are
@@ -229,6 +261,8 @@ pub fn discover_project(request: &CaptureRequest) -> Result<ProjectInventory, St
             .map(|candidate| candidate.descriptor)
             .collect(),
         warnings: discovery.warnings,
+        ignored_count: discovery.ignored_count,
+        blocked_count: discovery.blocked_count,
     })
 }
 
@@ -338,8 +372,52 @@ pub fn capture_selected(
             resource_files.push(captured);
         }
 
-        let content_sha256 =
-            resource_digest(&resource_files, discovered.descriptor.dependency.as_ref());
+        let captured_directory = if let Some(source) = discovery.directories.get(resource_id) {
+            validate_logical_path(&source.logical_path)?;
+            let folded = source.logical_path.to_lowercase();
+            if let Some(existing) = casefold_paths.insert(folded, source.logical_path.clone()) {
+                if existing != source.logical_path {
+                    return Err(format!(
+                        "case-insensitive logical path collision: '{}' and '{}'",
+                        existing, source.logical_path
+                    ));
+                }
+            }
+            validate_source_directory(
+                &source.physical_path,
+                &canonical_project,
+                request,
+                resource_id,
+            )?;
+            let meta = fs::symlink_metadata(&source.physical_path).map_err(|error| {
+                format!("inspect '{}': {}", source.physical_path.display(), error)
+            })?;
+            let captured = CapturedDirectory {
+                logical_path: source.logical_path.clone(),
+                resource_id: resource_id.clone(),
+                source_mtime: modified_secs(&meta),
+                mode: safe_mode(&meta),
+            };
+            if result
+                .directories
+                .insert(source.logical_path.clone(), captured.clone())
+                .is_some()
+            {
+                return Err(format!(
+                    "logical directory '{}' is owned by more than one resource",
+                    source.logical_path
+                ));
+            }
+            Some(captured)
+        } else {
+            None
+        };
+
+        let content_sha256 = resource_digest(
+            &resource_files,
+            captured_directory.as_ref(),
+            discovered.descriptor.dependency.as_ref(),
+        );
         if let Some(action) = &discovered.descriptor.dependency {
             result.dependency_actions.push(action.clone());
         }
@@ -408,6 +486,8 @@ pub fn domain_resources(
                 source_digest: resource.content_sha256.clone(),
             },
             CaptureResourceKind::ProjectFile
+            | CaptureResourceKind::ProjectContentFile
+            | CaptureResourceKind::ProjectContentDirectory
             | CaptureResourceKind::ProjectSettings
             | CaptureResourceKind::Agent
             | CaptureResourceKind::Command
@@ -425,6 +505,7 @@ pub fn domain_resources(
             _ => domain::Provenance::Unknown,
         };
         let mut metadata = candidate.metadata.clone();
+        metadata.retain(|key, _| !key.starts_with("_local_"));
         metadata.insert(
             "content_sha256".to_string(),
             resource.content_sha256.clone(),
@@ -502,6 +583,10 @@ fn domain_provider(provider: Provider) -> domain::Provider {
 fn domain_kind(kind: &CaptureResourceKind, provider: Option<Provider>) -> domain::ResourceKind {
     match kind {
         CaptureResourceKind::ProjectFile => domain::ResourceKind::ProjectFile,
+        CaptureResourceKind::ProjectContentFile => domain::ResourceKind::ProjectContentFile,
+        CaptureResourceKind::ProjectContentDirectory => {
+            domain::ResourceKind::ProjectContentDirectory
+        }
         CaptureResourceKind::ProjectSettings => domain::ResourceKind::Setting,
         CaptureResourceKind::Conversation => match provider {
             Some(Provider::Claude) => domain::ResourceKind::ClaudeConversation,
@@ -562,9 +647,20 @@ fn discover(request: &CaptureRequest) -> Result<Discovery, String> {
 
     let mut discovery = Discovery {
         resources: BTreeMap::new(),
+        directories: BTreeMap::new(),
         warnings: Vec::new(),
+        ignored_count: 0,
+        blocked_count: 0,
     };
     discover_project_files(&canonical_project, &mut discovery)?;
+    if request.include_project_content {
+        discover_generic_project_content(
+            request,
+            &canonical_project,
+            &excluded_roots,
+            &mut discovery,
+        )?;
+    }
     if let Some(home) = &request.codex_home {
         discover_codex(home, &canonical_project, &excluded_roots, &mut discovery)?;
     }
@@ -678,6 +774,510 @@ fn discover_project_files(root: &Path, discovery: &mut Discovery) -> Result<(), 
 
     discover_plugin_intents(root, discovery)?;
     Ok(())
+}
+
+#[derive(Clone, Debug)]
+struct ProjectIgnoreRule {
+    pattern: String,
+    negated: bool,
+    directory_only: bool,
+    rooted: bool,
+}
+
+fn discover_generic_project_content(
+    request: &CaptureRequest,
+    root: &Path,
+    excluded_project_roots: &[PathBuf],
+    discovery: &mut Discovery,
+) -> Result<(), String> {
+    let ignore_rules = load_project_ignore_rules(root, &mut discovery.warnings)?;
+    let mut excluded_roots = excluded_project_roots.to_vec();
+    for excluded in &request.excluded_content_roots {
+        match canonical_existing_dir(excluded, "excluded project-content root") {
+            Ok(path) if path.starts_with(root) && path != root => excluded_roots.push(path),
+            Ok(_) => {}
+            Err(error) => discovery.warnings.push(error),
+        }
+    }
+    excluded_roots.sort();
+    excluded_roots.dedup();
+
+    let owned_logical_paths = discovery
+        .resources
+        .values()
+        .flat_map(|resource| resource.descriptor.logical_paths.iter())
+        .filter(|logical_path| logical_path.starts_with("project/"))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    let mut walker = WalkDir::new(root)
+        .follow_links(false)
+        .sort_by_file_name()
+        .max_depth(MAX_TREE_DEPTH.saturating_add(1))
+        .into_iter();
+    while let Some(entry) = walker.next() {
+        let entry = entry.map_err(|error| format!("walk '{}': {}", root.display(), error))?;
+        if entry.depth() == 0 {
+            continue;
+        }
+        let relative = match normalized_relative(root, entry.path()) {
+            Ok(relative) => relative,
+            Err(error) => {
+                discovery.blocked_count = discovery.blocked_count.saturating_add(1);
+                discovery.warnings.push(error);
+                if entry.file_type().is_dir() {
+                    walker.skip_current_dir();
+                }
+                continue;
+            }
+        };
+        if entry.depth() > MAX_TREE_DEPTH {
+            discovery.blocked_count = discovery.blocked_count.saturating_add(1);
+            discovery.warnings.push(format!(
+                "project content below '{}' exceeds the {}-component depth limit",
+                relative, MAX_TREE_DEPTH
+            ));
+            if entry.file_type().is_dir() {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
+        if hard_excluded_project_content_path(&relative) {
+            discovery.ignored_count = discovery.ignored_count.saturating_add(1);
+            if entry.file_type().is_dir() {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
+        if excluded_roots
+            .iter()
+            .any(|excluded| entry.path().starts_with(excluded))
+        {
+            discovery.ignored_count = discovery.ignored_count.saturating_add(1);
+            if entry.file_type().is_dir() {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
+        let is_directory = entry.file_type().is_dir();
+        if project_path_is_ignored(&ignore_rules, &relative, is_directory) {
+            discovery.ignored_count = discovery.ignored_count.saturating_add(1);
+            if is_directory {
+                walker.skip_current_dir();
+            }
+            continue;
+        }
+
+        let logical_path = format!("project/{}", relative);
+        if owned_logical_paths.contains(&logical_path) {
+            continue;
+        }
+        let meta = fs::symlink_metadata(entry.path())
+            .map_err(|error| format!("inspect '{}': {}", entry.path().display(), error))?;
+
+        if meta.file_type().is_symlink() {
+            add_blocked_project_content_candidate(
+                discovery,
+                &relative,
+                "Symlinks are not portable project content",
+            )?;
+            continue;
+        }
+        if meta.is_dir() {
+            add_project_content_directory(discovery, root, entry.path(), &relative, &meta)?;
+            continue;
+        }
+        if !meta.is_file() {
+            add_blocked_project_content_candidate(
+                discovery,
+                &relative,
+                "Sockets, devices, FIFOs, and other special files are not portable",
+            )?;
+            continue;
+        }
+        if relative
+            .split('/')
+            .any(|component| denied_file_name(component))
+        {
+            add_blocked_project_content_candidate(
+                discovery,
+                &relative,
+                "Known credential and private-key paths cannot be synced",
+            )?;
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if meta.nlink() > 1 {
+                add_blocked_project_content_candidate(
+                    discovery,
+                    &relative,
+                    "Hard-linked files are not portable project content",
+                )?;
+                continue;
+            }
+        }
+        if meta.len() > MAX_FILE_BYTES {
+            add_blocked_project_content_candidate(
+                discovery,
+                &relative,
+                &format!(
+                    "File exceeds the {} byte project-content limit",
+                    MAX_FILE_BYTES
+                ),
+            )?;
+            continue;
+        }
+        add_project_content_file(discovery, root, entry.path(), &relative, &meta)?;
+    }
+    Ok(())
+}
+
+fn add_project_content_directory(
+    discovery: &mut Discovery,
+    root: &Path,
+    path: &Path,
+    relative: &str,
+    meta: &fs::Metadata,
+) -> Result<(), String> {
+    validate_logical_project_relative(relative)?;
+    reject_unsafe_ancestors(path, root)?;
+    let logical_path = format!("project/{}", relative);
+    let resource_id = project_content_resource_id("dir", relative);
+    let mode = safe_mode(meta);
+    let source_mtime = modified_secs(meta);
+    let mut metadata = BTreeMap::new();
+    metadata.insert("entry_type".to_string(), "directory".to_string());
+    metadata.insert("_local_relative_path".to_string(), relative.to_string());
+    metadata.insert("_local_mode".to_string(), mode.to_string());
+    metadata.insert("_local_source_mtime".to_string(), source_mtime.to_string());
+    metadata.insert(
+        "_local_review_digest".to_string(),
+        project_content_review_digest("dir", relative, "", mode),
+    );
+    insert_resource(
+        discovery,
+        DiscoveredResource {
+            descriptor: ResourceCandidate {
+                resource_id: resource_id.clone(),
+                kind: CaptureResourceKind::ProjectContentDirectory,
+                provider: None,
+                display_name: relative.to_string(),
+                relative_cwd: None,
+                apply_policy: CaptureApplyPolicy::Review,
+                selected_by_default: true,
+                blocked_reason: None,
+                logical_paths: vec![logical_path.clone()],
+                dependency: None,
+                metadata,
+            },
+            files: Vec::new(),
+        },
+    )?;
+    discovery.directories.insert(
+        resource_id,
+        SourceDirectory {
+            physical_path: path.to_path_buf(),
+            logical_path,
+        },
+    );
+    Ok(())
+}
+
+fn add_project_content_file(
+    discovery: &mut Discovery,
+    root: &Path,
+    path: &Path,
+    relative: &str,
+    before: &fs::Metadata,
+) -> Result<(), String> {
+    validate_logical_project_relative(relative)?;
+    reject_unsafe_ancestors(path, root)?;
+    let bytes = fs::read(path).map_err(|error| format!("read '{}': {}", path.display(), error))?;
+    let after = fs::symlink_metadata(path)
+        .map_err(|error| format!("reinspect '{}': {}", path.display(), error))?;
+    if after.file_type().is_symlink()
+        || !after.is_file()
+        || before.len() != after.len()
+        || modified_secs(before) != modified_secs(&after)
+        || safe_mode(before) != safe_mode(&after)
+    {
+        return Err(format!(
+            "project-content file '{}' changed while it was scanned",
+            relative
+        ));
+    }
+    let detected_secret = detect_secret_material(&bytes);
+    if detected_secret == Some("private key material") {
+        return add_blocked_project_content_candidate(
+            discovery,
+            relative,
+            "Private-key material cannot be synced",
+        );
+    }
+    let logical_path = format!("project/{}", relative);
+    let resource_id = project_content_resource_id("file", relative);
+    let mode = safe_mode(&after);
+    let source_mtime = modified_secs(&after);
+    let content_sha256 = sha256_bytes(&bytes);
+    let warning_code = detected_secret
+        .map(|_| "possible_secret")
+        .or_else(|| is_executable_path(path).then_some("executable"));
+    let mut metadata = BTreeMap::new();
+    metadata.insert("entry_type".to_string(), "file".to_string());
+    metadata.insert("_local_relative_path".to_string(), relative.to_string());
+    metadata.insert("_local_size".to_string(), bytes.len().to_string());
+    metadata.insert("_local_mode".to_string(), mode.to_string());
+    metadata.insert("_local_source_mtime".to_string(), source_mtime.to_string());
+    metadata.insert("_local_content_sha256".to_string(), content_sha256.clone());
+    metadata.insert(
+        "_local_review_digest".to_string(),
+        project_content_review_digest("file", relative, &content_sha256, mode),
+    );
+    if let Some(warning_code) = warning_code {
+        metadata.insert("_local_warning_code".to_string(), warning_code.to_string());
+    }
+    insert_resource(
+        discovery,
+        DiscoveredResource {
+            descriptor: ResourceCandidate {
+                resource_id,
+                kind: CaptureResourceKind::ProjectContentFile,
+                provider: None,
+                display_name: relative.to_string(),
+                relative_cwd: None,
+                apply_policy: CaptureApplyPolicy::Review,
+                selected_by_default: true,
+                blocked_reason: None,
+                logical_paths: vec![logical_path.clone()],
+                dependency: None,
+                metadata,
+            },
+            files: vec![SourceFile {
+                physical_path: path.to_path_buf(),
+                logical_path,
+                opaque_content: true,
+                derived_bytes: None,
+            }],
+        },
+    )
+}
+
+fn add_blocked_project_content_candidate(
+    discovery: &mut Discovery,
+    relative: &str,
+    reason: &str,
+) -> Result<(), String> {
+    validate_logical_project_relative(relative)?;
+    discovery.blocked_count = discovery.blocked_count.saturating_add(1);
+    let resource_id = project_content_resource_id("file", relative);
+    let mut metadata = BTreeMap::new();
+    metadata.insert("entry_type".to_string(), "blocked".to_string());
+    metadata.insert("_local_relative_path".to_string(), relative.to_string());
+    insert_resource(
+        discovery,
+        DiscoveredResource {
+            descriptor: ResourceCandidate {
+                resource_id,
+                kind: CaptureResourceKind::ProjectContentFile,
+                provider: None,
+                display_name: relative.to_string(),
+                relative_cwd: None,
+                apply_policy: CaptureApplyPolicy::Review,
+                selected_by_default: false,
+                blocked_reason: Some(reason.to_string()),
+                logical_paths: vec![format!("project/{}", relative)],
+                dependency: None,
+                metadata,
+            },
+            files: Vec::new(),
+        },
+    )
+}
+
+fn project_content_resource_id(entry_type: &str, relative: &str) -> String {
+    let digest = sha256_bytes(format!("{}\0{}", entry_type, relative).as_bytes());
+    match entry_type {
+        "dir" => format!("project:content-dir:{}", digest),
+        _ => format!("project:content-file:{}", digest),
+    }
+}
+
+fn project_content_review_digest(
+    entry_type: &str,
+    relative: &str,
+    content_sha256: &str,
+    mode: u32,
+) -> String {
+    sha256_bytes(
+        format!(
+            "{}\0{}\0{}\0{:03o}",
+            entry_type, relative, content_sha256, mode
+        )
+        .as_bytes(),
+    )
+}
+
+fn hard_excluded_project_content_path(relative: &str) -> bool {
+    relative.split('/').any(|component| {
+        matches!(
+            component.to_ascii_lowercase().as_str(),
+            ".git"
+                | ".hg"
+                | ".svn"
+                | ".mallard"
+                | ".agent-sync"
+                | ".codex-sync"
+                | "node_modules"
+                | "target"
+                | "dist"
+                | "build"
+                | ".cache"
+                | "__pycache__"
+        )
+    })
+}
+
+fn load_project_ignore_rules(
+    root: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<ProjectIgnoreRule>, String> {
+    let mut rules = Vec::new();
+    for name in [".gitignore", ".ignore", ".mallardignore"] {
+        let path = root.join(name);
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("inspect '{}': {}", path.display(), error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            warnings.push(format!("Ignore file '{}' is not a regular file", name));
+            continue;
+        }
+        if metadata.len() > MAX_METADATA_BYTES as u64 {
+            warnings.push(format!("Ignore file '{}' exceeds the metadata limit", name));
+            continue;
+        }
+        let text = fs::read_to_string(&path)
+            .map_err(|error| format!("read '{}': {}", path.display(), error))?;
+        for raw in text.lines().take(MAX_METADATA_LINES.saturating_mul(8)) {
+            let mut line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let negated = line.starts_with('!');
+            if negated {
+                line = &line[1..];
+            }
+            if line.is_empty() || line.chars().any(char::is_control) {
+                continue;
+            }
+            let rooted = line.starts_with('/');
+            if rooted {
+                line = &line[1..];
+            }
+            let directory_only = line.ends_with('/');
+            if directory_only {
+                line = line.trim_end_matches('/');
+            }
+            if line.is_empty() {
+                continue;
+            }
+            rules.push(ProjectIgnoreRule {
+                pattern: line.replace('\\', "/"),
+                negated,
+                directory_only,
+                rooted,
+            });
+            if rules.len() > 8_192 {
+                return Err("project ignore rules exceed 8192 entries".to_string());
+            }
+        }
+    }
+    Ok(rules)
+}
+
+fn project_path_is_ignored(
+    rules: &[ProjectIgnoreRule],
+    relative: &str,
+    is_directory: bool,
+) -> bool {
+    let mut ignored = false;
+    for rule in rules {
+        if rule.directory_only && !is_directory {
+            let prefix_match = relative
+                .split('/')
+                .scan(String::new(), |prefix, component| {
+                    if !prefix.is_empty() {
+                        prefix.push('/');
+                    }
+                    prefix.push_str(component);
+                    Some(prefix.clone())
+                })
+                .any(|prefix| ignore_rule_matches(rule, &prefix));
+            if !prefix_match {
+                continue;
+            }
+        } else if !ignore_rule_matches(rule, relative) {
+            continue;
+        }
+        ignored = !rule.negated;
+    }
+    ignored
+}
+
+fn ignore_rule_matches(rule: &ProjectIgnoreRule, relative: &str) -> bool {
+    if rule.rooted || rule.pattern.contains('/') {
+        glob_path_matches(&rule.pattern, relative)
+            || relative
+                .strip_prefix(&format!("{}/", rule.pattern.trim_end_matches('/')))
+                .is_some()
+    } else {
+        relative
+            .split('/')
+            .any(|component| glob_path_matches(&rule.pattern, component))
+    }
+}
+
+fn glob_path_matches(pattern: &str, value: &str) -> bool {
+    fn matches_from(
+        pattern: &[u8],
+        value: &[u8],
+        pattern_index: usize,
+        value_index: usize,
+        memo: &mut BTreeMap<(usize, usize), bool>,
+    ) -> bool {
+        if let Some(result) = memo.get(&(pattern_index, value_index)) {
+            return *result;
+        }
+        let result = if pattern_index == pattern.len() {
+            value_index == value.len()
+        } else if pattern[pattern_index] == b'*' {
+            let double_star = pattern.get(pattern_index + 1) == Some(&b'*');
+            let next_pattern = pattern_index + if double_star { 2 } else { 1 };
+            matches_from(pattern, value, next_pattern, value_index, memo)
+                || (value_index < value.len()
+                    && (double_star || value[value_index] != b'/')
+                    && matches_from(pattern, value, pattern_index, value_index + 1, memo))
+        } else if value_index < value.len()
+            && (pattern[pattern_index] == b'?' && value[value_index] != b'/'
+                || pattern[pattern_index] == value[value_index])
+        {
+            matches_from(pattern, value, pattern_index + 1, value_index + 1, memo)
+        } else {
+            false
+        };
+        memo.insert((pattern_index, value_index), result);
+        result
+    }
+    matches_from(
+        pattern.as_bytes(),
+        value.as_bytes(),
+        0,
+        0,
+        &mut BTreeMap::new(),
+    )
 }
 
 fn add_single_project_file(
@@ -2253,6 +2853,42 @@ fn validate_source_file(
     inspect_candidate_files(&approved_root, &[path.to_path_buf()])
 }
 
+fn validate_source_directory(
+    path: &Path,
+    canonical_project: &Path,
+    request: &CaptureRequest,
+    resource_id: &str,
+) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| format!("inspect directory '{}': {}", path.display(), error))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "resource '{}' source '{}' is not a real no-follow directory",
+            resource_id,
+            path.display()
+        ));
+    }
+    reject_unsafe_ancestors(path, canonical_project)?;
+    let canonical = fs::canonicalize(path)
+        .map_err(|error| format!("resolve directory '{}': {}", path.display(), error))?;
+    if !canonical.starts_with(canonical_project)
+        || request
+            .excluded_project_roots
+            .iter()
+            .chain(request.excluded_content_roots.iter())
+            .any(|excluded| {
+                fs::canonicalize(excluded).is_ok_and(|excluded| canonical.starts_with(excluded))
+            })
+    {
+        return Err(format!(
+            "resource '{}' directory '{}' is outside approved project content",
+            resource_id,
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
 fn collect_regular_tree_files(approved_root: &Path, tree: PathBuf) -> Result<Vec<PathBuf>, String> {
     let meta =
         fs::symlink_metadata(&tree).map_err(|e| format!("inspect '{}': {}", tree.display(), e))?;
@@ -2568,7 +3204,11 @@ fn detect_secret_material(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-fn resource_digest(files: &[CapturedFile], dependency: Option<&DependencyAction>) -> String {
+fn resource_digest(
+    files: &[CapturedFile],
+    directory: Option<&CapturedDirectory>,
+    dependency: Option<&DependencyAction>,
+) -> String {
     let mut hasher = Sha256::new();
     for file in files {
         hasher.update((file.logical_path.len() as u64).to_be_bytes());
@@ -2576,6 +3216,11 @@ fn resource_digest(files: &[CapturedFile], dependency: Option<&DependencyAction>
         hasher.update((file.bytes.len() as u64).to_be_bytes());
         hasher.update(&file.bytes);
         hasher.update(file.mode.to_be_bytes());
+    }
+    if let Some(directory) = directory {
+        hasher.update((directory.logical_path.len() as u64).to_be_bytes());
+        hasher.update(directory.logical_path.as_bytes());
+        hasher.update(directory.mode.to_be_bytes());
     }
     if let Some(dependency) = dependency {
         if let Ok(bytes) = serde_json::to_vec(dependency) {
@@ -2618,6 +3263,8 @@ fn provider_name(provider: Provider) -> &'static str {
 fn resource_kind_name(kind: &CaptureResourceKind) -> &'static str {
     match kind {
         CaptureResourceKind::ProjectFile => "project-file",
+        CaptureResourceKind::ProjectContentFile => "project-content-file",
+        CaptureResourceKind::ProjectContentDirectory => "project-content-directory",
         CaptureResourceKind::ProjectSettings => "settings",
         CaptureResourceKind::Conversation => "session",
         CaptureResourceKind::Memory => "memory",
@@ -2802,6 +3449,8 @@ mod tests {
             standalone_skills: Vec::new(),
             global_plugins: Vec::new(),
             blocked_global_skills: Vec::new(),
+            include_project_content: false,
+            excluded_content_roots: Vec::new(),
         };
         let inventory = discover_project(&request).unwrap();
         let codex = inventory
@@ -2854,6 +3503,8 @@ mod tests {
             standalone_skills: Vec::new(),
             global_plugins: Vec::new(),
             blocked_global_skills: Vec::new(),
+            include_project_content: false,
+            excluded_content_roots: Vec::new(),
         };
         let inventory = discover_project(&request).unwrap();
         let conversation_ids = inventory
@@ -3024,5 +3675,207 @@ mod tests {
         let text = String::from_utf8(bytes).unwrap();
         assert!(!text.contains("\"a\""));
         assert!(text.contains("\"b\""));
+    }
+
+    #[test]
+    fn project_content_ids_are_stable_and_nested_directories_capture_independently() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("machine-a/project");
+        let second = temp.path().join("machine-b/project");
+        for root in [&first, &second] {
+            write(&root.join("docs/specs/a.md"), b"portable spec");
+            fs::create_dir_all(root.join("docs/empty")).unwrap();
+        }
+
+        let scan = |root: &Path| {
+            let mut request = CaptureRequest::for_project(root);
+            request.include_project_content = true;
+            let inventory = discover_project(&request).unwrap();
+            let by_path = inventory
+                .resources
+                .iter()
+                .filter(|resource| {
+                    matches!(
+                        resource.kind,
+                        CaptureResourceKind::ProjectContentFile
+                            | CaptureResourceKind::ProjectContentDirectory
+                    )
+                })
+                .map(|resource| {
+                    (
+                        resource.logical_paths[0].clone(),
+                        (resource.resource_id.clone(), resource.kind.clone()),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>();
+            (request, by_path)
+        };
+        let (first_request, first_entries) = scan(&first);
+        let (_, second_entries) = scan(&second);
+        assert_eq!(first_entries, second_entries);
+        assert!(first_entries.contains_key("project/docs"));
+        assert!(first_entries.contains_key("project/docs/specs"));
+        assert!(first_entries.contains_key("project/docs/specs/a.md"));
+        assert!(first_entries.contains_key("project/docs/empty"));
+
+        let selected = first_entries
+            .values()
+            .map(|(resource_id, _)| resource_id.clone())
+            .collect::<BTreeSet<_>>();
+        let captured = capture_selected(&first_request, &selected).unwrap();
+        assert_eq!(
+            captured.files["project/docs/specs/a.md"].bytes,
+            b"portable spec"
+        );
+        assert!(captured.directories.contains_key("project/docs"));
+        assert!(captured.directories.contains_key("project/docs/specs"));
+        assert!(captured.directories.contains_key("project/docs/empty"));
+    }
+
+    #[test]
+    fn project_content_scan_honors_ignores_exclusions_and_credentials() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        write(&project.join("keep.txt"), b"keep");
+        write(&project.join(".mallardignore"), b"ignored/\n*.tmp\n");
+        write(&project.join("ignored/no.txt"), b"ignored");
+        write(&project.join("cache.tmp"), b"ignored");
+        write(&project.join("node_modules/package/index.js"), b"ignored");
+        write(&project.join(".git/config"), b"ignored");
+        write(&project.join(".env.production"), b"TOKEN=blocked");
+        write(
+            &project.join("secret.txt"),
+            b"-----BEGIN PRIVATE KEY-----\nblocked",
+        );
+        write(
+            &project.join("child-project/child.txt"),
+            b"separate project",
+        );
+
+        let mut request = CaptureRequest::for_project(&project);
+        request.include_project_content = true;
+        request.excluded_project_roots = vec![project.join("child-project")];
+        let inventory = discover_project(&request).unwrap();
+        let generic = inventory
+            .resources
+            .iter()
+            .filter(|resource| {
+                matches!(
+                    resource.kind,
+                    CaptureResourceKind::ProjectContentFile
+                        | CaptureResourceKind::ProjectContentDirectory
+                )
+            })
+            .collect::<Vec<_>>();
+        let paths = generic
+            .iter()
+            .flat_map(|resource| resource.logical_paths.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(paths.contains("project/keep.txt"));
+        assert!(paths.contains("project/.mallardignore"));
+        assert!(!paths.iter().any(|path| path.contains("ignored/no.txt")));
+        assert!(!paths.iter().any(|path| path.contains("cache.tmp")));
+        assert!(!paths.iter().any(|path| path.contains("node_modules")));
+        assert!(!paths.iter().any(|path| path.contains(".git")));
+        assert!(!paths
+            .iter()
+            .any(|path| path.contains("child-project/child.txt")));
+        for blocked in [".env.production", "secret.txt"] {
+            let resource = generic
+                .iter()
+                .find(|resource| resource.display_name == blocked)
+                .unwrap();
+            assert!(resource.blocked_reason.is_some());
+            assert!(!resource.selected_by_default);
+        }
+        assert!(inventory.ignored_count >= 4);
+        assert!(inventory.blocked_count >= 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_content_links_are_blocked_and_never_followed() {
+        use std::fs::hard_link;
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        let outside = temp.path().join("outside.txt");
+        write(&outside, b"outside");
+        write(&project.join("original.txt"), b"linked");
+        hard_link(project.join("original.txt"), project.join("hard-link.txt")).unwrap();
+        symlink(&outside, project.join("outside-link.txt")).unwrap();
+
+        let mut request = CaptureRequest::for_project(&project);
+        request.include_project_content = true;
+        let inventory = discover_project(&request).unwrap();
+        for path in ["original.txt", "hard-link.txt", "outside-link.txt"] {
+            let resource = inventory
+                .resources
+                .iter()
+                .find(|resource| resource.display_name == path)
+                .unwrap();
+            assert!(
+                resource.blocked_reason.is_some(),
+                "{path} was unexpectedly selectable"
+            );
+        }
+        assert!(!inventory.resources.iter().any(|resource| {
+            resource
+                .logical_paths
+                .iter()
+                .any(|path| path.contains("outside.txt"))
+        }));
+    }
+
+    #[test]
+    fn project_content_size_and_depth_boundaries_fail_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        let oversized = fs::File::create(project.join("oversized.bin")).unwrap();
+        oversized.set_len(MAX_FILE_BYTES + 1).unwrap();
+        let mut deep = project.clone();
+        for index in 0..=MAX_TREE_DEPTH {
+            deep.push(format!("d{index}"));
+        }
+        write(&deep.join("too-deep.txt"), b"deep");
+
+        let mut request = CaptureRequest::for_project(&project);
+        request.include_project_content = true;
+        let inventory = discover_project(&request).unwrap();
+        let oversized = inventory
+            .resources
+            .iter()
+            .find(|resource| resource.display_name == "oversized.bin")
+            .unwrap();
+        assert!(oversized
+            .blocked_reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("exceeds")));
+        assert!(inventory.blocked_count >= 2);
+        assert!(inventory
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("depth limit")));
+        assert!(!inventory
+            .resources
+            .iter()
+            .any(|resource| resource.display_name.ends_with("too-deep.txt")));
+    }
+
+    #[test]
+    fn project_content_stress_scan_enforces_the_twenty_thousand_resource_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let project = temp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+        for index in 0..=MAX_DISCOVERED_FILES {
+            fs::write(project.join(format!("entry-{index:05}.txt")), b"").unwrap();
+        }
+        let mut request = CaptureRequest::for_project(&project);
+        request.include_project_content = true;
+        let error = discover_project(&request).unwrap_err();
+        assert!(error.contains("exceeds 20000 resources"), "{error}");
     }
 }

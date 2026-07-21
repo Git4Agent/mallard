@@ -1,6 +1,6 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type ReactNode } from "react";
 import type { StorageConfigV3 } from "../../types";
 import Icon from "../Icons";
 
@@ -103,11 +103,13 @@ export function StorageEditor({
   disabled,
   onChange,
   onRemove,
+  primaryAction,
 }: {
   storage: StorageConfigV3;
   disabled: boolean;
   onChange: (storage: StorageConfigV3) => void;
   onRemove?: () => void;
+  primaryAction?: ReactNode;
 }) {
   const set = (patch: Partial<StorageConfigV3>) => onChange({ ...storage, ...patch });
   const derivedS3ApiUrl = r2S3ApiUrl(storage.account_id ?? "", storage.bucket ?? "");
@@ -195,28 +197,30 @@ export function StorageEditor({
             <button type="button" className="btn" onClick={() => void chooseFolder()} disabled={disabled}>
               <Icon name="folder" size={13} /> Browse…
             </button>
+            {primaryAction}
           </div>
         </label>
       ) : (
-        <div className="v3-r2-setup">
-          <section className="v3-r2-guide" aria-labelledby={`storage-${storage.id}-r2-guide`}>
-            <span className="v3-r2-guide-icon"><Icon name="cloud" size={18} /></span>
-            <div>
-              <div className="v3-r2-guide-heading">
-                <strong id={`storage-${storage.id}-r2-guide`}>Connect a Cloudflare R2 bucket</strong>
-                <button type="button" className="btn-link" onClick={() => void openHelp(R2_SETUP_DOC)}>Setup guide</button>
+        <>
+          <div className="v3-r2-setup">
+            <section className="v3-r2-guide" aria-labelledby={`storage-${storage.id}-r2-guide`}>
+              <span className="v3-r2-guide-icon"><Icon name="cloud" size={18} /></span>
+              <div>
+                <div className="v3-r2-guide-heading">
+                  <strong id={`storage-${storage.id}-r2-guide`}>Connect a Cloudflare R2 bucket</strong>
+                  <button type="button" className="btn-link" onClick={() => void openHelp(R2_SETUP_DOC)}>Setup guide</button>
+                </div>
+                <p>Create one bucket and an <strong>Object Read &amp; Write</strong> token scoped to that bucket.</p>
+                <ol>
+                  <li><button type="button" onClick={() => void openHelp(R2_BUCKET_DOC)}>Create an R2 bucket</button></li>
+                  <li><button type="button" onClick={() => void openHelp(R2_CREDENTIALS_DOC)}>Create R2 credentials</button></li>
+                  <li><button type="button" onClick={() => void openHelp(CLOUDFLARE_ACCOUNT_ID_DOC)}>Find your Account ID</button></li>
+                </ol>
+                <small>Copy both credentials when the token is created—the Secret Access Key is shown only once.</small>
               </div>
-              <p>Create one bucket and an <strong>Object Read &amp; Write</strong> token scoped to that bucket.</p>
-              <ol>
-                <li><button type="button" onClick={() => void openHelp(R2_BUCKET_DOC)}>Create an R2 bucket</button></li>
-                <li><button type="button" onClick={() => void openHelp(R2_CREDENTIALS_DOC)}>Create R2 credentials</button></li>
-                <li><button type="button" onClick={() => void openHelp(CLOUDFLARE_ACCOUNT_ID_DOC)}>Find your Account ID</button></li>
-              </ol>
-              <small>Copy both credentials when the token is created—the Secret Access Key is shown only once.</small>
-            </div>
-          </section>
+            </section>
 
-          <div className="v3-storage-fields v3-r2-fields">
+            <div className="v3-storage-fields v3-r2-fields">
             <label className="v3-r2-url-field">
               <span className="form-label-row">
                 <span>S3 API URL</span>
@@ -322,8 +326,10 @@ export function StorageEditor({
               />
               <small id={`storage-${storage.id}-secret-hint`}>Example: <code>a1B2…x9Y0</code></small>
             </label>
+            </div>
           </div>
-        </div>
+          {primaryAction && <div className="v3-storage-primary-action">{primaryAction}</div>}
+        </>
       )}
     </article>
   );

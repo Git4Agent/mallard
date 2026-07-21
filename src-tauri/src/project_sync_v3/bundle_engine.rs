@@ -1,4 +1,4 @@
-//! Schema-3 bundle storage, publication, fetch, restore planning, and apply.
+//! Schema-4 bundle storage, publication, fetch, restore planning, and apply.
 //!
 //! The engine operates on validated logical/store keys and a small object
 //! store trait. Its local implementation is complete; an S3 adapter can reuse
@@ -15,11 +15,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 use super::domain::{
-    self, ActionId, ActionStatus, ApplyPolicy, ApplyReceipt, BindingState, BundleFileEntry,
-    BundleHead, BundleId, BundleIdentity, BundleKind, BundleManifest, BundleRecipe, BundleSnapshot,
-    CapturedWith, DependencyAction, DependencyActionKind, LogicalPath, PlanId, ProjectBinding,
-    Provider, ResourceDescriptor, ResourceId, ResourceKind, RestoreAction, RestoreActionKind,
-    RestorePlan, StorageId, Tombstone, TombstoneTarget, BUNDLE_SCHEMA_V3, RESTORE_PLAN_SCHEMA_V1,
+    self, ActionId, ActionStatus, ApplyPolicy, ApplyReceipt, BindingState, BundleDirectoryEntry,
+    BundleFileEntry, BundleHead, BundleId, BundleIdentity, BundleKind, BundleManifest,
+    BundleRecipe, BundleSnapshot, CapturedWith, DependencyAction, DependencyActionKind,
+    LogicalPath, PlanId, ProjectBinding, Provider, ResourceDescriptor, ResourceId, ResourceKind,
+    RestoreAction, RestoreActionKind, RestorePlan, StorageId, Tombstone, TombstoneTarget,
+    BUNDLE_SCHEMA_V4, RESTORE_PLAN_SCHEMA_V1,
 };
 use super::provider_capture::{self, CapturedResources};
 
@@ -611,7 +612,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
         // Only fetch materializes dependency actions, but invalid captured
         // dependency intent must still fail the publish, not the next pull.
         provider_capture::domain_dependency_actions(&request.captured)?;
-        let (resources, mut files, tombstones) = reconcile_manifest_content(
+        let (resources, mut files, mut directories, tombstones) = reconcile_manifest_content(
             &request.recipe,
             &captured_descriptors,
             &request.captured,
@@ -647,8 +648,27 @@ impl<S: BundleObjectStore> BundleEngine<S> {
             );
         }
 
+        for (logical_path, captured) in &request.captured.directories {
+            let logical = LogicalPath::parse(logical_path.clone())?;
+            let resource_id = ResourceId::parse(captured.resource_id.clone())?;
+            if !request.recipe.entries.contains_key(&resource_id) {
+                return Err(format!(
+                    "captured directory '{}' belongs to unselected resource '{}'",
+                    logical, resource_id
+                ));
+            }
+            directories.insert(
+                logical,
+                BundleDirectoryEntry {
+                    resource_id,
+                    mode: Some(captured.mode & 0o777),
+                    source_mtime: captured.source_mtime,
+                },
+            );
+        }
+
         let manifest = BundleManifest {
-            schema_version: BUNDLE_SCHEMA_V3,
+            schema_version: BUNDLE_SCHEMA_V4,
             generation,
             commit_id: commit_id.clone(),
             updated_at: request.updated_at,
@@ -657,6 +677,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
             captured_with: request.captured_with,
             resources,
             files,
+            directories,
             tombstones,
         };
         manifest.validate()?;
@@ -671,7 +692,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
         let (added_files, changed_files, removed_files) =
             file_delta(previous_manifest.as_ref(), &manifest);
         let commit = CommitRecord {
-            schema_version: BUNDLE_SCHEMA_V3,
+            schema_version: BUNDLE_SCHEMA_V4,
             bundle_id: request.identity.bundle_id.clone(),
             generation,
             commit_id: commit_id.clone(),
@@ -692,7 +713,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
         self.store.put_immutable(&commit_key, &commit_bytes)?;
 
         let head = BundleHead {
-            schema_version: BUNDLE_SCHEMA_V3,
+            schema_version: BUNDLE_SCHEMA_V4,
             bundle_id: request.identity.bundle_id.clone(),
             kind: request.identity.kind,
             generation,
@@ -774,10 +795,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
 
     /// The optional form is used by read-only status views where an empty
     /// linked destination is a valid state rather than an error.
-    pub fn inspect_optional(
-        &self,
-        bundle_id: &BundleId,
-    ) -> Result<Option<BundleSnapshot>, String> {
+    pub fn inspect_optional(&self, bundle_id: &BundleId) -> Result<Option<BundleSnapshot>, String> {
         let Some((head, _)) = self.read_head(bundle_id)? else {
             return Ok(None);
         };
@@ -801,7 +819,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
         manifest_sha256: &str,
     ) -> Result<BundleManifest, String> {
         let head = BundleHead {
-            schema_version: BUNDLE_SCHEMA_V3,
+            schema_version: BUNDLE_SCHEMA_V4,
             bundle_id: bundle_id.clone(),
             kind: BundleKind::Project,
             generation,
@@ -865,7 +883,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
                 .get(&key)?
                 .ok_or_else(|| format!("listed bundle tag '{}' disappeared", key))?;
             let tag: BundleTag = parse_bounded_json(&stored.bytes, "bundle tag")?;
-            if tag.schema_version != BUNDLE_SCHEMA_V3 || tag.bundle_id != bundle_id {
+            if tag.schema_version != BUNDLE_SCHEMA_V4 || tag.bundle_id != bundle_id {
                 return Err(format!("bundle tag '{}' has inconsistent identity", key));
             }
             summaries.push(RemoteBundleSummary {
@@ -952,6 +970,56 @@ impl<S: BundleObjectStore> BundleEngine<S> {
             }
             actions.push(action);
         }
+        for (logical_path, entry) in &bundle.snapshot.manifest.directories {
+            let descriptor = bundle
+                .snapshot
+                .manifest
+                .resources
+                .get(&entry.resource_id)
+                .ok_or_else(|| format!("directory '{}' has no resource", logical_path))?;
+            if descriptor.kind != ResourceKind::ProjectContentDirectory {
+                return Err(format!(
+                    "directory '{}' is not project-content metadata",
+                    logical_path
+                ));
+            }
+            let target = project_content_target(logical_path, binding)?;
+            let expected_target_mode = match inspect_project_directory_target(&target) {
+                Ok(mode) => mode,
+                Err(error) => {
+                    actions.push(manual_action(
+                        &entry.resource_id,
+                        &format!(
+                            "Project directory '{}' is blocked at '{}': {}",
+                            logical_path,
+                            target.display(),
+                            error
+                        ),
+                    )?);
+                    continue;
+                }
+            };
+            let mode = entry.mode.unwrap_or(0o700) & 0o777;
+            let kind = RestoreActionKind::EnsureProjectDirectory {
+                logical_path: logical_path.clone(),
+                mode,
+                source_mtime: entry.source_mtime,
+            };
+            actions.push(RestoreAction {
+                action_id: action_id_for(
+                    &entry.resource_id,
+                    logical_path.as_str(),
+                    kind.action_type(),
+                )?,
+                resource_id: entry.resource_id.clone(),
+                kind,
+                target_path: Some(path_text(&target)?),
+                source_sha256: Some(directory_entry_digest(logical_path, mode)),
+                expected_target_sha256: None,
+                expected_target_mode,
+                requires_explicit_approval: true,
+            });
+        }
         for (logical_path, entry) in &bundle.snapshot.manifest.files {
             let descriptor = bundle
                 .snapshot
@@ -983,7 +1051,22 @@ impl<S: BundleObjectStore> BundleEngine<S> {
                     previous, logical_path
                 ));
             }
-            let target_state = inspect_restore_target(&target)?;
+            let target_state = match inspect_restore_target(&target) {
+                Ok(state) => state,
+                Err(error) if descriptor.kind == ResourceKind::ProjectContentFile => {
+                    actions.push(manual_action(
+                        &entry.resource_id,
+                        &format!(
+                            "Project file '{}' is blocked at '{}': {}",
+                            logical_path,
+                            target.display(),
+                            error
+                        ),
+                    )?);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if logical_path.as_str() != "state/codex/session_index.jsonl"
                 && matches!(
                     descriptor.kind,
@@ -1005,7 +1088,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
                 continue;
             }
 
-            let kind = restore_kind_for_file(logical_path, descriptor, &entry.sha256)?;
+            let kind = restore_kind_for_file(logical_path, descriptor, entry)?;
             // A conversation copied by an older Agent Sync release can still
             // have the exact portable source digest. Treat it as the same
             // known session so the path-only migration stays a safe default.
@@ -1036,6 +1119,9 @@ impl<S: BundleObjectStore> BundleEngine<S> {
                 target_path: Some(path_text(&target)?),
                 source_sha256: Some(entry.sha256.clone()),
                 expected_target_sha256: target_state.digest,
+                expected_target_mode: (descriptor.kind == ResourceKind::ProjectContentFile)
+                    .then_some(target_state.mode)
+                    .flatten(),
                 requires_explicit_approval,
             });
             if descriptor.relative_cwd.is_some()
@@ -1043,6 +1129,98 @@ impl<S: BundleObjectStore> BundleEngine<S> {
                 && continuation_ids.insert(descriptor.resource_id.clone())
             {
                 actions.push(continuation_action(descriptor, binding)?);
+            }
+        }
+        for tombstone in bundle.snapshot.manifest.tombstones.values() {
+            match &tombstone.target {
+                TombstoneTarget::ProjectContentFile {
+                    resource_id,
+                    logical_path,
+                } => {
+                    let last_sha256 = tombstone.last_sha256.clone().ok_or_else(|| {
+                        format!(
+                            "project-content file tombstone '{}' lacks its last digest",
+                            logical_path
+                        )
+                    })?;
+                    let target = project_content_target(logical_path, binding)?;
+                    let target_state = match inspect_restore_target(&target) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            actions.push(manual_action(
+                                resource_id,
+                                &format!(
+                                    "Project-file deletion '{}' is blocked at '{}': {}",
+                                    logical_path,
+                                    target.display(),
+                                    error
+                                ),
+                            )?);
+                            continue;
+                        }
+                    };
+                    if target_state.digest.is_none() {
+                        continue;
+                    }
+                    let kind = RestoreActionKind::DeleteProjectFile {
+                        logical_path: logical_path.clone(),
+                        last_sha256: last_sha256.clone(),
+                    };
+                    actions.push(RestoreAction {
+                        action_id: action_id_for(
+                            resource_id,
+                            logical_path.as_str(),
+                            kind.action_type(),
+                        )?,
+                        resource_id: resource_id.clone(),
+                        kind,
+                        target_path: Some(path_text(&target)?),
+                        source_sha256: None,
+                        expected_target_sha256: Some(last_sha256),
+                        expected_target_mode: target_state.mode,
+                        requires_explicit_approval: true,
+                    });
+                }
+                TombstoneTarget::ProjectContentDirectory {
+                    resource_id,
+                    logical_path,
+                } => {
+                    let target = project_content_target(logical_path, binding)?;
+                    let expected_target_mode = match inspect_project_directory_target(&target) {
+                        Ok(Some(mode)) => Some(mode),
+                        Ok(None) => continue,
+                        Err(error) => {
+                            actions.push(manual_action(
+                                resource_id,
+                                &format!(
+                                    "Project-directory deletion '{}' is blocked at '{}': {}",
+                                    logical_path,
+                                    target.display(),
+                                    error
+                                ),
+                            )?);
+                            continue;
+                        }
+                    };
+                    let kind = RestoreActionKind::DeleteProjectDirectory {
+                        logical_path: logical_path.clone(),
+                    };
+                    actions.push(RestoreAction {
+                        action_id: action_id_for(
+                            resource_id,
+                            logical_path.as_str(),
+                            kind.action_type(),
+                        )?,
+                        resource_id: resource_id.clone(),
+                        kind,
+                        target_path: Some(path_text(&target)?),
+                        source_sha256: None,
+                        expected_target_sha256: None,
+                        expected_target_mode,
+                        requires_explicit_approval: true,
+                    });
+                }
+                _ => {}
             }
         }
         actions.sort_by(|a, b| a.action_id.cmp(&b.action_id));
@@ -1059,6 +1237,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
             created_at,
             expires_at: created_at.saturating_add(DEFAULT_PLAN_LIFETIME_SECS),
             actions,
+            project_content_eligibility: None,
         };
         plan.validate()?;
         Ok(plan)
@@ -1085,7 +1264,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
 
     fn publish_tag(&self, manifest: &BundleManifest) -> Result<(), String> {
         let tag = BundleTag {
-            schema_version: BUNDLE_SCHEMA_V3,
+            schema_version: BUNDLE_SCHEMA_V4,
             bundle_id: manifest.bundle.bundle_id.clone(),
             display_name: manifest.bundle.display_name.clone(),
             kind: manifest.bundle.kind,
@@ -1472,7 +1651,7 @@ mod tests {
         for number in 1..=1_005_u64 {
             let id = bundle_id(number);
             let tag = BundleTag {
-                schema_version: BUNDLE_SCHEMA_V3,
+                schema_version: BUNDLE_SCHEMA_V4,
                 bundle_id: id.clone(),
                 display_name: format!("Bundle {}", number),
                 kind: BundleKind::Project,
@@ -1841,6 +2020,8 @@ mod tests {
             standalone_skills: Vec::new(),
             global_plugins: Vec::new(),
             blocked_global_skills: Vec::new(),
+            include_project_content: false,
+            excluded_content_roots: Vec::new(),
         };
         let inventory = discover_project(&request).unwrap();
         let resource = inventory
@@ -1938,6 +2119,8 @@ mod tests {
             standalone_skills: Vec::new(),
             global_plugins: Vec::new(),
             blocked_global_skills: Vec::new(),
+            include_project_content: false,
+            excluded_content_roots: Vec::new(),
         };
         let inventory = discover_project(&request).unwrap();
         let resource = inventory
@@ -2203,6 +2386,8 @@ mod tests {
             standalone_skills: inventory.standalone_skills,
             global_plugins: inventory.plugins,
             blocked_global_skills: inventory.blocked_skills,
+            include_project_content: false,
+            excluded_content_roots: Vec::new(),
         };
         (codex_home, request)
     }
@@ -2463,6 +2648,8 @@ mod tests {
             standalone_skills: inventory.standalone_skills,
             global_plugins: inventory.plugins,
             blocked_global_skills: inventory.blocked_skills,
+            include_project_content: false,
+            excluded_content_roots: Vec::new(),
         };
         let resource_id = "codex:standalone-skill:get-real-hardware-rh-service";
         let recipe = recipe_for([resource_id.to_string()]);
@@ -2831,6 +3018,7 @@ fn custom_skill_action(
         target_path: Some(path_text(&target)?),
         source_sha256: Some(source_digest),
         expected_target_sha256: expected,
+        expected_target_mode: None,
         requires_explicit_approval: true,
     };
     action.validate()?;
@@ -2848,6 +3036,7 @@ fn manual_action(resource_id: &ResourceId, message: &str) -> Result<RestoreActio
         target_path: None,
         source_sha256: None,
         expected_target_sha256: None,
+        expected_target_mode: None,
         requires_explicit_approval: true,
     };
     action.validate()?;
@@ -3001,7 +3190,7 @@ fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 fn restore_kind_for_file(
     logical_path: &LogicalPath,
     descriptor: &ResourceDescriptor,
-    source_sha256: &str,
+    entry: &BundleFileEntry,
 ) -> Result<RestoreActionKind, String> {
     if logical_path.as_str() == "state/codex/session_index.jsonl" {
         return Ok(RestoreActionKind::MergeFile {
@@ -3017,11 +3206,16 @@ fn restore_kind_for_file(
             provider: Provider::Claude,
             logical_path: logical_path.clone(),
         },
+        ResourceKind::ProjectContentFile => RestoreActionKind::WriteProjectFile {
+            logical_path: logical_path.clone(),
+            mode: entry.mode.unwrap_or(0o600) & 0o777,
+            source_mtime: entry.source_mtime,
+        },
         ResourceKind::Hook => RestoreActionKind::ReviewHook {
-            definition_sha256: source_sha256.to_string(),
+            definition_sha256: entry.sha256.clone(),
         },
         ResourceKind::McpServer => RestoreActionKind::ReviewMcp {
-            definition_sha256: source_sha256.to_string(),
+            definition_sha256: entry.sha256.clone(),
         },
         ResourceKind::Setting => RestoreActionKind::ApplySetting {
             provider: descriptor
@@ -3167,6 +3361,87 @@ fn map_logical_target(
     Ok(None)
 }
 
+fn project_content_target(
+    logical_path: &LogicalPath,
+    binding: &ProjectBinding,
+) -> Result<PathBuf, String> {
+    let relative = logical_path
+        .as_str()
+        .strip_prefix("project/")
+        .ok_or_else(|| format!("'{}' is not project content", logical_path))?;
+    safe_lexical_join(Path::new(&binding.canonical_project_root), relative)
+}
+
+fn directory_entry_digest(logical_path: &LogicalPath, mode: u32) -> String {
+    sha256(format!("dir\0{}\0{:03o}", logical_path, mode & 0o777).as_bytes())
+}
+
+fn inspect_project_directory_target(path: &Path) -> Result<Option<u32>, String> {
+    inspect_existing_ancestors_no_symlink(path)?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "inspect project directory '{}': {}",
+                path.display(),
+                error
+            ))
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "target '{}' is not a real no-follow directory",
+            path.display()
+        ));
+    }
+    Ok(Some(safe_mode(&metadata)))
+}
+
+fn project_action_logical_path(action: &RestoreAction) -> Option<LogicalPath> {
+    match &action.kind {
+        RestoreActionKind::WriteProjectFile { logical_path, .. }
+        | RestoreActionKind::EnsureProjectDirectory { logical_path, .. }
+        | RestoreActionKind::DeleteProjectFile { logical_path, .. }
+        | RestoreActionKind::DeleteProjectDirectory { logical_path } => Some(logical_path.clone()),
+        _ => None,
+    }
+}
+
+fn project_action_depth(action: &RestoreAction) -> usize {
+    project_action_logical_path(action)
+        .map(|path| path.as_str().split('/').count())
+        .unwrap_or(0)
+}
+
+fn logical_path_is_ancestor(directory: &LogicalPath, child: &LogicalPath) -> bool {
+    child
+        .as_str()
+        .strip_prefix(directory.as_str())
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+#[cfg(unix)]
+fn set_path_mode(path: &Path, mode: u32) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o777))
+        .map_err(|error| format!("set mode '{}': {}", path.display(), error))
+}
+
+#[cfg(not(unix))]
+fn set_path_mode(_path: &Path, _mode: u32) -> Result<(), String> {
+    Ok(())
+}
+
+fn set_path_mtime_best_effort(path: &Path, source_mtime: u64) {
+    if source_mtime == 0 {
+        return;
+    }
+    if let Ok(file) = fs::OpenOptions::new().read(true).open(path) {
+        let _ = file.set_modified(UNIX_EPOCH + std::time::Duration::from_secs(source_mtime));
+    }
+}
+
 fn required_home<'a>(home: Option<&'a str>, provider: &str) -> Result<&'a Path, String> {
     home.map(Path::new)
         .ok_or_else(|| format!("{} home is required by this bundle", provider))
@@ -3206,6 +3481,7 @@ fn safe_lexical_join(root: &Path, relative: &str) -> Result<PathBuf, String> {
 struct RestoreTargetState {
     digest: Option<String>,
     bytes: Option<Vec<u8>>,
+    mode: Option<u32>,
 }
 
 fn inspect_restore_target(path: &Path) -> Result<RestoreTargetState, String> {
@@ -3216,6 +3492,7 @@ fn inspect_restore_target(path: &Path) -> Result<RestoreTargetState, String> {
             return Ok(RestoreTargetState {
                 digest: None,
                 bytes: None,
+                mode: None,
             })
         }
         Err(e) => {
@@ -3240,7 +3517,19 @@ fn inspect_restore_target(path: &Path) -> Result<RestoreTargetState, String> {
     Ok(RestoreTargetState {
         digest: Some(sha256(&bytes)),
         bytes: Some(bytes),
+        mode: Some(safe_mode(&meta)),
     })
+}
+
+#[cfg(unix)]
+fn safe_mode(metadata: &fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn safe_mode(_metadata: &fs::Metadata) -> u32 {
+    0o600
 }
 
 fn validate_target_for_logical(
@@ -3878,6 +4167,7 @@ fn reconcile_manifest_content(
     (
         BTreeMap<ResourceId, ResourceDescriptor>,
         BTreeMap<LogicalPath, BundleFileEntry>,
+        BTreeMap<LogicalPath, BundleDirectoryEntry>,
         BTreeMap<String, Tombstone>,
     ),
     String,
@@ -3892,12 +4182,18 @@ fn reconcile_manifest_content(
         .keys()
         .map(|path| LogicalPath::parse(path.clone()))
         .collect::<Result<BTreeSet<_>, _>>()?;
+    let captured_directory_paths = captured
+        .directories
+        .keys()
+        .map(|path| LogicalPath::parse(path.clone()))
+        .collect::<Result<BTreeSet<_>, _>>()?;
     let captured_ids = captured_descriptors
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
     let mut resources = BTreeMap::new();
     let mut files = BTreeMap::new();
+    let mut directories = BTreeMap::new();
     let mut tombstones = previous
         .map(|manifest| manifest.tombstones.clone())
         .unwrap_or_default();
@@ -3910,6 +4206,11 @@ fn reconcile_manifest_content(
             for (path, entry) in &previous.unwrap().files {
                 if &entry.resource_id == id {
                     files.insert(path.clone(), entry.clone());
+                }
+            }
+            for (path, entry) in &previous.unwrap().directories {
+                if &entry.resource_id == id {
+                    directories.insert(path.clone(), entry.clone());
                 }
             }
         } else {
@@ -3939,16 +4240,44 @@ fn reconcile_manifest_content(
             let recaptured_without_file = captured_ids.contains(&old_entry.resource_id)
                 && !captured_file_paths.contains(path);
             if owner_removed || recaptured_without_file {
+                let is_project_content = previous
+                    .resources
+                    .get(&old_entry.resource_id)
+                    .is_some_and(|descriptor| descriptor.kind == ResourceKind::ProjectContentFile);
                 let tombstone = Tombstone {
-                    target: TombstoneTarget::File {
-                        resource_id: old_entry.resource_id.clone(),
-                        logical_path: path.clone(),
+                    target: if is_project_content {
+                        TombstoneTarget::ProjectContentFile {
+                            resource_id: old_entry.resource_id.clone(),
+                            logical_path: path.clone(),
+                        }
+                    } else {
+                        TombstoneTarget::File {
+                            resource_id: old_entry.resource_id.clone(),
+                            logical_path: path.clone(),
+                        }
                     },
                     last_sha256: Some(old_entry.sha256.clone()),
                     deleted_at: updated_at,
                 };
                 tombstones.insert(tombstone.canonical_key(), tombstone);
                 files.remove(path);
+            }
+        }
+        for (path, old_entry) in &previous.directories {
+            let owner_removed = !recipe.entries.contains_key(&old_entry.resource_id);
+            let recaptured_without_directory = captured_ids.contains(&old_entry.resource_id)
+                && !captured_directory_paths.contains(path);
+            if owner_removed || recaptured_without_directory {
+                let tombstone = Tombstone {
+                    target: TombstoneTarget::ProjectContentDirectory {
+                        resource_id: old_entry.resource_id.clone(),
+                        logical_path: path.clone(),
+                    },
+                    last_sha256: None,
+                    deleted_at: updated_at,
+                };
+                tombstones.insert(tombstone.canonical_key(), tombstone);
+                directories.remove(path);
             }
         }
     }
@@ -3959,8 +4288,19 @@ fn reconcile_manifest_content(
             resource_id: _,
             logical_path,
         } => !files.contains_key(logical_path) && !captured_file_paths.contains(logical_path),
+        TombstoneTarget::ProjectContentFile {
+            resource_id: _,
+            logical_path,
+        } => !files.contains_key(logical_path) && !captured_file_paths.contains(logical_path),
+        TombstoneTarget::ProjectContentDirectory {
+            resource_id: _,
+            logical_path,
+        } => {
+            !directories.contains_key(logical_path)
+                && !captured_directory_paths.contains(logical_path)
+        }
     });
-    Ok((resources, files, tombstones))
+    Ok((resources, files, directories, tombstones))
 }
 
 fn dependencies_from_manifest(manifest: &BundleManifest) -> Result<Vec<DependencyAction>, String> {
@@ -4103,6 +4443,53 @@ impl<S: BundleObjectStore> BundleEngine<S> {
         {
             return Err(format!("approval references unknown action '{}'", unknown));
         }
+        let mut effective_approved = approved_action_ids.clone();
+        let approved_project_files = plan
+            .actions
+            .iter()
+            .filter_map(|action| match &action.kind {
+                RestoreActionKind::WriteProjectFile { logical_path, .. }
+                    if effective_approved.contains(&action.action_id) =>
+                {
+                    Some(logical_path.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for action in &plan.actions {
+            if let RestoreActionKind::EnsureProjectDirectory { logical_path, .. } = &action.kind {
+                if approved_project_files
+                    .iter()
+                    .any(|file| logical_path_is_ancestor(logical_path, file))
+                {
+                    effective_approved.insert(action.action_id.clone());
+                }
+            }
+        }
+        let approves_project_content = plan.actions.iter().any(|action| {
+            effective_approved.contains(&action.action_id)
+                && matches!(
+                    action.kind,
+                    RestoreActionKind::WriteProjectFile { .. }
+                        | RestoreActionKind::EnsureProjectDirectory { .. }
+                        | RestoreActionKind::DeleteProjectFile { .. }
+                        | RestoreActionKind::DeleteProjectDirectory { .. }
+                )
+        });
+        if approves_project_content
+            && plan
+                .project_content_eligibility
+                .as_ref()
+                .is_some_and(|eligibility| {
+                    eligibility.state != domain::ProjectFileSyncEligibilityState::Eligible
+                })
+        {
+            return Err(
+                "project content cannot be applied because this folder is Git-managed or eligibility is unknown"
+                    .to_string(),
+            );
+        }
+
         let current = self
             .read_head(&plan.bundle_id)?
             .ok_or_else(|| "bundle head disappeared after planning".to_string())?;
@@ -4130,8 +4517,38 @@ impl<S: BundleObjectStore> BundleEngine<S> {
             .map(|action| (action.resource_id.clone(), action.clone()))
             .collect::<BTreeMap<_, _>>();
 
+        let mut prepared_directories = Vec::new();
+        let mut ensure_actions = plan
+            .actions
+            .iter()
+            .filter(|action| {
+                effective_approved.contains(&action.action_id)
+                    && matches!(
+                        action.kind,
+                        RestoreActionKind::EnsureProjectDirectory { .. }
+                    )
+            })
+            .collect::<Vec<_>>();
+        ensure_actions.sort_by_key(|action| project_action_depth(action));
+        for action in ensure_actions {
+            match self.prepare_project_directory(binding, action) {
+                Ok(()) => prepared_directories.push(action),
+                Err(error) => receipts.push(receipt_for(
+                    action,
+                    ActionStatus::Failed,
+                    applied_at,
+                    project_action_logical_path(action),
+                    None,
+                    Some(error),
+                )),
+            }
+        }
+
+        let mut approved_file_deletions = Vec::new();
+        let mut approved_directory_deletions = Vec::new();
+
         for action in &plan.actions {
-            if !approved_action_ids.contains(&action.action_id) {
+            if !effective_approved.contains(&action.action_id) {
                 receipts.push(receipt_for(
                     action,
                     ActionStatus::Skipped,
@@ -4143,6 +4560,13 @@ impl<S: BundleObjectStore> BundleEngine<S> {
                 continue;
             }
             match &action.kind {
+                RestoreActionKind::EnsureProjectDirectory { .. } => {}
+                RestoreActionKind::DeleteProjectFile { .. } => {
+                    approved_file_deletions.push(action);
+                }
+                RestoreActionKind::DeleteProjectDirectory { .. } => {
+                    approved_directory_deletions.push(action);
+                }
                 RestoreActionKind::InstallCustomSkill {
                     provider,
                     skill_name,
@@ -4231,6 +4655,7 @@ impl<S: BundleObjectStore> BundleEngine<S> {
                     });
                 }
                 RestoreActionKind::WriteFile { logical_path }
+                | RestoreActionKind::WriteProjectFile { logical_path, .. }
                 | RestoreActionKind::MergeFile { logical_path }
                 | RestoreActionKind::MaterializeConversation { logical_path, .. } => {
                     let receipt = self.apply_file_action(
@@ -4256,6 +4681,59 @@ impl<S: BundleObjectStore> BundleEngine<S> {
                 }
             }
         }
+
+        approved_file_deletions
+            .sort_by_key(|action| std::cmp::Reverse(project_action_depth(action)));
+        for action in approved_file_deletions {
+            let receipt = self.apply_project_file_deletion(
+                binding,
+                action,
+                &plan_backup,
+                applied_at,
+                &mut backups,
+            );
+            receipts.push(receipt.unwrap_or_else(|error| {
+                receipt_for(
+                    action,
+                    ActionStatus::Failed,
+                    applied_at,
+                    project_action_logical_path(action),
+                    None,
+                    Some(error),
+                )
+            }));
+        }
+
+        approved_directory_deletions
+            .sort_by_key(|action| std::cmp::Reverse(project_action_depth(action)));
+        for action in approved_directory_deletions {
+            let receipt = self.apply_project_directory_deletion(binding, action, applied_at);
+            receipts.push(receipt.unwrap_or_else(|error| {
+                receipt_for(
+                    action,
+                    ActionStatus::Failed,
+                    applied_at,
+                    project_action_logical_path(action),
+                    None,
+                    Some(error),
+                )
+            }));
+        }
+
+        prepared_directories.sort_by_key(|action| std::cmp::Reverse(project_action_depth(action)));
+        for action in prepared_directories {
+            let receipt = self.finalize_project_directory(binding, action, applied_at);
+            receipts.push(receipt.unwrap_or_else(|error| {
+                receipt_for(
+                    action,
+                    ActionStatus::Failed,
+                    applied_at,
+                    project_action_logical_path(action),
+                    None,
+                    Some(error),
+                )
+            }));
+        }
         deferred.sort_by(|a, b| a.action_id.cmp(&b.action_id));
         deferred.dedup_by(|a, b| a.action_id == b.action_id);
         Ok(ApplyBundleResult {
@@ -4264,6 +4742,209 @@ impl<S: BundleObjectStore> BundleEngine<S> {
             backups,
             deferred_dependencies: deferred,
         })
+    }
+
+    fn prepare_project_directory(
+        &self,
+        binding: &ProjectBinding,
+        action: &RestoreAction,
+    ) -> Result<(), String> {
+        let RestoreActionKind::EnsureProjectDirectory { logical_path, .. } = &action.kind else {
+            return Err("directory preparation received another action kind".to_string());
+        };
+        let target = project_content_target(logical_path, binding)?;
+        if action.target_path.as_deref() != Some(path_text(&target)?.as_str()) {
+            return Err("project directory target differs from the pinned plan".to_string());
+        }
+        validate_target_for_logical(&target, logical_path, binding)?;
+        match (
+            inspect_project_directory_target(&target)?,
+            action.expected_target_mode,
+        ) {
+            (Some(actual), Some(expected)) if actual == expected => Ok(()),
+            (Some(_), Some(_)) => Err("project directory mode changed after planning".to_string()),
+            (Some(_), None) => Err("project directory appeared after planning".to_string()),
+            (None, Some(_)) => Err("project directory disappeared after planning".to_string()),
+            (None, None) => {
+                let parent = target
+                    .parent()
+                    .ok_or_else(|| "project directory has no parent".to_string())?;
+                let parent_meta = fs::symlink_metadata(parent).map_err(|error| {
+                    format!(
+                        "inspect project directory parent '{}': {}",
+                        parent.display(),
+                        error
+                    )
+                })?;
+                if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+                    return Err(format!(
+                        "project directory parent '{}' is not a real directory",
+                        parent.display()
+                    ));
+                }
+                fs::create_dir(&target).map_err(|error| {
+                    format!("create project directory '{}': {}", target.display(), error)
+                })?;
+                set_path_mode(&target, 0o700)
+            }
+        }
+    }
+
+    fn finalize_project_directory(
+        &self,
+        binding: &ProjectBinding,
+        action: &RestoreAction,
+        applied_at: u64,
+    ) -> Result<ApplyReceipt, String> {
+        let RestoreActionKind::EnsureProjectDirectory {
+            logical_path,
+            mode,
+            source_mtime,
+        } = &action.kind
+        else {
+            return Err("directory finalization received another action kind".to_string());
+        };
+        let target = project_content_target(logical_path, binding)?;
+        validate_target_for_logical(&target, logical_path, binding)?;
+        if inspect_project_directory_target(&target)?.is_none() {
+            return Err("project directory disappeared before finalization".to_string());
+        }
+        set_path_mode(&target, *mode)?;
+        set_path_mtime_best_effort(&target, *source_mtime);
+        Ok(receipt_for(
+            action,
+            ActionStatus::Applied,
+            applied_at,
+            Some(logical_path.clone()),
+            action.source_sha256.clone(),
+            None,
+        ))
+    }
+
+    fn apply_project_file_deletion(
+        &self,
+        binding: &ProjectBinding,
+        action: &RestoreAction,
+        plan_backup: &Path,
+        applied_at: u64,
+        backups: &mut Vec<BackupRecord>,
+    ) -> Result<ApplyReceipt, String> {
+        let RestoreActionKind::DeleteProjectFile {
+            logical_path,
+            last_sha256,
+        } = &action.kind
+        else {
+            return Err("file deletion received another action kind".to_string());
+        };
+        let target = project_content_target(logical_path, binding)?;
+        if action.target_path.as_deref() != Some(path_text(&target)?.as_str()) {
+            return Err("project-file deletion target differs from the plan".to_string());
+        }
+        validate_target_for_logical(&target, logical_path, binding)?;
+        let before = inspect_restore_target(&target)?;
+        let Some(bytes) = before.bytes else {
+            return Ok(receipt_for(
+                action,
+                ActionStatus::Applied,
+                applied_at,
+                Some(logical_path.clone()),
+                None,
+                None,
+            ));
+        };
+        if before.digest.as_deref() != Some(last_sha256.as_str())
+            || action.expected_target_sha256.as_deref() != Some(last_sha256.as_str())
+        {
+            return Err("local project file changed; deletion was blocked".to_string());
+        }
+        if action
+            .expected_target_mode
+            .zip(before.mode)
+            .is_some_and(|(expected, actual)| expected != actual)
+        {
+            return Err("local project file mode changed; deletion was blocked".to_string());
+        }
+        let backup_path = plan_backup.join(format!("{}.delete.bak", action.action_id.as_str()));
+        write_immutable_backup(&backup_path, &bytes)?;
+        if sha256(
+            &fs::read(&backup_path)
+                .map_err(|error| format!("verify deletion backup: {}", error))?,
+        ) != *last_sha256
+        {
+            return Err("project-file deletion backup failed verification".to_string());
+        }
+        backups.push(BackupRecord {
+            action_id: action.action_id.clone(),
+            target_path: path_text(&target)?,
+            backup_path: path_text(&backup_path)?,
+            sha256: last_sha256.clone(),
+        });
+        fs::remove_file(&target)
+            .map_err(|error| format!("delete project file '{}': {}", target.display(), error))?;
+        Ok(receipt_for(
+            action,
+            ActionStatus::Applied,
+            applied_at,
+            Some(logical_path.clone()),
+            None,
+            None,
+        ))
+    }
+
+    fn apply_project_directory_deletion(
+        &self,
+        binding: &ProjectBinding,
+        action: &RestoreAction,
+        applied_at: u64,
+    ) -> Result<ApplyReceipt, String> {
+        let RestoreActionKind::DeleteProjectDirectory { logical_path } = &action.kind else {
+            return Err("directory deletion received another action kind".to_string());
+        };
+        let target = project_content_target(logical_path, binding)?;
+        if action.target_path.as_deref() != Some(path_text(&target)?.as_str()) {
+            return Err("project-directory deletion target differs from the plan".to_string());
+        }
+        validate_target_for_logical(&target, logical_path, binding)?;
+        let Some(actual_mode) = inspect_project_directory_target(&target)? else {
+            return Ok(receipt_for(
+                action,
+                ActionStatus::Applied,
+                applied_at,
+                Some(logical_path.clone()),
+                None,
+                None,
+            ));
+        };
+        if action
+            .expected_target_mode
+            .is_some_and(|expected| expected != actual_mode)
+        {
+            return Err("local project directory mode changed; deletion was blocked".to_string());
+        }
+        if fs::read_dir(&target)
+            .map_err(|error| format!("read project directory '{}': {}", target.display(), error))?
+            .next()
+            .is_some()
+        {
+            return Err(
+                "project directory is not empty; recursive deletion is forbidden".to_string(),
+            );
+        }
+        fs::remove_dir(&target).map_err(|error| {
+            format!(
+                "delete empty project directory '{}': {}",
+                target.display(),
+                error
+            )
+        })?;
+        Ok(receipt_for(
+            action,
+            ActionStatus::Applied,
+            applied_at,
+            Some(logical_path.clone()),
+            None,
+            None,
+        ))
     }
 
     fn logical_path_for_review_action(
@@ -4344,7 +5025,22 @@ impl<S: BundleObjectStore> BundleEngine<S> {
             (Some(expected), Some(actual)) if expected == actual => {}
             _ => return Err("restore target changed after planning".to_string()),
         }
+        if action.expected_target_mode != before.mode
+            && matches!(action.kind, RestoreActionKind::WriteProjectFile { .. })
+        {
+            return Err("project-file mode changed after planning".to_string());
+        }
         if before.digest.as_deref() == Some(materialized_sha256.as_str()) {
+            if let RestoreActionKind::WriteProjectFile {
+                mode, source_mtime, ..
+            } = &action.kind
+            {
+                if (entry.mode.unwrap_or(0o600) & 0o777) != (*mode & 0o777) {
+                    return Err("project-file metadata changed after planning".to_string());
+                }
+                set_path_mode(&target, *mode)?;
+                set_path_mtime_best_effort(&target, *source_mtime);
+            }
             return Ok(receipt_for(
                 action,
                 ActionStatus::Applied,
@@ -4380,6 +5076,16 @@ impl<S: BundleObjectStore> BundleEngine<S> {
             materialized_bytes
         };
         write_target_atomic(&target, &write_bytes, entry.mode.unwrap_or(0o600))?;
+        if let RestoreActionKind::WriteProjectFile {
+            mode, source_mtime, ..
+        } = &action.kind
+        {
+            if (entry.mode.unwrap_or(0o600) & 0o777) != (*mode & 0o777) {
+                return Err("project-file metadata changed after planning".to_string());
+            }
+            set_path_mode(&target, *mode)?;
+            set_path_mtime_best_effort(&target, *source_mtime);
+        }
         let after = sha256(&write_bytes);
         Ok(receipt_for(
             action,

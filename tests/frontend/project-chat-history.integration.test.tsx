@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
+import Icon from "../../src/components/Icons";
 import ProjectChatHistoryPage, {
   ProjectChatHistoryContent,
   ThreadMetrics,
@@ -68,6 +70,54 @@ const history = {
   }],
 };
 
+test("sync tooltip hover keeps the sibling icon rail geometry stable", () => {
+  const css = readFileSync("src/App.css", "utf8");
+  const titleRule = css.match(/\.v3-history-thread-title\s*\{[^}]+\}/s)?.[0] ?? "";
+  const tooltipRule = css.match(/\.v3-thread-sync-indicator::after,[\s\S]+?\n\}/)?.[0] ?? "";
+
+  assert.match(titleRule, /align-items:\s*center/);
+  assert.doesNotMatch(tooltipRule, /transform:/);
+  assert.doesNotMatch(
+    css,
+    /\.v3-thread-sync-indicator:hover,\s*\n\.v3-thread-sync-indicator:focus-visible,\s*\n\.v3-thread-sync-error:hover/,
+  );
+});
+
+test("Push and Pull reviews use one stable workspace scroll region", () => {
+  const css = readFileSync("src/App.css", "utf8");
+  const workspaceRule = css.match(/\.v3-main\.v3-sync-review-page\s*\{[^}]+\}/s)?.[0] ?? "";
+  const reviewScrollRule = css.match(/\.v3-sync-review-page \.v3-sync-review-scroll\s*\{[^}]+\}/s)?.[0] ?? "";
+  const reviewSummaryRule = css.match(/\.v3-sync-review-summary\s*\{[^}]+\}/s)?.[0] ?? "";
+  const workspaceSource = readFileSync("src/components/project-sync/ProjectLinksWorkspace.tsx", "utf8");
+
+  assert.match(workspaceRule, /overflow:\s*hidden/);
+  assert.match(reviewScrollRule, /max-height:\s*none/);
+  assert.match(reviewScrollRule, /overflow-y:\s*auto/);
+  assert.match(reviewSummaryRule, /margin:\s*0;/);
+  assert.match(workspaceSource, /v3-sync-review-page/);
+
+  const pullReviewHandler = workspaceSource.slice(
+    workspaceSource.indexOf("if (pullReviewOpen)"),
+    workspaceSource.indexOf("setStoragePickerProjectId(null)", workspaceSource.indexOf("if (pullReviewOpen)")),
+  );
+  const pushReviewHandler = workspaceSource.slice(
+    workspaceSource.indexOf("if (pushReviewOpen)"),
+    workspaceSource.indexOf("setStoragePickerProjectId(null)", workspaceSource.indexOf("if (pushReviewOpen)")),
+  );
+  assert.doesNotMatch(pullReviewHandler, /scrollIntoView/);
+  assert.doesNotMatch(pushReviewHandler, /scrollIntoView/);
+});
+
+test("the combined project header and Storage section share one divider", () => {
+  const css = readFileSync("src/App.css", "utf8");
+  const combinedHeadingRule = css.match(/\.v3-project-combined-page \.v3-combined-project-heading\s*\{[^}]+\}/s)?.[0] ?? "";
+  const storageGroupRule = css.match(/\.v3-project-combined-page \.project-storage-group\s*\{[^}]+\}/s)?.[0] ?? "";
+
+  assert.match(combinedHeadingRule, /margin-bottom:\s*0/);
+  assert.match(combinedHeadingRule, /border-bottom:\s*0/);
+  assert.match(storageGroupRule, /border-top:\s*1px/);
+});
+
 test("history requests share concurrent work but not completed results", async () => {
   const singleFlight = createSingleFlight();
   let starts = 0;
@@ -117,7 +167,6 @@ test("history content uses the local alias and renders commit/thread actions", (
       onBranchChange={() => undefined}
       onRefresh={() => undefined}
       onLoadMore={() => undefined}
-      onOpenSettings={() => undefined}
       onOpenCodex={() => undefined}
       onOpenTerminal={() => undefined}
       onToggleDetails={() => undefined}
@@ -197,7 +246,6 @@ test("chat history loads through its own control inside session details", () => 
       onBranchChange={() => undefined}
       onRefresh={() => undefined}
       onLoadMore={() => undefined}
-      onOpenSettings={() => undefined}
       onOpenCodex={() => undefined}
       onOpenTerminal={() => undefined}
       onToggleDetails={() => undefined}
@@ -213,7 +261,7 @@ test("chat history loads through its own control inside session details", () => 
   assert.match(html, /Nested conversation preview/);
 });
 
-test("embedded history follows project settings without repeating project controls", () => {
+test("embedded history follows the project workspace without repeating project controls", () => {
   const html = renderToStaticMarkup(
     <ProjectChatHistoryContent
       embedded
@@ -237,7 +285,6 @@ test("embedded history follows project settings without repeating project contro
       onBranchChange={() => undefined}
       onRefresh={() => undefined}
       onLoadMore={() => undefined}
-      onOpenSettings={() => undefined}
       onOpenCodex={() => undefined}
       onOpenTerminal={() => undefined}
     />,
@@ -277,7 +324,6 @@ test("embedded non-Git history uses one Codex threads heading", () => {
       onBranchChange={() => undefined}
       onRefresh={() => undefined}
       onLoadMore={() => undefined}
-      onOpenSettings={() => undefined}
       onOpenCodex={() => undefined}
       onOpenTerminal={() => undefined}
     />,
@@ -355,7 +401,6 @@ test("selected storage adds directional indicators and storage-only threads", ()
       onBranchChange={() => undefined}
       onRefresh={() => undefined}
       onLoadMore={() => undefined}
-      onOpenSettings={() => undefined}
       onOpenCodex={() => undefined}
       onOpenTerminal={() => undefined}
     />,
@@ -369,6 +414,14 @@ test("selected storage adds directional indicators and storage-only threads", ()
   assert.match(html, /aria-label="Only in Local storage 1\. Pull to download it here\."/);
   assert.match(html, /Stored thread 019f7798/);
   assert.match(html, /aria-label="2 threads"/);
+  assert.ok(
+    html.indexOf('aria-label="Newer on this computer. Push to update Local storage 1."')
+      < html.indexOf("Add Git history mapping"),
+  );
+  assert.ok(
+    html.indexOf('aria-label="Only in Local storage 1. Pull to download it here."')
+      < html.indexOf("Stored thread 019f7798"),
+  );
 });
 
 test("non-Git history renders a flat Codex thread list", () => {
@@ -394,7 +447,6 @@ test("non-Git history renders a flat Codex thread list", () => {
       onBranchChange={() => undefined}
       onRefresh={() => undefined}
       onLoadMore={() => undefined}
-      onOpenSettings={() => undefined}
       onOpenCodex={() => undefined}
       onOpenTerminal={() => undefined}
     />,
@@ -410,7 +462,7 @@ test("non-Git history renders a flat Codex thread list", () => {
   assert.doesNotMatch(html, /Branch/);
 });
 
-test("an invalid persisted Codex profile offers Project Settings recovery", () => {
+test("an invalid persisted Codex profile stays in the project workspace", () => {
   const html = renderToStaticMarkup(
     <ProjectChatHistoryContent
       project={project}
@@ -428,18 +480,24 @@ test("an invalid persisted Codex profile offers Project Settings recovery", () =
       history={null}
       loading={false}
       loadingMore={false}
-      actionError="Codex profile path changed; open Project Settings"
+      actionError="Codex profile path changed."
       actionBusyThreadId={null}
       onBranchChange={() => undefined}
       onRefresh={() => undefined}
       onLoadMore={() => undefined}
-      onOpenSettings={() => undefined}
       onOpenCodex={() => undefined}
       onOpenTerminal={() => undefined}
     />,
   );
   assert.match(html, /role="alert"/);
-  assert.match(html, /Open Project Settings/);
+  assert.doesNotMatch(html, /Open Project Settings|Project settings/);
+});
+
+test("the Git project icon uses a hollow folder with a centered branch", () => {
+  const html = renderToStaticMarkup(<Icon name="git-folder" size={16} />);
+  assert.match(html, /icon-git-folder-mark/);
+  assert.match(html, /cx="9" cy="9"/);
+  assert.doesNotMatch(html, /d="M3 10h18"/);
 });
 
 test("completed projects use their main row for history and only mark Git repositories", () => {
@@ -472,7 +530,6 @@ test("completed projects use their main row for history and only mark Git reposi
       activityOpen={false}
       unreadLogs={0}
       onSelectProject={() => undefined}
-      onConfigureProject={() => undefined}
       onRemoveProject={() => undefined}
       onSelectDraft={() => undefined}
       onDiscardDraft={() => undefined}
@@ -488,15 +545,72 @@ test("completed projects use their main row for history and only mark Git reposi
   assert.match(html, /src="\/mallard-logo\.svg"/);
   assert.doesNotMatch(html, /mallard-logo\.png/);
   assert.doesNotMatch(html, /aria-label="View history for Mallard local"/);
-  assert.equal(html.match(/v3-repository-kind/g)?.length, 1);
-  assert.match(html, /title="Git repository"/);
-  assert.match(html, /git<\/span>/);
+  assert.equal(html.match(/v3-project-git-icon/g)?.length, 1);
+  assert.equal(html.match(/icon-git-folder-mark/g)?.length, 1);
+  assert.equal(html.match(/v3-project-folder-icon/g)?.length, 1);
+  assert.match(html, /aria-label="Mallard local, Git repository"/);
+  assert.doesNotMatch(html, /v3-repository-kind|>git<\/span>/);
   assert.doesNotMatch(html, /Default Codex|myconf3 · Codex/);
   assert.match(html, /role="separator" aria-label="Resize Projects and Storage sections" aria-orientation="horizontal"/);
   assert.match(html, /aria-valuenow="56"/);
   assert.doesNotMatch(html, /Git Based|Non-Git Based/);
-  assert.match(html, /Project settings for Mallard local/);
+  assert.doesNotMatch(html, /Project settings for Mallard local/);
   assert.doesNotMatch(html, /View history for draft repo/);
+});
+
+test("the sidebar locks project and storage navigation during a sync workflow", () => {
+  const html = renderToStaticMarkup(
+    <ProjectSidebar
+      projects={[project]}
+      drafts={[]}
+      activeDraftId={null}
+      storages={[{
+        id: "storage-1",
+        name: "Local storage 1",
+        kind: "local",
+        bucket: "",
+        access_key_id: "",
+        secret_access_key: "",
+        account_id: "",
+        s3_endpoint: "",
+        region: "",
+        local_dir: "/tmp/storage",
+        included_default_exclusions: [],
+      }]}
+      storageUsage={{ "storage-1": 1 }}
+      activeProjectId={project.local_project_id}
+      activeStorageId={null}
+      loading={false}
+      busy
+      activityOpen={false}
+      unreadLogs={0}
+      onSelectProject={() => undefined}
+      onRemoveProject={() => undefined}
+      onSelectDraft={() => undefined}
+      onDiscardDraft={() => undefined}
+      onToggleActivity={() => undefined}
+      onAddProject={() => undefined}
+      onRefresh={() => undefined}
+      onOpenStorage={() => undefined}
+      onRemoveStorage={() => undefined}
+      onAddStorage={() => undefined}
+      onOpenLegacy={() => undefined}
+    />,
+  );
+
+  const projectMarker = html.indexOf("<span>Mallard local</span>");
+  const projectButton = html.slice(html.lastIndexOf("<button", projectMarker), html.indexOf(">", html.lastIndexOf("<button", projectMarker)) + 1);
+  const storageMarker = html.indexOf("<span>Local storage 1</span>");
+  const storageButton = html.slice(html.lastIndexOf("<button", storageMarker), html.indexOf(">", html.lastIndexOf("<button", storageMarker)) + 1);
+  const legacyMarker = html.indexOf("Legacy profiles</button>");
+  const legacyButton = html.slice(html.lastIndexOf("<button", legacyMarker), html.indexOf(">", html.lastIndexOf("<button", legacyMarker)) + 1);
+  const addStorageMarker = html.indexOf('aria-label="Add storage"');
+  const addStorageButton = html.slice(html.lastIndexOf("<button", addStorageMarker), html.indexOf(">", addStorageMarker) + 1);
+
+  assert.match(projectButton, /disabled=""/);
+  assert.match(storageButton, /disabled=""/);
+  assert.match(legacyButton, /disabled=""/);
+  assert.match(addStorageButton, /disabled=""/);
 });
 
 void ProjectChatHistoryPage;

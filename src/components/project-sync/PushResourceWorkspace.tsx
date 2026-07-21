@@ -1,9 +1,40 @@
-import { useEffect } from "react";
-import type { ProjectResourceDescriptor } from "../../types";
+import { useEffect, useMemo, useState } from "react";
+import type {
+  CapabilityStatusReport,
+  LocalProjectSummary,
+  ProjectBinding,
+  ProjectContentInventory,
+  ProjectResourceDescriptor,
+  ThreadSyncComparison,
+} from "../../types";
 import Icon from "../Icons";
+import ProjectChatHistoryPage from "./ProjectChatHistoryPage";
+import ProjectFilesReviewPage, { type ProjectFileReviewRow } from "./ProjectFilesReviewPage";
 import ResourceInventory from "./ResourceInventory";
+import SkillsPluginStatusPage from "./SkillsPluginStatusPage";
+import SyncReviewTabs, {
+  type SyncReviewStep,
+  syncReviewSteps,
+  useSyncReviewScroll,
+} from "./SyncReviewTabs";
+import { categoryFor } from "./model";
 
 const EMPTY_STATUSES = new Map<string, string>();
+const STEP_LABELS: Record<SyncReviewStep, string> = {
+  history: "Git & sessions",
+  skills: "Skills",
+  plugins: "Plugins",
+  project_files: "Project files",
+  review: "Review",
+};
+const STORAGE_BLOCKING_STATES = new Set(["storage_only", "storage_ahead", "diverged"]);
+
+export interface PushReviewBlocker {
+  kind: "storage" | "local";
+  step: Exclude<SyncReviewStep, "review">;
+  resourceId: string;
+  state: string;
+}
 
 interface Props {
   resources: ProjectResourceDescriptor[];
@@ -11,11 +42,199 @@ interface Props {
   projectDefaults: Set<string>;
   busy: boolean;
   error: string | null;
+  project?: LocalProjectSummary;
+  binding?: ProjectBinding | null;
+  storageId?: string | null;
+  storageName?: string | null;
+  refreshEpoch?: number;
+  threadComparison?: ThreadSyncComparison | null;
+  capabilityReport?: CapabilityStatusReport | null;
+  projectContentInventory?: ProjectContentInventory | null;
+  projectContentScanned?: boolean;
+  projectContentLoading?: boolean;
+  projectContentRemovals?: ReadonlySet<string>;
+  acknowledgedWarningDigests?: ReadonlySet<string>;
+  showProjectFiles?: boolean;
+  initialStep?: SyncReviewStep;
+  activeStep?: SyncReviewStep;
+  onStepChange?: (step: SyncReviewStep) => void;
   onToggle: (resourceId: string) => void;
+  onSelectionChange?: (selected: Set<string>) => void;
+  onScanProjectFiles?: () => void;
+  onToggleProjectContentRemoval?: (resourceId: string) => void;
+  onToggleProjectContentWarning?: (warningDigest: string) => void;
   onUseProjectDefaults: () => void;
   onClear: () => void;
   onClose: () => void;
   onPush: () => void;
+  onPull?: () => void;
+}
+
+function countSelected(items: ProjectResourceDescriptor[], selected: ReadonlySet<string>): number {
+  return items.filter((item) => selected.has(item.resource_id)).length;
+}
+
+function groupForStep(step: SyncReviewStep, resources: ProjectResourceDescriptor[]): ProjectResourceDescriptor[] {
+  if (step === "history") return resources.filter((resource) => categoryFor(resource) === "conversations");
+  if (step === "skills") return resources.filter((resource) => categoryFor(resource) === "skills");
+  if (step === "plugins") return resources.filter((resource) => categoryFor(resource) === "plugins");
+  if (step === "project_files") return resources.filter((resource) => categoryFor(resource) === "project_files");
+  return resources;
+}
+
+export function nextPushReviewStep(
+  step: SyncReviewStep,
+  steps: readonly SyncReviewStep[] = syncReviewSteps(false),
+): SyncReviewStep {
+  const stepIndex = steps.indexOf(step);
+  return steps[Math.min(steps.length - 1, Math.max(0, stepIndex) + 1)];
+}
+
+function pushBlockerKind(
+  state: string,
+  storagePresent: boolean,
+  selected: boolean,
+): PushReviewBlocker["kind"] | null {
+  if (STORAGE_BLOCKING_STATES.has(state)) return "storage";
+  if (state === "unknown") {
+    return storagePresent ? "storage" : selected ? "local" : null;
+  }
+  if (state === "blocked") return selected ? "local" : null;
+  return null;
+}
+
+export function pushReviewBlockers(
+  selected: ReadonlySet<string>,
+  threadComparison?: ThreadSyncComparison | null,
+  capabilityReport?: CapabilityStatusReport | null,
+  projectContentInventory?: ProjectContentInventory | null,
+  acknowledgedWarningDigests: ReadonlySet<string> = new Set(),
+): PushReviewBlocker[] {
+  const blockers: PushReviewBlocker[] = [];
+  for (const entry of threadComparison?.entries ?? []) {
+    const kind = pushBlockerKind(entry.state, entry.storage_present, selected.has(entry.resource_id));
+    if (kind) blockers.push({ kind, step: "history", resourceId: entry.resource_id, state: entry.state });
+  }
+  for (const item of capabilityReport?.items ?? []) {
+    const kind = pushBlockerKind(item.state, item.storage_present, selected.has(item.resource_id));
+    if (kind) {
+      blockers.push({
+        kind,
+        step: item.kind === "plugin" ? "plugins" : "skills",
+        resourceId: item.resource_id,
+        state: item.state,
+      });
+    }
+  }
+  for (const entry of projectContentInventory?.entries ?? []) {
+    const selectedEntry = selected.has(entry.descriptor.resource_id);
+    const kind = pushBlockerKind(entry.state, entry.storage_present, selectedEntry);
+    if (kind) {
+      blockers.push({
+        kind,
+        step: "project_files",
+        resourceId: entry.descriptor.resource_id,
+        state: entry.state,
+      });
+      continue;
+    }
+    if (selectedEntry && entry.warning_digest && !acknowledgedWarningDigests.has(entry.warning_digest)) {
+      blockers.push({
+        kind: "local",
+        step: "project_files",
+        resourceId: entry.descriptor.resource_id,
+        state: "warning_unacknowledged",
+      });
+    }
+  }
+  return blockers;
+}
+
+export function pushReviewBlockingCount(
+  selected: ReadonlySet<string>,
+  threadComparison?: ThreadSyncComparison | null,
+  capabilityReport?: CapabilityStatusReport | null,
+  projectContentInventory?: ProjectContentInventory | null,
+  acknowledgedWarningDigests: ReadonlySet<string> = new Set(),
+): number {
+  return pushReviewBlockers(
+    selected,
+    threadComparison,
+    capabilityReport,
+    projectContentInventory,
+    acknowledgedWarningDigests,
+  ).length;
+}
+
+export function pushSelectableResourceIds(
+  resources: ProjectResourceDescriptor[],
+  threadComparison?: ThreadSyncComparison | null,
+  capabilityReport?: CapabilityStatusReport | null,
+  projectContentInventory?: ProjectContentInventory | null,
+): Set<string> {
+  const blockedIds = new Set<string>();
+  for (const entry of threadComparison?.entries ?? []) {
+    if ((entry.state as string) === "blocked") blockedIds.add(entry.resource_id);
+  }
+  for (const item of capabilityReport?.items ?? []) {
+    if (item.state === "blocked" || item.blocked_reason) blockedIds.add(item.resource_id);
+  }
+  for (const entry of projectContentInventory?.entries ?? []) {
+    if (entry.blocked_reason || STORAGE_BLOCKING_STATES.has(entry.state)) {
+      blockedIds.add(entry.descriptor.resource_id);
+    }
+  }
+  return new Set(resources
+    .filter((resource) => (
+      !resource.blocked_reason
+      && resource.apply_policy !== "never"
+      && !blockedIds.has(resource.resource_id)
+    ))
+    .map((resource) => resource.resource_id));
+}
+
+export function sanitizePushSelection(
+  selected: ReadonlySet<string>,
+  resources: ProjectResourceDescriptor[],
+  threadComparison?: ThreadSyncComparison | null,
+  capabilityReport?: CapabilityStatusReport | null,
+  projectContentInventory?: ProjectContentInventory | null,
+): Set<string> {
+  const selectableIds = pushSelectableResourceIds(
+    resources,
+    threadComparison,
+    capabilityReport,
+    projectContentInventory,
+  );
+  return new Set([...selected].filter((resourceId) => selectableIds.has(resourceId)));
+}
+
+export function requiredProjectContentDirectoryIds(
+  inventory: ProjectContentInventory | null | undefined,
+  selected: ReadonlySet<string>,
+): Set<string> {
+  const directoriesByPath = new Map((inventory?.entries ?? [])
+    .filter((entry) => entry.entry_type === "directory")
+    .map((entry) => [entry.relative_path, entry.descriptor.resource_id]));
+  const required = new Set<string>();
+  for (const entry of inventory?.entries ?? []) {
+    if (!selected.has(entry.descriptor.resource_id) || entry.entry_type !== "file") continue;
+    const parts = entry.relative_path.split("/");
+    for (let end = 1; end < parts.length; end += 1) {
+      const resourceId = directoriesByPath.get(parts.slice(0, end).join("/"));
+      if (resourceId) required.add(resourceId);
+    }
+  }
+  return required;
+}
+
+export function includeRequiredProjectContentDirectories(
+  inventory: ProjectContentInventory | null | undefined,
+  selected: ReadonlySet<string>,
+): Set<string> {
+  const next = new Set(selected);
+  requiredProjectContentDirectoryIds(inventory, next).forEach((resourceId) => next.add(resourceId));
+  return next;
 }
 
 export default function PushResourceWorkspace({
@@ -24,12 +243,43 @@ export default function PushResourceWorkspace({
   projectDefaults,
   busy,
   error,
+  project,
+  binding = null,
+  storageId = null,
+  storageName = "storage",
+  refreshEpoch = 0,
+  threadComparison,
+  capabilityReport,
+  projectContentInventory = null,
+  projectContentScanned = false,
+  projectContentLoading = false,
+  projectContentRemovals = new Set(),
+  acknowledgedWarningDigests = new Set(),
+  showProjectFiles = false,
+  initialStep = "history",
+  activeStep: controlledActiveStep,
+  onStepChange,
   onToggle,
+  onSelectionChange,
+  onScanProjectFiles,
+  onToggleProjectContentRemoval,
+  onToggleProjectContentWarning,
   onUseProjectDefaults,
   onClear,
   onClose,
   onPush,
+  onPull,
 }: Props) {
+  const steps = useMemo(() => syncReviewSteps(showProjectFiles), [showProjectFiles]);
+  const [uncontrolledActiveStep, setUncontrolledActiveStep] = useState<SyncReviewStep>(initialStep);
+  const requestedActiveStep = controlledActiveStep ?? uncontrolledActiveStep;
+  const activeStep = steps.includes(requestedActiveStep) ? requestedActiveStep : "review";
+  const { scrollRef, rememberScrollPosition } = useSyncReviewScroll(activeStep);
+  const selectStep = (step: SyncReviewStep) => {
+    if (controlledActiveStep === undefined) setUncontrolledActiveStep(step);
+    onStepChange?.(step);
+  };
+
   useEffect(() => {
     const closeOnEscape = (event: KeyboardEvent) => {
       if (event.key === "Escape" && !busy) onClose();
@@ -38,23 +288,196 @@ export default function PushResourceWorkspace({
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [busy, onClose]);
 
-  const selectedCount = selected.size;
+  const conversations = useMemo(
+    () => resources.filter((resource) => categoryFor(resource) === "conversations"),
+    [resources],
+  );
+  const sessionIndex = conversations.find((resource) => resource.resource_id === "codex:session-index") ?? null;
+  const visibleConversations = conversations.filter((resource) => resource.resource_id !== sessionIndex?.resource_id);
+  const skills = useMemo(() => resources.filter((resource) => categoryFor(resource) === "skills"), [resources]);
+  const plugins = useMemo(() => resources.filter((resource) => categoryFor(resource) === "plugins"), [resources]);
+  const projectFiles = useMemo(
+    () => resources.filter((resource) => categoryFor(resource) === "project_files"),
+    [resources],
+  );
+  const other = useMemo(() => resources.filter((resource) => {
+    const category = categoryFor(resource);
+    return category === "project_setup" || category === "tools";
+  }), [resources]);
+  const selectableIds = useMemo(
+    () => pushSelectableResourceIds(resources, threadComparison, capabilityReport, projectContentInventory),
+    [capabilityReport, projectContentInventory, resources, threadComparison],
+  );
+  const effectiveSelected = useMemo(
+    () => new Set([...selected].filter((resourceId) => selectableIds.has(resourceId))),
+    [selectableIds, selected],
+  );
+  const safeProjectDefaults = useMemo(
+    () => new Set([...projectDefaults].filter((resourceId) => selectableIds.has(resourceId))),
+    [projectDefaults, selectableIds],
+  );
+
+  const counts = {
+    history: countSelected(visibleConversations, effectiveSelected),
+    skills: countSelected(skills, effectiveSelected),
+    plugins: countSelected(plugins, effectiveSelected),
+    project_files: countSelected(projectFiles, effectiveSelected),
+    review: effectiveSelected.size,
+  };
+  const blockers = pushReviewBlockers(
+    effectiveSelected,
+    threadComparison,
+    capabilityReport,
+    projectContentInventory,
+    acknowledgedWarningDigests,
+  );
+  const blockingCount = blockers.length;
+  const storageBlockingCount = blockers.filter((blocker) => blocker.kind === "storage").length;
+  const localBlockingCount = blockingCount - storageBlockingCount;
+  const warningSteps = new Set<SyncReviewStep>();
+  blockers.forEach((blocker) => warningSteps.add(blocker.step));
+  if (blockingCount > 0) warningSteps.add("review");
+  const blockerTitle = storageBlockingCount > 0
+    ? localBlockingCount > 0 ? "Review before pushing" : "Pull before pushing"
+    : "Resolve selected resources";
+  const blockerDetail = [
+    storageBlockingCount > 0
+      ? `${storageBlockingCount} storage change${storageBlockingCount === 1 ? "" : "s"} need${storageBlockingCount === 1 ? "s" : ""} review.`
+      : null,
+    localBlockingCount > 0
+      ? `${localBlockingCount} selected local resource${localBlockingCount === 1 ? "" : "s"} cannot be captured. Exclude ${localBlockingCount === 1 ? "it" : "them"} or fix the local issue.`
+      : null,
+  ].filter((message): message is string => Boolean(message)).join(" ");
+  const blockerFooter = [
+    storageBlockingCount > 0
+      ? `${storageBlockingCount} storage change${storageBlockingCount === 1 ? "" : "s"} need${storageBlockingCount === 1 ? "s" : ""} review`
+      : null,
+    localBlockingCount > 0
+      ? `${localBlockingCount} selected resource${localBlockingCount === 1 ? "" : "s"} need${localBlockingCount === 1 ? "s" : ""} attention`
+      : null,
+  ].filter((message): message is string => Boolean(message)).join(" · ");
+
+  const commitSelection = (next: Set<string>) => {
+    const safeNext = includeRequiredProjectContentDirectories(
+      projectContentInventory,
+      new Set([...next].filter((resourceId) => selectableIds.has(resourceId))),
+    );
+    if (onSelectionChange) {
+      onSelectionChange(safeNext);
+      return;
+    }
+    const ids = new Set([...selected, ...safeNext]);
+    ids.forEach((resourceId) => {
+      if (selected.has(resourceId) !== safeNext.has(resourceId)) onToggle(resourceId);
+    });
+  };
+  const toggleResource = (resourceId: string) => {
+    if (!selectableIds.has(resourceId)) return;
+    const next = new Set(effectiveSelected);
+    const requiredProjectDirectories = requiredProjectContentDirectoryIds(projectContentInventory, next);
+    if (requiredProjectDirectories.has(resourceId)) return;
+    if (next.has(resourceId)) next.delete(resourceId);
+    else next.add(resourceId);
+    if (conversations.some((resource) => resource.resource_id === resourceId) && sessionIndex) {
+      const selectedSessionCount = visibleConversations.filter((resource) => next.has(resource.resource_id)).length;
+      if (selectedSessionCount > 0) next.add(sessionIndex.resource_id);
+      else next.delete(sessionIndex.resource_id);
+    }
+    commitSelection(next);
+  };
+  const useRecommendedForStep = () => {
+    if (activeStep === "review") {
+      if (safeProjectDefaults.size === projectDefaults.size) onUseProjectDefaults();
+      else commitSelection(new Set(safeProjectDefaults));
+      return;
+    }
+    const group = groupForStep(activeStep, resources);
+    const next = new Set(effectiveSelected);
+    group.forEach((resource) => next.delete(resource.resource_id));
+    group.forEach((resource) => {
+      if (safeProjectDefaults.has(resource.resource_id)) next.add(resource.resource_id);
+    });
+    commitSelection(next);
+  };
+  const clearStep = () => {
+    if (activeStep === "review") {
+      onClear();
+      return;
+    }
+    const group = groupForStep(activeStep, resources);
+    const next = new Set(effectiveSelected);
+    group.forEach((resource) => {
+      const projectEntry = projectContentInventory?.entries.find((entry) => (
+        entry.descriptor.resource_id === resource.resource_id
+      ));
+      if (activeStep !== "project_files" || !projectEntry?.storage_present) {
+        next.delete(resource.resource_id);
+      }
+    });
+    commitSelection(next);
+  };
+  const stepIndex = steps.indexOf(activeStep);
+  const previousStep = steps[Math.max(0, stepIndex - 1)];
+  const nextStep = nextPushReviewStep(activeStep, steps);
+  const goBack = () => selectStep(previousStep);
+  const goNext = () => selectStep(nextStep);
+  const selectedCount = effectiveSelected.size;
+  const selectableConversationIds = new Set(visibleConversations
+    .filter((resource) => selectableIds.has(resource.resource_id))
+    .map((resource) => resource.resource_id));
+  const selectableSkillIds = new Set(skills
+    .filter((resource) => selectableIds.has(resource.resource_id))
+    .map((resource) => resource.resource_id));
+  const selectablePluginIds = new Set(plugins
+    .filter((resource) => selectableIds.has(resource.resource_id))
+    .map((resource) => resource.resource_id));
+  const requiredProjectDirectories = requiredProjectContentDirectoryIds(
+    projectContentInventory,
+    effectiveSelected,
+  );
+  const projectFileRows: ProjectFileReviewRow[] = (projectContentInventory?.entries ?? []).map((entry) => ({
+    resourceId: entry.descriptor.resource_id,
+    relativePath: entry.relative_path,
+    entryType: entry.entry_type,
+    state: entry.state,
+    size: entry.size,
+    mode: entry.mode,
+    sourceMtime: entry.source_mtime,
+    localPresent: entry.local_present,
+    storagePresent: entry.storage_present,
+    newlyDiscovered: entry.newly_discovered,
+    selectedAfterScan: entry.selected_after_scan,
+    blockedReason: entry.blocked_reason,
+    warningCode: entry.warning_code,
+    warningDigest: entry.warning_digest,
+  }));
+  const currentGroup = groupForStep(activeStep, resources);
+  const currentDefaults = currentGroup.filter((resource) => safeProjectDefaults.has(resource.resource_id));
+  const currentMatchesDefaults = activeStep === "review"
+    ? effectiveSelected.size === safeProjectDefaults.size
+      && [...effectiveSelected].every((resourceId) => safeProjectDefaults.has(resourceId))
+    : currentGroup.every((resource) => (
+      effectiveSelected.has(resource.resource_id) === safeProjectDefaults.has(resource.resource_id)
+    ));
 
   return (
-    <section className="v3-inline-action-review v3-inline-push-review" aria-labelledby="v3-push-resource-title">
-      <header className="v3-inline-action-header v3-push-resource-header">
-        <h2 id="v3-push-resource-title">Push resources</h2>
+    <section className="v3-inline-action-review v3-inline-push-review v3-sync-review-workspace" aria-labelledby="v3-push-resource-title">
+      <header className="v3-inline-action-header v3-push-resource-header v3-sync-review-header">
+        <div className="v3-sync-review-title">
+          <h2 id="v3-push-resource-title">Push review</h2>
+          <span className="v3-sync-review-hint">Choose what to include</span>
+        </div>
         <div className="v3-push-resource-actions">
           <button
             type="button"
             className="btn btn-ghost"
-            onClick={onUseProjectDefaults}
-            disabled={busy || projectDefaults.size === 0}
-            title="Use project defaults"
+            onClick={useRecommendedForStep}
+            disabled={busy || safeProjectDefaults.size === 0 || currentMatchesDefaults}
+            title={`Use the recommended ${activeStep === "review" ? "selection" : `${activeStep} selection`}`}
           >
-            Defaults ({projectDefaults.size})
+            Recommended{activeStep === "review" ? ` (${safeProjectDefaults.size})` : ` (${currentDefaults.length})`}
           </button>
-          <button type="button" className="btn btn-ghost" onClick={onClear} disabled={busy || selectedCount === 0}>
+          <button type="button" className="btn btn-ghost" onClick={clearStep} disabled={busy || countSelected(currentGroup, effectiveSelected) === 0}>
             Clear
           </button>
         </div>
@@ -63,35 +486,181 @@ export default function PushResourceWorkspace({
           className="btn btn-ghost v3-inline-action-close"
           onClick={onClose}
           disabled={busy}
-          aria-label="Close push resources"
+          aria-label="Close push review"
         >
           <Icon name="x" size={15} />
         </button>
       </header>
 
-      <div className="v3-inline-action-content v3-push-resource-content">
-        <div className="v3-inline-action-scroll">
-          <ResourceInventory
-            resources={resources}
-            selected={selected}
-            statuses={EMPTY_STATUSES}
-            disabled={busy}
-            onToggle={onToggle}
-          />
+      <SyncReviewTabs
+        activeStep={activeStep}
+        counts={counts}
+        steps={steps}
+        warningSteps={warningSteps}
+        disabled={busy}
+        onChange={selectStep}
+      />
+
+      <div
+        id={`sync-review-${activeStep}-panel`}
+        className="v3-inline-action-content v3-push-resource-content v3-sync-review-content"
+        role="tabpanel"
+        aria-labelledby={`sync-review-${activeStep}-tab`}
+      >
+        <div
+          ref={scrollRef}
+          className="v3-inline-action-scroll v3-sync-review-scroll"
+          onScroll={rememberScrollPosition}
+        >
+          {activeStep === "history" && project && binding?.profile_ids?.codex ? (
+            <ProjectChatHistoryPage
+              embedded
+              project={project}
+              binding={binding}
+              refreshEpoch={refreshEpoch}
+              activeStorageId={storageId}
+              activeStorageName={storageName}
+              selectionMode="push"
+              selectedResourceIds={effectiveSelected}
+              selectableResourceIds={selectableConversationIds}
+              selectionDisabled={busy}
+              onToggleResource={toggleResource}
+              comparisonOverride={threadComparison}
+            />
+          ) : activeStep === "history" ? (
+            <ResourceInventory resources={conversations} selected={effectiveSelected} statuses={EMPTY_STATUSES} disabled={busy} onToggle={toggleResource} />
+          ) : null}
+
+          {(activeStep === "skills" || activeStep === "plugins") && project ? (
+            <SkillsPluginStatusPage
+              view={activeStep}
+              project={project}
+              binding={binding}
+              refreshEpoch={refreshEpoch}
+              activeStorageId={storageId}
+              activeStorageName={storageName}
+              onOpenProjectSettings={() => undefined}
+              selectionMode="push"
+              selectedResourceIds={effectiveSelected}
+              selectableResourceIds={activeStep === "skills" ? selectableSkillIds : selectablePluginIds}
+              selectionDisabled={busy}
+              onToggleResource={toggleResource}
+              reportOverride={capabilityReport}
+            />
+          ) : activeStep === "skills" ? (
+            <ResourceInventory resources={skills} selected={effectiveSelected} statuses={EMPTY_STATUSES} disabled={busy} onToggle={toggleResource} />
+          ) : activeStep === "plugins" ? (
+            <ResourceInventory resources={plugins} selected={effectiveSelected} statuses={EMPTY_STATUSES} disabled={busy} onToggle={toggleResource} />
+          ) : null}
+
+          {activeStep === "project_files" && (
+            <ProjectFilesReviewPage
+              mode="push"
+              eligibility={projectContentInventory?.eligibility ?? {
+                state: project?.is_git_repository ? "git_managed" : "eligible",
+                reason: project?.is_git_repository
+                  ? "Git manages files in this project folder."
+                  : "This project folder is not inside a Git work tree.",
+              }}
+              rows={projectFileRows}
+              selectedIds={effectiveSelected}
+              requiredIds={requiredProjectDirectories}
+              removalIds={projectContentRemovals}
+              acknowledgedWarningDigests={acknowledgedWarningDigests}
+              scanned={projectContentScanned}
+              loading={projectContentLoading}
+              ignoredCount={projectContentInventory?.ignored_count}
+              blockedCount={projectContentInventory?.blocked_count}
+              warnings={projectContentInventory?.warnings}
+              disabled={busy}
+              onScan={onScanProjectFiles}
+              onToggle={toggleResource}
+              onBulkToggle={(resourceIds, shouldSelect) => {
+                const next = new Set(effectiveSelected);
+                resourceIds.forEach((resourceId) => {
+                  if (shouldSelect) next.add(resourceId);
+                  else if (!requiredProjectDirectories.has(resourceId)) next.delete(resourceId);
+                });
+                commitSelection(next);
+              }}
+              onToggleRemoval={onToggleProjectContentRemoval}
+              onToggleWarning={onToggleProjectContentWarning}
+              onReviewPull={onPull}
+            />
+          )}
+
+          {activeStep === "review" && (
+            <div className="v3-sync-review-summary">
+              <button type="button" onClick={() => selectStep("history")}>
+                <span><Icon name="git-branch" size={15} /><strong>Sessions</strong></span>
+                <span>{counts.history} included<Icon name="chevron-right" size={13} /></span>
+              </button>
+              <button type="button" onClick={() => selectStep("skills")}>
+                <span><Icon name="folder" size={15} /><strong>Skills</strong></span>
+                <span>{counts.skills} included<Icon name="chevron-right" size={13} /></span>
+              </button>
+              <button type="button" onClick={() => selectStep("plugins")}>
+                <span><Icon name="link" size={15} /><strong>Plugins</strong></span>
+                <span>{counts.plugins} included<Icon name="chevron-right" size={13} /></span>
+              </button>
+              {showProjectFiles && (
+                <button type="button" onClick={() => selectStep("project_files")}>
+                  <span><Icon name="file" size={15} /><strong>Project files</strong></span>
+                  <span>
+                    {counts.project_files} included
+                    {projectContentRemovals.size > 0 ? ` · ${projectContentRemovals.size} removal${projectContentRemovals.size === 1 ? "" : "s"}` : ""}
+                    <Icon name="chevron-right" size={13} />
+                  </span>
+                </button>
+              )}
+              <details className="v3-sync-review-other">
+                <summary>
+                  <span><Icon name="settings" size={15} /><strong>Agent setup & tools</strong></span>
+                  <span>{countSelected(other, effectiveSelected)} included<Icon name="chevron-right" size={13} /></span>
+                </summary>
+                <ResourceInventory resources={other} selected={effectiveSelected} statuses={EMPTY_STATUSES} disabled={busy} onToggle={toggleResource} />
+              </details>
+              {sessionIndex && effectiveSelected.has(sessionIndex.resource_id) && (
+                <p className="v3-sync-review-derived"><Icon name="check-circle" size={13} />The project session index is included automatically.</p>
+              )}
+              {blockingCount > 0 && (
+                <div className="v3-callout v3-sync-review-blocker" role="alert">
+                  <Icon name="alert-triangle" size={15} />
+                  <span><strong>{blockerTitle}</strong>{blockerDetail}</span>
+                  {storageBlockingCount > 0 && onPull && <button type="button" className="btn btn-ghost" onClick={onPull} disabled={busy}>Review Pull</button>}
+                </div>
+              )}
+            </div>
+          )}
         </div>
 
         {error && <div className="v3-callout error v3-pull-error"><Icon name="alert-triangle" size={15} /> {error}</div>}
       </div>
 
-      <footer className="v3-inline-action-footer v3-push-resource-footer">
-        <button type="button" className="btn btn-primary v3-pull-apply-button" onClick={onPush} disabled={busy}>
-          <Icon name={busy ? "refresh" : "upload"} size={16} className={busy ? "icon-spin" : undefined} />
-          {busy
-            ? "Pushing…"
-            : selectedCount === 0
-              ? "Push empty"
+      <footer className="v3-inline-action-footer v3-push-resource-footer v3-sync-review-footer">
+        <span>
+          <strong>{selectedCount} included</strong>
+          <small>{blockingCount > 0 ? blockerFooter : "Selections are saved after Push succeeds."}</small>
+        </span>
+        {stepIndex > 0 && (
+          <button type="button" className="btn btn-ghost" onClick={goBack} disabled={busy}>
+            <Icon name="chevron-left" size={14} />
+            Back: {STEP_LABELS[previousStep]}
+          </button>
+        )}
+        {activeStep !== "review" ? (
+          <button type="button" className="btn btn-primary" onClick={goNext} disabled={busy}>
+            Next: {STEP_LABELS[nextStep]}
+            <Icon name="chevron-right" size={14} />
+          </button>
+        ) : (
+          <button type="button" className="btn btn-primary v3-pull-apply-button" onClick={onPush} disabled={busy || (selectedCount === 0 && projectContentRemovals.size === 0) || blockingCount > 0}>
+            <Icon name={busy ? "refresh" : "upload"} size={16} className={busy ? "icon-spin" : undefined} />
+            {busy ? "Pushing…" : projectContentRemovals.size > 0
+              ? `Push ${selectedCount} resource${selectedCount === 1 ? "" : "s"} · ${projectContentRemovals.size} removal${projectContentRemovals.size === 1 ? "" : "s"}`
               : `Push ${selectedCount} resource${selectedCount === 1 ? "" : "s"}`}
-        </button>
+          </button>
+        )}
       </footer>
     </section>
   );

@@ -10,6 +10,7 @@ import type {
   BundleReadiness,
   BundleRecipe,
   BundleSnapshotSummary,
+  CapabilityStatusReport,
   CodexConversationPathAudit,
   CodexConversationPathRepairResult,
   ConnectProjectBundleRequest,
@@ -22,6 +23,7 @@ import type {
   ProjectChatHistory,
   ProjectDiscovery,
   ProjectDetail,
+  ProjectContentInventory,
   ProjectOperationResult,
   ProjectProvider,
   ProjectSetupDraft,
@@ -153,11 +155,33 @@ export const projectSyncApi = {
   getStatus: (localProjectId: string, storageId: string) =>
     invoke<ResourceStatusReport>("get_bundle_status", { localProjectId, storageId }),
 
+  getCapabilityStatus: (localProjectId: string, storageId?: string | null) =>
+    invoke<CapabilityStatusReport>("get_project_capability_status", {
+      localProjectId,
+      storageId: storageId ?? null,
+    }),
+
   getThreadSyncComparison: (localProjectId: string, storageId: string) =>
     invoke<ThreadSyncComparison>("get_project_thread_sync_comparison", { localProjectId, storageId }),
 
-  pushBundle: (localProjectId: string, storageId: string, recipe: BundleRecipe) =>
-    invoke<ProjectOperationResult>("push_bundle", { localProjectId, storageId, recipe }),
+  inspectProjectFiles: (localProjectId: string, storageId: string) =>
+    invoke<ProjectContentInventory>("inspect_project_files", { localProjectId, storageId }),
+
+  pushBundle: (
+    localProjectId: string,
+    storageId: string,
+    recipe: BundleRecipe,
+    projectContentReviewToken?: string | null,
+    projectContentRemovalIds: string[] = [],
+    acknowledgedWarningDigests: string[] = [],
+  ) => invoke<ProjectOperationResult>("push_bundle", {
+    localProjectId,
+    storageId,
+    recipe,
+    projectContentReviewToken: projectContentReviewToken ?? null,
+    projectContentRemovalIds,
+    acknowledgedWarningDigests,
+  }),
 
   getBinding: (localProjectId: string) =>
     invoke<ProjectBinding | null>("get_project_binding", { localProjectId }),

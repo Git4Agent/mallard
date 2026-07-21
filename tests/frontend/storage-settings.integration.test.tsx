@@ -91,6 +91,20 @@ test("cloud storage editor exposes the guided R2 form instead of generic S3 fiel
   assert.doesNotMatch(html, />Region</);
 });
 
+test("local storage keeps browse and save actions in the path row", () => {
+  const html = renderToStaticMarkup(
+    <StorageEditor
+      storage={{ ...r2Storage(), id: "storage-local", kind: "local", local_dir: "/tmp/storage" }}
+      disabled={false}
+      onChange={() => undefined}
+      primaryAction={<button type="button">Save storage</button>}
+    />,
+  );
+
+  assert.match(html, /<div><input[^>]*\/tmp\/storage[^>]*><button[^>]*>.*Browse…<\/button><button[^>]*>Save storage<\/button><\/div>/);
+  assert.doesNotMatch(html, /v3-storage-primary-action/);
+});
+
 test("repository rows keep metadata behind an icon disclosure", () => {
   const bundle: RemoteBundleSummary = {
     bundle_id: "440ed684dbb6034cf32c3bdf04a8f0ea",

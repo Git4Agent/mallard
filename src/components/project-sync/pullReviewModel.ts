@@ -7,7 +7,7 @@ import type {
 } from "../../types";
 import type { PullReviewSelection } from "./pullReviewFlow";
 
-type PullReviewCategory = "project_data" | "global_tool";
+type PullReviewCategory = "project_data" | "project_content" | "global_tool";
 type GlobalToolKind = "plugin" | "custom_skill" | "setup_item";
 
 export interface PullReviewItem {
@@ -19,6 +19,9 @@ export interface PullReviewItem {
   toolKind: GlobalToolKind | null;
   restoreActions: RestoreAction[];
   dependencyActions: DependencyAction[];
+  projectContentPath: string | null;
+  projectContentEntryType: "file" | "directory" | null;
+  projectContentOperation: "add" | "replace" | "create_directory" | "delete_file" | "delete_directory" | null;
 }
 
 const DEFERRED_RESTORE_KINDS = new Set(["install_plugin", "install_standalone_skill"]);
@@ -41,6 +44,9 @@ function restoreActionCopy(action: RestoreAction): {
   provider: ProjectProvider | null;
   category: PullReviewCategory;
   toolKind: GlobalToolKind | null;
+  projectContentPath?: string;
+  projectContentEntryType?: "file" | "directory";
+  projectContentOperation?: PullReviewItem["projectContentOperation"];
 } {
   const kind = action.kind.kind;
   const provider = "provider" in action.kind ? action.kind.provider : null;
@@ -80,6 +86,46 @@ function restoreActionCopy(action: RestoreAction): {
       provider,
       category: "project_data",
       toolKind: null,
+    };
+  }
+  if (kind === "write_project_file") {
+    const projectPath = action.kind.logical_path.replace(/^project\//, "");
+    return {
+      title: finalPathPart(projectPath),
+      detail: projectPath,
+      provider: null,
+      category: "project_content",
+      toolKind: null,
+      projectContentPath: projectPath,
+      projectContentEntryType: "file",
+      projectContentOperation: action.expected_target_sha256 ? "replace" : "add",
+    };
+  }
+  if (kind === "ensure_project_directory") {
+    const projectPath = action.kind.logical_path.replace(/^project\//, "");
+    return {
+      title: finalPathPart(projectPath),
+      detail: projectPath,
+      provider: null,
+      category: "project_content",
+      toolKind: null,
+      projectContentPath: projectPath,
+      projectContentEntryType: "directory",
+      projectContentOperation: "create_directory",
+    };
+  }
+  if (kind === "delete_project_file" || kind === "delete_project_directory") {
+    const projectPath = action.kind.logical_path.replace(/^project\//, "");
+    const isDirectory = kind === "delete_project_directory";
+    return {
+      title: finalPathPart(projectPath),
+      detail: projectPath,
+      provider: null,
+      category: "project_content",
+      toolKind: null,
+      projectContentPath: projectPath,
+      projectContentEntryType: isDirectory ? "directory" : "file",
+      projectContentOperation: isDirectory ? "delete_directory" : "delete_file",
     };
   }
   if (kind === "write_file" || kind === "merge_file") {
@@ -156,6 +202,9 @@ export function buildPullReviewItems(
       toolKind,
       restoreActions: [],
       dependencyActions: [],
+      projectContentPath: null,
+      projectContentEntryType: null,
+      projectContentOperation: null,
     };
     items.set(resourceId, item);
     return item;
@@ -172,6 +221,9 @@ export function buildPullReviewItems(
       copy.toolKind,
     );
     item.restoreActions.push(action);
+    if (copy.projectContentPath) item.projectContentPath = copy.projectContentPath;
+    if (copy.projectContentEntryType) item.projectContentEntryType = copy.projectContentEntryType;
+    if (copy.projectContentOperation) item.projectContentOperation = copy.projectContentOperation;
     if (copy.category === "global_tool") {
       item.title = copy.title;
       item.detail = copy.detail;
@@ -199,9 +251,44 @@ export function buildPullReviewItems(
   }
 
   return [...items.values()].sort((left, right) => {
-    if (left.category !== right.category) return left.category === "project_data" ? -1 : 1;
-    return left.title.localeCompare(right.title);
+    const categoryRank: Record<PullReviewCategory, number> = {
+      project_data: 0,
+      project_content: 1,
+      global_tool: 2,
+    };
+    if (left.category !== right.category) {
+      return categoryRank[left.category] - categoryRank[right.category];
+    }
+    return (left.projectContentPath ?? left.title).localeCompare(right.projectContentPath ?? right.title);
   });
+}
+
+export function requiredPullProjectDirectoryIds(
+  items: PullReviewItem[],
+  selected: ReadonlySet<string>,
+): Set<string> {
+  const directoriesByPath = new Map(items
+    .filter((item) => item.category === "project_content" && item.projectContentEntryType === "directory")
+    .map((item) => [item.projectContentPath, item.resourceId]));
+  const required = new Set<string>();
+  for (const item of items) {
+    if (!selected.has(item.resourceId) || item.category !== "project_content" || !item.projectContentPath) continue;
+    const parts = item.projectContentPath.split("/");
+    for (let end = 1; end < parts.length; end += 1) {
+      const resourceId = directoriesByPath.get(parts.slice(0, end).join("/"));
+      if (resourceId) required.add(resourceId);
+    }
+  }
+  return required;
+}
+
+export function includeRequiredPullProjectDirectories(
+  items: PullReviewItem[],
+  selected: ReadonlySet<string>,
+): Set<string> {
+  const next = new Set(selected);
+  requiredPullProjectDirectoryIds(items, next).forEach((resourceId) => next.add(resourceId));
+  return next;
 }
 
 export function restoreActionIds(item: PullReviewItem): string[] {
@@ -228,6 +315,7 @@ export function requiresApproval(item: PullReviewItem): boolean {
 }
 
 export function defaultSelected(item: PullReviewItem): boolean {
+  if (item.category === "project_content") return false;
   const actions = [
     ...item.restoreActions.filter((action) => !DEFERRED_RESTORE_KINDS.has(action.kind.kind)),
     ...item.dependencyActions,
@@ -240,6 +328,8 @@ export function itemKindLabel(item: PullReviewItem): string {
   if (item.toolKind === "custom_skill") return "Custom skill";
   if (item.toolKind === "setup_item") return "Setup item";
   if (item.restoreActions.some((action) => action.kind.kind === "materialize_conversation")) return "Conversation";
+  if (item.projectContentEntryType === "directory") return "Project folder";
+  if (item.projectContentEntryType === "file") return "Project file";
   if (item.restoreActions.some((action) => action.kind.kind === "write_file" || action.kind.kind === "merge_file")) return "File";
   return "Definition";
 }

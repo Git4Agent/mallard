@@ -133,14 +133,16 @@ test("a valid Pull plan renders an enabled non-modal Apply workspace while suppo
       failedResourceIds={new Set()}
       busy={false}
       error={null}
+      initialStep="review"
       onApply={() => undefined}
       onRefresh={() => undefined}
       onBack={() => undefined}
     />,
   );
   assert.match(html, /v3-pull-review-workspace/);
-  assert.match(html, /Project files/);
-  assert.doesNotMatch(html, />Tools</, "an empty tools group is omitted");
+  assert.match(html, />Git &amp; sessions</);
+  assert.match(html, />Review</);
+  assert.doesNotMatch(html, /Project files &amp; setup/, "an empty setup group is omitted");
   assert.doesNotMatch(html, /aria-modal/);
   assert.doesNotMatch(html, /v3-modal-backdrop/);
   const applyText = html.lastIndexOf("Apply 1 change");
@@ -245,6 +247,7 @@ test("restore and native dependency actions merge into one global-tool row per r
       failedResourceIds={new Set()}
       busy={false}
       error={null}
+      initialStep="review"
       onApply={() => undefined}
       onRefresh={() => undefined}
       onBack={() => undefined}
@@ -254,7 +257,9 @@ test("restore and native dependency actions merge into one global-tool row per r
   assert.doesNotMatch(html, /Install selected/);
   assert.doesNotMatch(html, /deferred to the native dependency runner/);
   assert.doesNotMatch(html, /Ready to restore|Preparing installer/);
-  assert.equal((html.match(/class="v3-pull-item(?: |")/g) ?? []).length, 2);
+  assert.match(html, /aria-label="Skills, 0 selected, needs attention/);
+  assert.match(html, /aria-label="Plugins, 0 selected, needs attention/);
+  assert.match(html, />Needs approval</);
 });
 
 test("skipping a required global tool cannot produce a ready Pull outcome", () => {
@@ -290,6 +295,7 @@ test("skipping a required global tool cannot produce a ready Pull outcome", () =
       failedResourceIds={new Set()}
       busy={false}
       error={null}
+      initialStep="review"
       onApply={() => undefined}
       onRefresh={() => undefined}
       onBack={() => undefined}

@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type ReactNode,
+} from "react";
 import type {
   BundlePage,
   CodexConversationPathAudit,
@@ -11,6 +18,7 @@ import type {
 } from "../../types";
 import Icon from "../Icons";
 import ProjectChatHistoryPage from "./ProjectChatHistoryPage";
+import SkillsPluginStatusPage from "./SkillsPluginStatusPage";
 import ConversationPathRepairNotice from "./ConversationPathRepairNotice";
 import { newStorage, storageConfigReady, StorageEditor } from "./StorageSettingsV3";
 import { projectSyncApi } from "./api";
@@ -25,17 +33,20 @@ import {
 } from "./model";
 
 type LinkKey = { projectId: string; storageId: string };
+export type ProjectWorkspaceTab = "history" | "skills" | "plugins";
+export type StorageReviewKind = "pull" | "push";
 type StorageEditorRequest =
   | { mode: "toggle"; storageId: string; requestId: number }
   | { mode: "create"; storageKind: "local" | "s3"; requestId: number }
   | { mode: "close"; requestId: number };
-type ProjectEditorRequest = { mode: "toggle" | "close"; projectId: string; requestId: number };
 type InlineStorageReview = {
-  kind: "pull" | "push";
+  kind: StorageReviewKind;
   projectId: string;
   storageId: string;
   content: ReactNode;
   onClose: () => void;
+  onContinue?: () => void;
+  continueDisabled?: boolean;
 };
 
 interface Props {
@@ -52,7 +63,6 @@ interface Props {
   conversationPathAudits: Record<string, CodexConversationPathAudit>;
   conversationPathAuditErrors: Record<string, string>;
   conversationPathAuditLoading: boolean;
-  onSelectProject: (projectId: string, storageId?: string | null) => Promise<void> | void;
   onSelectStorage: (projectId: string, storageId: string) => Promise<void> | void;
   onLinkStorage: (projectId: string, storageId: string) => Promise<void> | void;
   onUnlinkStorage: (projectId: string, storageId: string) => Promise<void> | void;
@@ -67,8 +77,6 @@ interface Props {
   storageEditorRequest?: StorageEditorRequest | null;
   onStorageEditorRequestHandled?: () => void;
   onStorageEditorChange?: (storageId: string | null) => void;
-  projectEditorRequest?: ProjectEditorRequest | null;
-  onProjectEditorRequestHandled?: () => void;
   newProjectSetup?: ReactNode;
   historyRefreshEpoch?: number;
   inlineStorageReview?: InlineStorageReview | null;
@@ -77,6 +85,93 @@ interface Props {
 function storageSubtitle(storage: StorageConfigV3): string {
   if (storage.kind === "local") return compactProjectPath(storage.local_dir || "Folder not configured");
   return storage.bucket || storage.s3_endpoint || "S3 storage not configured";
+}
+
+export function ProjectWorkspaceTabs({
+  activeTab,
+  isGitRepository,
+  onChange,
+}: {
+  activeTab: ProjectWorkspaceTab;
+  isGitRepository: boolean;
+  onChange: (tab: ProjectWorkspaceTab) => void;
+}) {
+  const tabOrder: ProjectWorkspaceTab[] = ["history", "skills", "plugins"];
+  const selectFromKeyboard = (
+    event: ReactKeyboardEvent<HTMLButtonElement>,
+    tab: ProjectWorkspaceTab,
+  ) => {
+    event.preventDefault();
+    const tabList = event.currentTarget.parentElement;
+    onChange(tab);
+    window.requestAnimationFrame(() => {
+      tabList
+        ?.querySelector<HTMLButtonElement>(`[data-project-tab="${tab}"]`)
+        ?.focus();
+    });
+  };
+  const handleKeyDown = (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+    const currentTab = event.currentTarget.dataset.projectTab as ProjectWorkspaceTab;
+    const currentIndex = tabOrder.indexOf(currentTab);
+    if (event.key === "Home") return selectFromKeyboard(event, tabOrder[0]);
+    if (event.key === "End") return selectFromKeyboard(event, tabOrder[tabOrder.length - 1]);
+    if (event.key === "ArrowLeft") {
+      return selectFromKeyboard(event, tabOrder[(currentIndex - 1 + tabOrder.length) % tabOrder.length]);
+    }
+    if (event.key === "ArrowRight") {
+      selectFromKeyboard(event, tabOrder[(currentIndex + 1) % tabOrder.length]);
+    }
+  };
+
+  return (
+    <div className="v3-project-tabs" role="tablist" aria-label="Project information">
+      <button
+        type="button"
+        id="project-history-tab"
+        data-project-tab="history"
+        role="tab"
+        aria-selected={activeTab === "history"}
+        aria-controls="project-history-panel"
+        tabIndex={activeTab === "history" ? 0 : -1}
+        className={activeTab === "history" ? "active" : undefined}
+        onClick={() => onChange("history")}
+        onKeyDown={handleKeyDown}
+      >
+        <Icon name={isGitRepository ? "git-branch" : "openai"} size={14} />
+        {isGitRepository ? "Git & sessions" : "Sessions"}
+      </button>
+      <button
+        type="button"
+        id="project-skills-tab"
+        data-project-tab="skills"
+        role="tab"
+        aria-selected={activeTab === "skills"}
+        aria-controls="project-skills-panel"
+        tabIndex={activeTab === "skills" ? 0 : -1}
+        className={activeTab === "skills" ? "active" : undefined}
+        onClick={() => onChange("skills")}
+        onKeyDown={handleKeyDown}
+      >
+        <Icon name="folder" size={14} />
+        Skills
+      </button>
+      <button
+        type="button"
+        id="project-plugins-tab"
+        data-project-tab="plugins"
+        role="tab"
+        aria-selected={activeTab === "plugins"}
+        aria-controls="project-plugins-panel"
+        tabIndex={activeTab === "plugins" ? 0 : -1}
+        className={activeTab === "plugins" ? "active" : undefined}
+        onClick={() => onChange("plugins")}
+        onKeyDown={handleKeyDown}
+      >
+        <Icon name="link" size={14} />
+        Plugins
+      </button>
+    </div>
+  );
 }
 
 export function StorageRepositoryRow({ bundle }: { bundle: RemoteBundleSummary }) {
@@ -139,6 +234,28 @@ export function conversationPathsBlockSync(
   return hasBinding && (auditLoading || !!auditError || !audit || !audit.ready);
 }
 
+export function projectPushActionLabel({
+  reviewOpen,
+  preparing,
+  publishing,
+}: {
+  reviewOpen: boolean;
+  preparing: boolean;
+  publishing: boolean;
+}): string {
+  if (publishing) return "Pushing…";
+  if (preparing) return "Preparing…";
+  if (reviewOpen) return "Continue push";
+  return "Push";
+}
+
+export function storageActionLockedForReview(
+  reviewKind: StorageReviewKind | null,
+  action: StorageReviewKind | "storage",
+): boolean {
+  return reviewKind !== null && (action === "storage" || action !== reviewKind);
+}
+
 export default function ProjectLinksWorkspace({
   projects,
   activeProjectId,
@@ -153,7 +270,6 @@ export default function ProjectLinksWorkspace({
   conversationPathAudits,
   conversationPathAuditErrors,
   conversationPathAuditLoading,
-  onSelectProject,
   onSelectStorage,
   onLinkStorage,
   onUnlinkStorage,
@@ -168,8 +284,6 @@ export default function ProjectLinksWorkspace({
   storageEditorRequest,
   onStorageEditorRequestHandled,
   onStorageEditorChange,
-  projectEditorRequest,
-  onProjectEditorRequestHandled,
   newProjectSetup,
   historyRefreshEpoch = 0,
   inlineStorageReview,
@@ -181,12 +295,14 @@ export default function ProjectLinksWorkspace({
   const [bundlePage, setBundlePage] = useState<BundlePage | null>(null);
   const [bundleLoading, setBundleLoading] = useState(false);
   const [bundleError, setBundleError] = useState<string | null>(null);
-  const [editingProjectId, setEditingProjectId] = useState<string | null>(null);
   const [renamingProjectId, setRenamingProjectId] = useState<string | null>(null);
   const [projectAliasDraft, setProjectAliasDraft] = useState("");
+  const [activeProjectTab, setActiveProjectTab] = useState<ProjectWorkspaceTab>("history");
+  const [storagePickerProjectId, setStoragePickerProjectId] = useState<string | null>(null);
   const bundleRequestRef = useRef(0);
   const storageSettingsRef = useRef<HTMLDivElement>(null);
-  const projectSettingsRef = useRef<HTMLDivElement>(null);
+  const storagePickerRef = useRef<HTMLDivElement>(null);
+  const storagePickerTriggerRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
     if (!editingStorage) return;
@@ -201,12 +317,34 @@ export default function ProjectLinksWorkspace({
   }, [editingStorage?.storageId, onStorageEditorChange]);
 
   useEffect(() => {
-    if (!editingProjectId) return;
-    const frame = window.requestAnimationFrame(() => {
-      projectSettingsRef.current?.scrollIntoView({ block: "start", behavior: "smooth" });
-    });
-    return () => window.cancelAnimationFrame(frame);
-  }, [editingProjectId]);
+    setStoragePickerProjectId(null);
+  }, [activeProjectId]);
+
+  useEffect(() => {
+    if (!inlineStorageReview) return;
+    setStoragePickerProjectId(null);
+    setLinkingProjectId(null);
+  }, [inlineStorageReview?.kind, inlineStorageReview?.projectId, inlineStorageReview?.storageId]);
+
+  useEffect(() => {
+    if (!storagePickerProjectId) return;
+    const handlePointerDown = (event: PointerEvent) => {
+      if (!storagePickerRef.current?.contains(event.target as Node)) {
+        setStoragePickerProjectId(null);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      setStoragePickerProjectId(null);
+      window.requestAnimationFrame(() => storagePickerTriggerRef.current?.focus());
+    };
+    document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [storagePickerProjectId]);
 
   const linkedByProject = useMemo(() => new Map(projects.map((project) => [
     project.local_project_id,
@@ -267,7 +405,6 @@ export default function ProjectLinksWorkspace({
     if (storageEditorRequest.mode === "create") {
       const storage = newStorage(storageEditorRequest.storageKind, storages.length + 1);
       bundleRequestRef.current += 1;
-      setEditingProjectId(null);
       setEditingStorage({ projectId: "", storageId: storage.id });
       setStorageDraft(storage);
       setBundlePage(null);
@@ -289,38 +426,11 @@ export default function ProjectLinksWorkspace({
       return;
     }
 
-    setEditingProjectId(null);
     setEditingStorage({ projectId: "", storageId: storage.id });
     setStorageDraft({ ...storage });
     void loadStorageBundles(storage.id);
     onStorageEditorRequestHandled?.();
   }, [storageEditorRequest?.requestId]);
-
-  useEffect(() => {
-    if (!projectEditorRequest) return;
-    if (projectEditorRequest.mode === "close") {
-      setEditingProjectId(null);
-      setRenamingProjectId(null);
-      onProjectEditorRequestHandled?.();
-      return;
-    }
-    const project = projects.find((candidate) => candidate.local_project_id === projectEditorRequest.projectId);
-    if (!project) return;
-    if (editingProjectId === project.local_project_id) {
-      setEditingProjectId(null);
-      setRenamingProjectId(null);
-      onProjectEditorRequestHandled?.();
-      return;
-    }
-    bundleRequestRef.current += 1;
-    setEditingStorage(null);
-    setStorageDraft(null);
-    setRenamingProjectId(null);
-    setEditingProjectId(project.local_project_id);
-    setProjectAliasDraft(project.local_alias ?? project.display_name);
-    void onSelectProject(project.local_project_id);
-    onProjectEditorRequestHandled?.();
-  }, [projectEditorRequest?.requestId]);
 
   const toggleStorageEditor = async (storage: StorageConfigV3) => {
     if (editingStorage?.storageId === storage.id) {
@@ -334,24 +444,8 @@ export default function ProjectLinksWorkspace({
     await loadStorageBundles(storage.id);
   };
 
-  const openProjectSettings = async (projectId: string) => {
-    const project = projects.find((candidate) => candidate.local_project_id === projectId);
-    if (!project) return;
-    bundleRequestRef.current += 1;
-    setEditingStorage(null);
-    setStorageDraft(null);
-    setRenamingProjectId(null);
-    setEditingProjectId(projectId);
-    setProjectAliasDraft(project.local_alias ?? project.display_name);
-    await onSelectProject(projectId);
-  };
-
-  const focusedProjectId = editingProjectId ?? inlineStorageReview?.projectId ?? null;
-  const settingsProject = focusedProjectId
-    ? projects.find((project) => project.local_project_id === focusedProjectId) ?? null
-    : null;
   const activeProject = projects.find((project) => project.local_project_id === activeProjectId) ?? null;
-  const workspaceProject = newProjectSetup ? null : settingsProject ?? activeProject;
+  const workspaceProject = newProjectSetup ? null : activeProject;
   const workspaceBinding = workspaceProject
     ? bindingByProject.get(workspaceProject.local_project_id)
     : undefined;
@@ -382,12 +476,6 @@ export default function ProjectLinksWorkspace({
     : null;
   const projectNameChanged = !!workspaceProject
     && proposedProjectAlias !== (workspaceProject.local_alias ?? null);
-
-  const closeProjectSettings = () => {
-    inlineStorageReview?.onClose();
-    setRenamingProjectId(null);
-    setEditingProjectId(null);
-  };
 
   const saveProjectName = async () => {
     if (!workspaceProject || !projectNameChanged) return;
@@ -427,28 +515,24 @@ export default function ProjectLinksWorkspace({
           </div>
 
           <div ref={storageSettingsRef} className="v3-storage-settings-below v3-storage-settings-dedicated">
-            <StorageEditor storage={storageDraft} disabled={busy} onChange={setStorageDraft} />
-
-            <div className="v3-inline-storage-save">
-              {!storageReady && (
-                <span>
-                  {storageDraft.kind === "local"
-                    ? "Choose a folder to continue."
-                    : "Enter the bucket, Account ID, and both R2 credentials to continue."}
-                </span>
+            <StorageEditor
+              storage={storageDraft}
+              disabled={busy}
+              onChange={setStorageDraft}
+              primaryAction={(
+                <button
+                  type="button"
+                  className="btn"
+                  disabled={busy || !storageReady || (!creatingStorage && JSON.stringify(storageDraft) === JSON.stringify(editedStorageConfig))}
+                  onClick={() => void run(`storage:${editedStorageConfig.id}`, async () => {
+                    await onSaveStorage(storageDraft);
+                    await loadStorageBundles(editedStorageConfig.id);
+                  })}
+                >
+                  {runningAction === `storage:${editedStorageConfig.id}` ? "Saving…" : creatingStorage ? "Create storage" : "Save storage"}
+                </button>
               )}
-              <button
-                type="button"
-                className="btn"
-                disabled={busy || !storageReady || (!creatingStorage && JSON.stringify(storageDraft) === JSON.stringify(editedStorageConfig))}
-                onClick={() => void run(`storage:${editedStorageConfig.id}`, async () => {
-                  await onSaveStorage(storageDraft);
-                  await loadStorageBundles(editedStorageConfig.id);
-                })}
-              >
-                {runningAction === `storage:${editedStorageConfig.id}` ? "Saving…" : creatingStorage ? "Create storage" : "Save storage"}
-              </button>
-            </div>
+            />
 
             {!creatingStorage && (
               <section className="v3-storage-repositories" aria-labelledby="storage-repositories-heading">
@@ -508,7 +592,7 @@ export default function ProjectLinksWorkspace({
   }
 
   return (
-    <main className={`v3-main v3-project-links-page${workspaceProject ? " v3-project-settings-page" : ""}${activeProject && !newProjectSetup ? " v3-project-combined-page" : ""}${settingsProject ? " v3-project-settings-expanded" : ""}${newProjectSetup ? " v3-project-setup-page" : ""}`}>
+    <main className={`v3-main v3-project-links-page${workspaceProject ? " v3-project-workspace-page v3-project-combined-page" : ""}${newProjectSetup ? " v3-project-setup-page" : ""}${inlineStorageReview ? " v3-sync-review-page" : ""}`}>
       <section
         className="profile-links-section"
         aria-label={newProjectSetup
@@ -594,7 +678,7 @@ export default function ProjectLinksWorkspace({
                         title={`Repository: ${workspaceProject.display_name}`}
                         aria-label={`Repository ${workspaceProject.display_name}`}
                       >
-                        <Icon name={workspaceProject.is_git_repository ? "git-branch" : "folder"} size={12} />
+                        <Icon name={workspaceProject.is_git_repository ? "git-folder" : "folder"} size={12} />
                         <span>{workspaceProject.display_name}</span>
                       </span>
                     )}
@@ -625,26 +709,7 @@ export default function ProjectLinksWorkspace({
                 </>
               )}
             </div>
-            {workspaceProject ? (
-              <button
-                type="button"
-                className={`btn btn-ghost v3-project-settings-toggle${settingsProject ? " active" : ""}`}
-                onClick={() => {
-                  if (settingsProject) {
-                    closeProjectSettings();
-                  } else {
-                    void openProjectSettings(workspaceProject.local_project_id);
-                  }
-                }}
-                disabled={busy}
-                aria-label={settingsProject ? "Hide project settings" : "Show project settings"}
-                title={settingsProject ? "Hide project settings" : "Show project settings"}
-                aria-expanded={!!settingsProject}
-                aria-controls="project-configuration-panel"
-              >
-                <Icon name="settings" size={15} />
-              </button>
-            ) : (
+            {!workspaceProject && (
               <div className="profile-links-heading-actions">
                 <div className="profile-links-counts">
                   {projects.length} projects <span>·</span> {storages.length} storage <span>·</span> {links.length} links
@@ -673,14 +738,17 @@ export default function ProjectLinksWorkspace({
               <Icon name="plus" size={15} /> Add project
             </button>
           </div>
-        ) : (!activeProject || settingsProject) ? (
-          <div
-            id={settingsProject ? "project-configuration-panel" : undefined}
-            ref={settingsProject ? projectSettingsRef : undefined}
-            className={`profile-links-list${settingsProject ? " v3-combined-settings-panel" : ""}`}
-          >
-            {(settingsProject ? [settingsProject] : projects).map((project) => {
+        ) : workspaceProject ? (
+          <div id="project-configuration-panel" className="profile-links-list v3-combined-settings-panel">
+            {[workspaceProject].map((project) => {
               const projectLinks = linkedByProject.get(project.local_project_id) ?? [];
+              const linkedStorages = projectLinks
+                .map((link) => storages.find((storage) => storage.id === link.storage_id))
+                .filter((storage): storage is StorageConfigV3 => !!storage);
+              const selectedStorage = linkedStorages.find((storage) => (
+                project.local_project_id === activeProjectId && storage.id === activeStorageId
+              )) ?? linkedStorages[0] ?? null;
+              const storagePickerOpen = storagePickerProjectId === project.local_project_id;
               const availableStorages = storages.filter((storage) => (
                 !projectLinks.some((link) => link.storage_id === storage.id)
               ));
@@ -766,9 +834,10 @@ export default function ProjectLinksWorkspace({
                             <button
                               type="button"
                               className={`profile-link-another${linkingProjectId === project.local_project_id ? " active" : ""}`}
-                              disabled={busy}
+                              disabled={busy || !!inlineStorageReview}
                               aria-expanded={linkingProjectId === project.local_project_id}
                               onClick={() => {
+                                setStoragePickerProjectId(null);
                                 setLinkingProjectId((current) => current === project.local_project_id ? null : project.local_project_id);
                               }}
                             >
@@ -779,8 +848,9 @@ export default function ProjectLinksWorkspace({
                           <button
                             type="button"
                             className="profile-link-another"
-                            disabled={busy}
+                            disabled={busy || !!inlineStorageReview}
                             onClick={() => {
+                              setStoragePickerProjectId(null);
                               setLinkingProjectId(null);
                               onOpenStorageSettings();
                             }}
@@ -793,42 +863,147 @@ export default function ProjectLinksWorkspace({
                     {projectLinks.length === 0 && <div className="profile-link-no-storage">No storage linked yet.</div>}
 
                     <div className="project-profile-storage-list">
-                    {projectLinks.map((link) => {
-                      const storage = storages.find((candidate) => candidate.id === link.storage_id);
-                      if (!storage) return null;
+                    {selectedStorage && (() => {
+                      const storage = selectedStorage;
                       const reviewOpen = inlineStorageReview?.projectId === project.local_project_id
                         && inlineStorageReview.storageId === storage.id;
                       const actionPrefix = `${project.local_project_id}:${storage.id}`;
-                      const selectedForComparison = project.local_project_id === activeProjectId
-                        && storage.id === activeStorageId;
+                      const reviewPanelId = `storage-review-${actionPrefix.replace(/[^a-z0-9_-]/gi, "-")}`;
+                      const activeReviewKind = reviewOpen ? inlineStorageReview?.kind ?? null : null;
+                      const pushReviewOpen = reviewOpen && inlineStorageReview?.kind === "push";
+                      const pullReviewOpen = reviewOpen && inlineStorageReview?.kind === "pull";
+                      const pushPreparing = runningAction === `push:${actionPrefix}`;
+                      const pushPublishing = pushReviewOpen && busy;
+                      const pushLabel = projectPushActionLabel({
+                        reviewOpen: pushReviewOpen,
+                        preparing: pushPreparing,
+                        publishing: pushPublishing,
+                      });
+                      const pushProgress = pushPreparing || pushPublishing;
+                      const storageControlsLocked = busy
+                        || !!runningAction
+                        || storageActionLockedForReview(activeReviewKind, "storage");
+                      const focusStorageOption = (position: "selected" | "first" | "last") => {
+                        window.requestAnimationFrame(() => {
+                          const options = Array.from(storagePickerRef.current?.querySelectorAll<HTMLButtonElement>(
+                            '[role="menuitemradio"]',
+                          ) ?? []);
+                          if (options.length === 0) return;
+                          if (position === "first") options[0]?.focus();
+                          else if (position === "last") options[options.length - 1]?.focus();
+                          else options.find((option) => option.getAttribute("aria-checked") === "true")?.focus();
+                        });
+                      };
 
                       return (
-                        <div key={storage.id} className={`storage-link-block${reviewOpen ? " v3-review-open" : ""}${selectedForComparison ? " selected" : ""}`}>
+                        <div
+                          key={storage.id}
+                          className={`storage-link-block selected${reviewOpen ? " v3-review-open" : ""}${storagePickerOpen ? " storage-picker-open" : ""}`}
+                          aria-busy={reviewOpen && busy}
+                        >
                           <div className="storage-link-row">
                             <div className="storage-link-storage-section">
-                              <label className="storage-link-main" title={`Compare threads with ${storage.name || "this storage"}`}>
-                                <input
-                                  className="storage-link-selector-input"
-                                  type="radio"
-                                  name={`comparison-storage-${project.local_project_id}`}
-                                  checked={selectedForComparison}
-                                  disabled={busy || !!runningAction}
-                                  onChange={() => void onSelectStorage(project.local_project_id, storage.id)}
-                                  aria-label={`Compare threads with ${storage.name || "this storage"}`}
-                                />
-                                <span className="storage-link-selector" aria-hidden="true"><span /></span>
+                              <div ref={storagePickerRef} className="storage-link-main">
+                                <span className="storage-link-selector active" aria-hidden="true"><span /></span>
                                 <span className="storage-link-icon">
                                   <Icon name={storage.kind === "local" ? "drive" : "cloud"} size={23} />
                                 </span>
                                 <span className="storage-link-copy">
-                                  <strong>{storage.name || "(unnamed)"}</strong>
+                                  {linkedStorages.length > 1 ? (
+                                    <span className={`storage-link-name-picker${storagePickerOpen ? " open" : ""}`}>
+                                      <button
+                                        ref={storagePickerTriggerRef}
+                                        type="button"
+                                        className="storage-link-name-trigger"
+                                        disabled={storageControlsLocked}
+                                        aria-haspopup="menu"
+                                        aria-expanded={storagePickerOpen}
+                                        aria-controls={`storage-picker-${project.local_project_id}`}
+                                        title="Choose the storage used to compare, pull, and push"
+                                        onClick={() => {
+                                          setLinkingProjectId(null);
+                                          setStoragePickerProjectId((current) => (
+                                            current === project.local_project_id ? null : project.local_project_id
+                                          ));
+                                        }}
+                                        onKeyDown={(event) => {
+                                          if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+                                          event.preventDefault();
+                                          setStoragePickerProjectId(project.local_project_id);
+                                          focusStorageOption(event.key === "ArrowDown" ? "selected" : "last");
+                                        }}
+                                        aria-label={`Active storage: ${storage.name || "unnamed"}. Choose another storage`}
+                                      >
+                                        <strong>{storage.name || "(unnamed)"}</strong>
+                                        <Icon name="chevron-down" size={12} aria-hidden="true" />
+                                      </button>
+                                    </span>
+                                  ) : (
+                                    <strong>{storage.name || "(unnamed)"}</strong>
+                                  )}
                                   <span title={storageSubtitle(storage)}>{storageSubtitle(storage)}</span>
                                 </span>
-                              </label>
+
+                                {linkedStorages.length > 1 && (
+                                  <div
+                                    id={`storage-picker-${project.local_project_id}`}
+                                    className="storage-link-menu"
+                                    role="menu"
+                                    aria-label="Choose active storage"
+                                    hidden={!storagePickerOpen}
+                                    onKeyDown={(event) => {
+                                      const options = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>(
+                                        '[role="menuitemradio"]',
+                                      ));
+                                      const currentIndex = options.indexOf(document.activeElement as HTMLButtonElement);
+                                      let nextIndex: number | null = null;
+                                      if (event.key === "ArrowDown") nextIndex = (currentIndex + 1) % options.length;
+                                      if (event.key === "ArrowUp") nextIndex = (currentIndex - 1 + options.length) % options.length;
+                                      if (event.key === "Home") nextIndex = 0;
+                                      if (event.key === "End") nextIndex = options.length - 1;
+                                      if (nextIndex === null || options.length === 0) return;
+                                      event.preventDefault();
+                                      options[nextIndex]?.focus();
+                                    }}
+                                  >
+                                    {linkedStorages.map((linkedStorage) => {
+                                      const isSelected = linkedStorage.id === storage.id;
+                                      return (
+                                        <button
+                                          key={linkedStorage.id}
+                                          type="button"
+                                          role="menuitemradio"
+                                          aria-checked={isSelected}
+                                          className={`storage-link-menu-option${isSelected ? " selected" : ""}`}
+                                          disabled={storageControlsLocked}
+                                          onClick={() => {
+                                            setStoragePickerProjectId(null);
+                                            if (!isSelected) {
+                                              if (reviewOpen) inlineStorageReview?.onClose();
+                                              void onSelectStorage(project.local_project_id, linkedStorage.id);
+                                            }
+                                            window.requestAnimationFrame(() => storagePickerTriggerRef.current?.focus());
+                                          }}
+                                        >
+                                          <span className={`storage-link-selector${isSelected ? " active" : ""}`} aria-hidden="true"><span /></span>
+                                          <span className="storage-link-menu-icon" aria-hidden="true">
+                                            <Icon name={linkedStorage.kind === "local" ? "drive" : "cloud"} size={20} />
+                                          </span>
+                                          <span className="storage-link-menu-copy">
+                                            <strong>{linkedStorage.name || "(unnamed)"}</strong>
+                                            <span title={storageSubtitle(linkedStorage)}>{storageSubtitle(linkedStorage)}</span>
+                                          </span>
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                )}
+                              </div>
                               <div className="storage-link-row-controls">
                                 <button
                                   type="button"
                                   className={`storage-link-configure${editingStorage?.storageId === storage.id ? " active" : ""}`}
+                                  disabled={storageControlsLocked}
                                   onClick={() => void toggleStorageEditor(storage)}
                                   title={`Configure ${storage.name || "storage"}`}
                                   aria-label={`Configure ${storage.name || "storage"}`}
@@ -839,7 +1014,7 @@ export default function ProjectLinksWorkspace({
                                 <button
                                   type="button"
                                   className="storage-link-unlink"
-                                  disabled={busy || !!runningAction}
+                                  disabled={storageControlsLocked}
                                   onClick={() => void run(
                                     `unlink:${actionPrefix}`,
                                     () => onUnlinkStorage(project.local_project_id, storage.id),
@@ -857,54 +1032,93 @@ export default function ProjectLinksWorkspace({
                               <div className="storage-link-action-group" role="group" aria-label="Project storage actions">
                                 <button
                                   type="button"
-                                  className={`storage-link-sync storage-link-sync-primary${reviewOpen && inlineStorageReview?.kind === "pull" ? " active" : ""}`}
-                                  disabled={busy || !!runningAction || conversationPathBlocked || (!!projectBinding && !canRestore)}
+                                  className={`storage-link-sync storage-link-sync-primary${pullReviewOpen ? " active" : ""}`}
+                                  disabled={busy
+                                    || !!runningAction
+                                    || conversationPathBlocked
+                                    || (!!projectBinding && !canRestore)
+                                    || storageActionLockedForReview(activeReviewKind, "pull")}
                                   onClick={() => {
-                                    if (reviewOpen && inlineStorageReview?.kind === "pull") {
-                                      inlineStorageReview.onClose();
+                                    if (pullReviewOpen) {
+                                      document
+                                        .getElementById(reviewPanelId)
+                                        ?.querySelector<HTMLButtonElement>('[role="tab"][aria-selected="true"]')
+                                        ?.focus({ preventScroll: true });
                                       return;
                                     }
+                                    setStoragePickerProjectId(null);
+                                    setLinkingProjectId(null);
                                     void run(`pull:${actionPrefix}`, () => onPull(project.local_project_id, storage.id));
                                   }}
                                   title={conversationPathTitle
                                     ?? profileIssue
-                                    ?? (!profilesWritable && projectBinding ? "The selected agent profile is read only" : "Review the Pull actions before applying them")}
-                                  aria-expanded={reviewOpen && inlineStorageReview?.kind === "pull"}
+                                    ?? (pullReviewOpen
+                                      ? "Return to the open Pull review"
+                                      : !profilesWritable && projectBinding
+                                        ? "The selected agent profile is read only"
+                                        : "Review the Pull actions before applying them")}
+                                  aria-label={pullReviewOpen
+                                    ? "Return to Pull review"
+                                    : `Pull from ${storage.name || "storage"}`}
+                                  aria-expanded={pullReviewOpen}
                                 >
                                   <Icon name="download" size={15} />
-                                  {runningAction === `pull:${actionPrefix}` ? "Reviewing…" : project.project_root ? "Pull" : "Set up"}
+                                  {runningAction === `pull:${actionPrefix}`
+                                    ? "Reviewing…"
+                                    : pullReviewOpen
+                                      ? "View review"
+                                      : project.project_root
+                                        ? "Pull"
+                                        : "Set up"}
                                 </button>
                                 <button
                                   type="button"
-                                  className={`storage-link-sync${reviewOpen && inlineStorageReview?.kind === "push" ? " active" : ""}`}
-                                  disabled={busy || !!runningAction || conversationPathBlocked || !canSync}
+                                  className={`storage-link-sync${pushReviewOpen ? " active" : ""}`}
+                                  disabled={busy
+                                    || !!runningAction
+                                    || conversationPathBlocked
+                                    || !canSync
+                                    || storageActionLockedForReview(activeReviewKind, "push")
+                                    || (pushReviewOpen && inlineStorageReview?.continueDisabled)}
                                   onClick={() => {
-                                    if (reviewOpen && inlineStorageReview?.kind === "push") {
-                                      inlineStorageReview.onClose();
+                                    if (pushReviewOpen) {
+                                      inlineStorageReview?.onContinue?.();
                                       return;
                                     }
+                                    setStoragePickerProjectId(null);
+                                    setLinkingProjectId(null);
                                     void run(`push:${actionPrefix}`, () => onPush(project.local_project_id, storage.id));
                                   }}
                                   title={conversationPathTitle
                                     ?? profileIssue
-                                    ?? "Choose resources, then push them to this storage"}
-                                  aria-expanded={reviewOpen && inlineStorageReview?.kind === "push"}
+                                    ?? (pushReviewOpen
+                                      ? "Continue reviewing resources for this push"
+                                      : "Choose resources, then push them to this storage")}
+                                  aria-label={pushReviewOpen
+                                    ? "Continue push"
+                                    : `Push to ${storage.name || "storage"}`}
+                                  aria-expanded={pushReviewOpen}
+                                  aria-controls={pushReviewOpen ? reviewPanelId : undefined}
                                 >
-                                  <Icon name="upload" size={15} />
-                                  {runningAction === `push:${actionPrefix}` ? "Pushing…" : "Push"}
+                                  <Icon
+                                    name={pushProgress ? "refresh" : "upload"}
+                                    size={15}
+                                    className={pushProgress ? "icon-spin" : undefined}
+                                  />
+                                  {pushLabel}
                                 </button>
                               </div>
                             </div>
                           </div>
 
                           {reviewOpen && (
-                            <div className="v3-storage-inline-review">
+                            <div id={reviewPanelId} className="v3-storage-inline-review">
                               {inlineStorageReview?.content}
                             </div>
                           )}
                         </div>
                       );
-                    })}
+                    })()}
                     </div>
 
                     {linkingProjectId === project.local_project_id && (
@@ -938,16 +1152,56 @@ export default function ProjectLinksWorkspace({
           </div>
         ) : null)}
 
-        {activeProject && !newProjectSetup && (
-          <ProjectChatHistoryPage
-            embedded
-            project={activeProject}
-            binding={bindingByProject.get(activeProject.local_project_id) ?? null}
-            refreshEpoch={historyRefreshEpoch}
-            onOpenProjectSettings={() => void openProjectSettings(activeProject.local_project_id)}
-            activeStorageId={activeStorageId}
-            activeStorageName={storages.find((storage) => storage.id === activeStorageId)?.name ?? null}
+        {activeProject && !newProjectSetup && !inlineStorageReview && (
+          <ProjectWorkspaceTabs
+            activeTab={activeProjectTab}
+            isGitRepository={!!activeProject.is_git_repository}
+            onChange={setActiveProjectTab}
           />
+        )}
+
+        {activeProject && !newProjectSetup && !inlineStorageReview && activeProjectTab === "history" && (
+          <div
+            id="project-history-panel"
+            className="v3-project-tab-panel"
+            role="tabpanel"
+            aria-labelledby="project-history-tab"
+          >
+            <ProjectChatHistoryPage
+              embedded
+              project={activeProject}
+              binding={bindingByProject.get(activeProject.local_project_id) ?? null}
+              refreshEpoch={historyRefreshEpoch}
+              activeStorageId={activeStorageId}
+              activeStorageName={storages.find((storage) => storage.id === activeStorageId)?.name ?? null}
+            />
+          </div>
+        )}
+
+        {activeProject && !newProjectSetup && !inlineStorageReview && (
+          activeProjectTab === "skills" || activeProjectTab === "plugins"
+        ) && (
+          <div
+            id={`project-${activeProjectTab}-panel`}
+            className="v3-project-tab-panel"
+            role="tabpanel"
+            aria-labelledby={`project-${activeProjectTab}-tab`}
+          >
+            <SkillsPluginStatusPage
+              view={activeProjectTab}
+              project={activeProject}
+              binding={bindingByProject.get(activeProject.local_project_id) ?? null}
+              refreshEpoch={historyRefreshEpoch}
+              activeStorageId={activeStorageId}
+              activeStorageName={storages.find((storage) => storage.id === activeStorageId)?.name ?? null}
+              onOpenProjectSettings={() => {
+                document.getElementById("project-configuration-panel")?.scrollIntoView({
+                  block: "start",
+                  behavior: "smooth",
+                });
+              }}
+            />
+          </div>
         )}
       </section>
 

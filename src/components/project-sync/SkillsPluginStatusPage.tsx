@@ -1,0 +1,456 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type {
+  CapabilityStatusItem,
+  CapabilityStatusReport,
+  LocalProjectSummary,
+  ProjectBinding,
+} from "../../types";
+import Icon from "../Icons";
+import { projectSyncApi } from "./api";
+import { errorMessage, providerLabel } from "./model";
+
+export type CapabilityStatusView = "skills" | "plugins";
+
+interface Props {
+  view: CapabilityStatusView;
+  project: LocalProjectSummary;
+  binding: ProjectBinding | null;
+  activeStorageId?: string | null;
+  activeStorageName?: string | null;
+  refreshEpoch: number;
+  onOpenProjectSettings: () => void;
+  selectionMode?: "push" | "pull";
+  selectedResourceIds?: ReadonlySet<string>;
+  selectableResourceIds?: ReadonlySet<string>;
+  selectionDisabled?: boolean;
+  onToggleResource?: (resourceId: string) => void;
+  reportOverride?: CapabilityStatusReport | null;
+}
+
+interface ContentProps {
+  view: CapabilityStatusView;
+  report: CapabilityStatusReport | null;
+  loading: boolean;
+  error: string | null;
+  missingProfile: boolean;
+  activeStorageName?: string | null;
+  onRefresh: () => void;
+  onOpenProjectSettings: () => void;
+  selectionMode?: "push" | "pull";
+  selectedResourceIds?: ReadonlySet<string>;
+  selectableResourceIds?: ReadonlySet<string>;
+  selectionDisabled?: boolean;
+  onToggleResource?: (resourceId: string) => void;
+}
+
+type StatusIcon =
+  | "alert-triangle"
+  | "ban"
+  | "check-circle"
+  | "download"
+  | "help-circle"
+  | "upload";
+
+interface StatusPresentation {
+  icon: StatusIcon;
+  className: string;
+  label: string;
+  detail: string;
+}
+
+function shortDigest(value?: string | null): string {
+  return value ? value.slice(0, 10) : "—";
+}
+
+function capabilityScope(item: CapabilityStatusItem): string {
+  if (item.kind === "plugin") return "global plugin";
+  if (item.kind === "standalone_skill") return "global custom skill";
+  return "project skill";
+}
+
+export function capabilityStatusPresentation(
+  item: CapabilityStatusItem,
+  storageName = "storage",
+): StatusPresentation {
+  if (item.blocked_reason || item.state === "blocked") {
+    return {
+      icon: "ban",
+      className: "blocked",
+      label: "Blocked",
+      detail: item.blocked_reason || "Mallard cannot safely capture this resource.",
+    };
+  }
+  if (item.kind === "plugin" && item.enabled === false) {
+    return {
+      icon: "alert-triangle",
+      className: "disabled",
+      label: "Disabled",
+      detail: "Installed locally but disabled in the provider configuration.",
+    };
+  }
+  switch (item.state) {
+    case "synced":
+      return item.kind === "plugin"
+        ? {
+          icon: "check-circle",
+          className: "synced",
+          label: "Backup intent matches",
+          detail: `The local plugin installation intent matches ${storageName}; plugin payload bytes are installer-owned.`,
+        }
+        : {
+          icon: "check-circle",
+          className: "synced",
+          label: "Up to date",
+          detail: `The local skill content matches ${storageName}.`,
+        };
+    case "local_only":
+      return {
+        icon: "upload",
+        className: "local",
+        label: "Not backed up",
+        detail: `This resource exists locally but not in ${storageName}.`,
+      };
+    case "local_ahead":
+      return {
+        icon: "upload",
+        className: "local",
+        label: "Local changes",
+        detail: `This resource changed locally after the reviewed ${storageName} version.`,
+      };
+    case "storage_only":
+      return {
+        icon: "download",
+        className: "storage",
+        label: item.kind === "plugin" ? "Available to install" : "Available to pull",
+        detail: `This resource is available in ${storageName} but not on this machine.`,
+      };
+    case "storage_ahead":
+      return {
+        icon: "download",
+        className: "storage",
+        label: "Storage update",
+        detail: `${storageName} changed after the reviewed local version.`,
+      };
+    case "diverged":
+      return {
+        icon: "alert-triangle",
+        className: "diverged",
+        label: item.kind === "plugin" ? "Review intent" : "Review changes",
+        detail: `The local and ${storageName} versions changed independently.`,
+      };
+    case "not_compared":
+      return item.local_present
+        ? {
+          icon: "check-circle",
+          className: "installed",
+          label: item.kind === "plugin" ? "Installed" : "Available locally",
+          detail: "Select a reachable storage to compare backup status.",
+        }
+        : {
+          icon: "help-circle",
+          className: "unknown",
+          label: "Unavailable",
+          detail: "This resource is not available on this machine.",
+        };
+    default:
+      return {
+        icon: "help-circle",
+        className: "unknown",
+        label: "Status unknown",
+        detail: item.message || "Mallard could not safely compare this resource.",
+      };
+  }
+}
+
+function CapabilityRow({
+  item,
+  storageName,
+  selectionMode,
+  selected = false,
+  selectable = false,
+  selectionDisabled = false,
+  onToggleResource,
+}: {
+  item: CapabilityStatusItem;
+  storageName: string;
+  selectionMode?: "push" | "pull";
+  selected?: boolean;
+  selectable?: boolean;
+  selectionDisabled?: boolean;
+  onToggleResource?: (resourceId: string) => void;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const presentation = capabilityStatusPresentation(item, storageName);
+  const blockedForPush = selectionMode === "push" && (!!item.blocked_reason || item.state === "blocked");
+  const canSelect = selectable && !blockedForPush;
+  const included = selected && canSelect;
+  const detailsId = `capability-${item.resource_id.replace(/[^a-z0-9_-]/gi, "-")}`;
+  const installDirectory = item.metadata?.install_dir_name;
+  const marketplace = item.metadata?.plugin_marketplace;
+  const source = item.metadata?.plugin_source;
+  const providedSummary = item.provided_skills.length > 0
+    ? item.provided_skills.join(" · ")
+    : null;
+
+  return (
+    <article className={`v3-capability-row${expanded ? " expanded" : ""}${selectionMode ? " v3-capability-selectable" : ""}${included ? " selected" : ""}`}>
+      {selectionMode && (
+        <label
+          className="v3-sync-row-choice v3-capability-choice"
+          title={canSelect ? `${included ? "Exclude" : "Include"} ${item.display_name}` : presentation.detail}
+        >
+          <input
+            type="checkbox"
+            checked={included}
+            disabled={selectionDisabled || !canSelect}
+            aria-label={`${included ? "Exclude" : "Include"} ${item.display_name}`}
+            onChange={() => {
+              if (canSelect) onToggleResource?.(item.resource_id);
+            }}
+          />
+        </label>
+      )}
+      <button
+        type="button"
+        className="v3-capability-row-main"
+        onClick={() => setExpanded((current) => !current)}
+        aria-expanded={expanded}
+        aria-controls={detailsId}
+      >
+        <span
+          className={`v3-capability-state ${presentation.className}`}
+          title={presentation.detail}
+          aria-label={presentation.detail}
+        >
+          <Icon name={presentation.icon} size={14} />
+        </span>
+        <span className="v3-capability-kind">
+          <Icon name={item.kind === "plugin" ? "link" : "folder"} size={15} />
+        </span>
+        <span className="v3-capability-copy">
+          <strong>{item.display_name}</strong>
+          <span>
+            {providerLabel(item.provider)} · {capabilityScope(item)}
+            {installDirectory && item.kind === "standalone_skill" ? ` · folder ${installDirectory}` : ""}
+          </span>
+          {providedSummary && (
+            <span className="v3-capability-provides" title={`Provides ${providedSummary}`}>
+              Provides {providedSummary}
+            </span>
+          )}
+        </span>
+        <span className="v3-capability-row-status">
+          <strong>{presentation.label}</strong>
+          <span>{item.selected_in_recipe ? "In backup selection" : "Not selected for backup"}</span>
+        </span>
+        <Icon name={expanded ? "chevron-down" : "chevron-right"} size={13} className="v3-capability-chevron" />
+      </button>
+
+      {expanded && (
+        <div id={detailsId} className="v3-capability-details">
+          <p className={`v3-capability-detail-message ${presentation.className}`}>{item.message || presentation.detail}</p>
+          <dl>
+            <div>
+              <dt>Local</dt>
+              <dd>
+                {item.local_present ? "Present" : "Missing"}
+                {item.local_version ? ` · v${item.local_version}` : ""}
+                {item.local_digest ? ` · ${item.kind === "plugin" ? "intent " : ""}${shortDigest(item.local_digest)}` : ""}
+              </dd>
+            </div>
+            <div>
+              <dt>{storageName}</dt>
+              <dd>
+                {item.storage_present ? "Present" : "Missing"}
+                {item.storage_version ? ` · v${item.storage_version}` : ""}
+                {item.storage_digest ? ` · ${item.kind === "plugin" ? "intent " : ""}${shortDigest(item.storage_digest)}` : ""}
+              </dd>
+            </div>
+            <div><dt>Resource ID</dt><dd><code>{item.resource_id}</code></dd></div>
+            <div><dt>Apply</dt><dd>{item.apply_policy.replace(/_/g, " ")}</dd></div>
+            {marketplace && <div><dt>Marketplace</dt><dd>{marketplace}</dd></div>}
+            {source && <div><dt>Source</dt><dd><code>{source}</code></dd></div>}
+          </dl>
+          {item.logical_paths.length > 0 && (
+            <div className="v3-capability-paths">
+              <span>Portable paths</span>
+              <code>{item.logical_paths.join("\n")}</code>
+            </div>
+          )}
+        </div>
+      )}
+    </article>
+  );
+}
+
+export function SkillsPluginStatusContent({
+  view,
+  report,
+  loading,
+  error,
+  missingProfile,
+  activeStorageName,
+  onRefresh,
+  onOpenProjectSettings,
+  selectionMode,
+  selectedResourceIds = new Set(),
+  selectableResourceIds,
+  selectionDisabled = false,
+  onToggleResource,
+}: ContentProps) {
+  const isSkillsView = view === "skills";
+  const items = useMemo(
+    () => report?.items.filter((item) => (
+      isSkillsView ? item.kind !== "plugin" : item.kind === "plugin"
+    )) ?? [],
+    [isSkillsView, report?.items],
+  );
+  const storageName = report?.storage_name || activeStorageName || "storage";
+  const title = isSkillsView ? "Skill status" : "Plugin status";
+  const itemLabel = isSkillsView ? "skills" : "plugins";
+  const icon = isSkillsView ? "folder" : "link";
+  const headingId = `project-${view}-heading`;
+
+  return (
+    <div className="v3-capability-page v3-history-embedded" aria-labelledby={headingId}>
+      <header className="profile-links-heading v3-history-header">
+        <div className="profile-links-copy">
+          <h2 id={headingId} className="v3-history-embedded-title"><Icon name={icon} size={15} />{title}</h2>
+        </div>
+        <div className="v3-history-toolbar">
+          {(report?.storage_name || activeStorageName) && (
+            <span className="v3-history-storage-lens" title={`Comparing with ${storageName}`}>
+              <Icon name="link" size={12} /><span>{storageName}</span>
+            </span>
+          )}
+          {report && (
+            <span className="v3-history-toolbar-stats">
+              <span className="v3-history-heading-count v3-history-toolbar-count" title={`${items.length} ${itemLabel}`} aria-label={`${items.length} ${itemLabel}`}>
+                <Icon name={icon} size={12} />{items.length}
+              </span>
+            </span>
+          )}
+          {report && report.warnings.length > 0 && (
+            <details className="v3-capability-warnings">
+              <summary><Icon name="alert-triangle" size={13} />{report.warnings.length} warning{report.warnings.length === 1 ? "" : "s"}</summary>
+              <ul>{report.warnings.map((warning) => <li key={warning}>{warning}</li>)}</ul>
+            </details>
+          )}
+          <button
+            type="button"
+            className="v3-history-icon-action"
+            onClick={onRefresh}
+            disabled={loading || missingProfile}
+            title={`Refresh ${itemLabel}`}
+            aria-label={`Refresh ${itemLabel}`}
+          >
+            <Icon name="refresh" size={15} className={loading ? "icon-spin" : undefined} />
+          </button>
+        </div>
+      </header>
+
+      {missingProfile ? (
+        <div className="v3-history-state v3-history-profile-state">
+          <Icon name="alert-triangle" size={18} />
+          <div><strong>Choose an agent profile to inventory {itemLabel}.</strong><span>The status view reads only the profile assigned to this project.</span></div>
+          <button type="button" className="btn btn-primary" onClick={onOpenProjectSettings}>Open Project Settings</button>
+        </div>
+      ) : loading && !report ? (
+        <div className="v3-history-state" role="status" aria-live="polite"><span className="status-loader" /> Scanning {itemLabel}…</div>
+      ) : error && !report ? (
+        <div className="v3-history-state v3-capability-error" role="alert">
+          <Icon name="alert-triangle" size={18} /><span>{error}</span><button type="button" className="btn" onClick={onRefresh}>Retry</button>
+        </div>
+      ) : report ? (
+        <>
+          {error && <div className="v3-callout error v3-capability-inline-error" role="alert"><Icon name="alert-triangle" size={14} />{error}</div>}
+          {items.length === 0 ? (
+            <div className="v3-history-state"><Icon name={icon} size={20} /> No {itemLabel} were found for this project and profile.</div>
+          ) : (
+            <div className="v3-capability-list v3-capability-primary-list">
+              {items.map((item) => <CapabilityRow key={item.resource_id} item={item} storageName={storageName}
+                selectionMode={selectionMode} selected={selectedResourceIds.has(item.resource_id)}
+                selectable={selectableResourceIds?.has(item.resource_id) ?? !!selectionMode}
+                selectionDisabled={selectionDisabled} onToggleResource={onToggleResource} />)}
+            </div>
+          )}
+        </>
+      ) : null}
+    </div>
+  );
+}
+
+export default function SkillsPluginStatusPage({
+  view,
+  project,
+  binding,
+  activeStorageId,
+  activeStorageName,
+  refreshEpoch,
+  onOpenProjectSettings,
+  selectionMode,
+  selectedResourceIds,
+  selectableResourceIds,
+  selectionDisabled = false,
+  onToggleResource,
+  reportOverride,
+}: Props) {
+  const [report, setReport] = useState<CapabilityStatusReport | null>(reportOverride ?? null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const requestRef = useRef(0);
+  const missingProfile = !binding || Object.keys(binding.profile_ids ?? {}).length === 0;
+
+  const load = useCallback(async () => {
+    if (reportOverride !== undefined) {
+      requestRef.current += 1;
+      setReport(reportOverride);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+    if (missingProfile) {
+      setReport(null);
+      setError(null);
+      setLoading(false);
+      return;
+    }
+    const requestId = ++requestRef.current;
+    setLoading(true);
+    setError(null);
+    try {
+      const next = await projectSyncApi.getCapabilityStatus(project.local_project_id, activeStorageId);
+      if (requestRef.current === requestId) setReport(next);
+    } catch (reason) {
+      if (requestRef.current === requestId) setError(errorMessage(reason));
+    } finally {
+      if (requestRef.current === requestId) setLoading(false);
+    }
+  }, [activeStorageId, missingProfile, project.local_project_id, reportOverride]);
+
+  useEffect(() => {
+    setReport(null);
+    void load();
+    return () => {
+      requestRef.current += 1;
+    };
+  }, [load, refreshEpoch]);
+
+  return (
+    <SkillsPluginStatusContent
+      view={view}
+      report={report}
+      loading={loading}
+      error={error}
+      missingProfile={missingProfile}
+      activeStorageName={activeStorageName}
+      onRefresh={() => void load()}
+      onOpenProjectSettings={onOpenProjectSettings}
+      selectionMode={selectionMode}
+      selectedResourceIds={selectedResourceIds}
+      selectableResourceIds={selectableResourceIds}
+      selectionDisabled={selectionDisabled}
+      onToggleResource={onToggleResource}
+    />
+  );
+}

@@ -342,7 +342,7 @@ export interface SyncStatus {
 }
 
 // ---------------------------------------------------------------------------
-// Project-scoped sync (schema 3)
+// Project-scoped sync (schema-3 local state, schema-4 portable bundles)
 // ---------------------------------------------------------------------------
 
 export type ProjectProvider = "codex" | "claude";
@@ -352,6 +352,7 @@ export type ProjectResourceCategory =
   | "project_setup"
   | "skills"
   | "plugins"
+  | "project_files"
   | "tools";
 
 export type ProjectResourceState =
@@ -370,6 +371,8 @@ export type ProjectResourceKind =
   | "codex_conversation"
   | "claude_conversation"
   | "project_file"
+  | "project_content_file"
+  | "project_content_directory"
   | "project_memory"
   | "agent"
   | "command"
@@ -458,8 +461,16 @@ export interface ProjectStorageLink {
   bundle_id: string;
   /** Last resource selection explicitly published to this storage. */
   recipe?: BundleRecipe | null;
+  /** Destination-local exclusions recorded only after a successful Push. */
+  project_content_preferences: ProjectContentPreferences;
   pinned: boolean;
   created_at: number;
+}
+
+export interface ProjectContentPreferences {
+  schema_version: 1;
+  revision: number;
+  excluded_resource_ids: string[];
 }
 
 export interface ProjectBinding {
@@ -742,6 +753,105 @@ export interface ResourceStatusReport {
   warnings?: string[];
 }
 
+export type CapabilityStatusState =
+  | "synced"
+  | "local_only"
+  | "local_ahead"
+  | "storage_only"
+  | "storage_ahead"
+  | "diverged"
+  | "blocked"
+  | "unknown"
+  | "not_compared";
+
+export interface CapabilityProfileContext {
+  provider: ProjectProvider;
+  profile_id: string;
+  display_name: string;
+  path: string;
+  shared_project_count: number;
+}
+
+export interface CapabilityStatusItem extends ProjectResourceDescriptor {
+  category: "skills" | "plugins" | string;
+  state: CapabilityStatusState | string;
+  local_present: boolean;
+  storage_present: boolean;
+  selected_in_recipe: boolean;
+  blocked_reason?: string | null;
+  logical_paths: string[];
+  local_digest?: string | null;
+  storage_digest?: string | null;
+  local_version?: string | null;
+  storage_version?: string | null;
+  enabled?: boolean | null;
+  provided_skills: string[];
+  message?: string | null;
+}
+
+export interface CapabilityStatusReport {
+  project_id: string;
+  project_name: string;
+  profiles: CapabilityProfileContext[];
+  storage_id?: string | null;
+  storage_name?: string | null;
+  generation?: number | null;
+  base_generation?: number | null;
+  compared_at: number;
+  items: CapabilityStatusItem[];
+  warnings: string[];
+}
+
+export type ProjectFileSyncEligibilityState = "eligible" | "git_managed" | "unknown";
+
+export interface ProjectFileSyncEligibility {
+  state: ProjectFileSyncEligibilityState;
+  reason: string;
+  detected_root?: string | null;
+}
+
+export type ProjectContentEntryType = "file" | "directory" | "blocked";
+
+export interface ProjectContentEntry {
+  descriptor: ProjectResourceDescriptor;
+  entry_type: ProjectContentEntryType;
+  relative_path: string;
+  logical_path: string;
+  size?: number | null;
+  mode?: number | null;
+  source_mtime?: number | null;
+  state: CapabilityStatusState | string;
+  local_present: boolean;
+  storage_present: boolean;
+  base_present: boolean;
+  local_digest?: string | null;
+  storage_digest?: string | null;
+  base_digest?: string | null;
+  review_digest?: string | null;
+  selected_in_recipe: boolean;
+  newly_discovered: boolean;
+  selected_after_scan: boolean;
+  blocked_reason?: string | null;
+  warning_code?: string | null;
+  warning_digest?: string | null;
+}
+
+export interface ProjectContentInventory {
+  local_project_id: string;
+  storage_id: string;
+  project_root: string;
+  eligibility: ProjectFileSyncEligibility;
+  review_token?: string | null;
+  storage_generation?: number | null;
+  preference_revision: number;
+  excluded_resource_ids: string[];
+  entries: ProjectContentEntry[];
+  ignored_count: number;
+  blocked_count: number;
+  warnings: string[];
+  scanned_at: number;
+}
+
 export interface ProjectOperationResult {
   success: boolean;
   message: string;
@@ -799,6 +909,10 @@ export interface PlannedAction {
 
 export type RestoreActionKind =
   | { kind: "write_file"; logical_path: string }
+  | { kind: "write_project_file"; logical_path: string; mode: number; source_mtime: number }
+  | { kind: "ensure_project_directory"; logical_path: string; mode: number; source_mtime: number }
+  | { kind: "delete_project_file"; logical_path: string; last_sha256: string }
+  | { kind: "delete_project_directory"; logical_path: string }
   | { kind: "merge_file"; logical_path: string }
   | { kind: "materialize_conversation"; provider: ProjectProvider; logical_path: string }
   | { kind: "install_standalone_skill"; provider: ProjectProvider; target_relative_path: string }
@@ -817,6 +931,7 @@ export interface RestoreAction {
   target_path?: string | null;
   source_sha256?: string | null;
   expected_target_sha256?: string | null;
+  expected_target_mode?: number | null;
   requires_explicit_approval: boolean;
 }
 
@@ -833,6 +948,7 @@ export interface RestorePlan {
   created_at: number;
   expires_at: number;
   actions: RestoreAction[];
+  project_content_eligibility?: ProjectFileSyncEligibility | null;
 }
 
 export interface RestoreResult {

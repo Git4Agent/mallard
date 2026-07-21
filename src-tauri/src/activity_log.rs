@@ -651,12 +651,18 @@ impl ActivityLogStore {
                 ))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                fs::create_dir(&self.root).map_err(|error| {
-                    format!(
-                        "create activity log directory '{}': {error}",
-                        self.root.display()
-                    )
-                })?;
+                match fs::create_dir(&self.root) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                        ensure_real_directory(&self.root)?;
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "create activity log directory '{}': {error}",
+                            self.root.display()
+                        ));
+                    }
+                }
             }
             Err(error) => {
                 return Err(format!(
