@@ -1,114 +1,168 @@
-# Mallard
+# Mallard — GitHub for AI-agent work
 
-Mallard is a Tauri 2 desktop app for moving selected Codex and Claude project
-resources between machines. It syncs project-owned conversations, settings,
-skills, plugins, and—when the project is not inside a Git work tree—optional
-ordinary files and folders. It never mirrors an entire provider home.
+Git records what changed. Mallard preserves the Codex sessions that explain
+why—and makes that project knowledge portable across teammates and machines.
 
-## Download
+Mallard was built for [OpenAI Build Week](https://openai.devpost.com/), a
+global week of building with Codex and GPT-5.6. It is a review-first desktop
+app for syncing selected, project-scoped Codex sessions and resources without
+copying an entire Codex home directory or credential store.
 
-Download the packaged Apple Silicon DMG from the
+**[Project website](https://mallard-ai.com/)** ·
+**[Devpost submission](https://devpost.com/software/agentgithub)** ·
+**[Watch the demo](https://youtu.be/5Agu6OuaQLg)**
+
+## What Mallard does
+
+- Maps Codex sessions onto a Git branch's first-parent commit history, so a
+  team can explore the reasoning behind a diff.
+- Parses session summaries and conversation previews locally, with metrics for
+  start and end times, user turns, tokens, agent messages, and tool calls.
+- Syncs selected project conversations, setup, skills, plugins, and approved
+  configuration through a local folder or Cloudflare R2.
+- Compares local and stored resources before Push or Pull, including
+  local-only, storage-only, ahead, synchronized, and conflict states.
+- Publishes immutable, SHA-256-verified bundle generations and presents an
+  explicit restore plan before applying changes. Pulls create backups and
+  retain apply receipts.
+- Optionally syncs selected ordinary files and folders for non-Git projects.
+  Git-managed project content continues to travel through Git.
+
+## Quick Start for judges
+
+### 1. Install Mallard
+
+The fastest path is the packaged Apple Silicon DMG from the
 [v0.1.2 release](https://github.com/Git4Agent/mallard/releases/tag/v0.1.2).
-The app is ad-hoc signed and unnotarized, so macOS may require approval under
-**System Settings → Privacy & Security** before the first launch.
+The app is ad-hoc signed and unnotarized, so macOS may require you to approve
+it under **System Settings → Privacy & Security** before the first launch.
 
-Current contracts: app `0.1.2`, machine-local config schema 3, portable bundle
-schema 4, and storage layout 1. Unsupported schemas are rejected; there is no
-migration or compatibility path in the current implementation.
+You will also need Git and a local Codex profile. The default profile is
+normally stored at `~/.codex`.
 
-## What it supports
+To run the desktop app from source instead, install Node.js with npm and a
+stable Rust toolchain, then run:
 
-- Machine-local Codex and Claude profiles mapped to each project checkout.
-- Local-folder and S3-compatible storage, including Cloudflare R2.
-- Destination-specific resource recipes and reviewed remote bases.
-- Immutable bundle generations with SHA-256 verification and head
-  compare-and-swap publication.
-- Pull planning, explicit per-resource approval, backups, apply receipts,
-  dependency actions, and readiness checks.
-- Optional non-Git project-file sync with exact file and directory tracking,
-  empty-directory restoration, and safe deletion tombstones.
-- Local project chat history, path repair, and retained activity logs.
+```sh
+npm install
+npm run tauri dev
+```
 
-## Run locally
+`npm run dev` starts only the Vite frontend and does not provide the Tauri
+filesystem and storage backend used by these test flows.
+
+### 2. Connect the shared Cloudflare R2 storage
+
+The bucket location and credentials are included in the private submission
+details. Do not add them to this repository, a project file, or an issue.
+
+1. In Mallard, open storage settings and add a **Cloudflare R2** storage.
+2. Paste the supplied **S3 API URL**. Mallard derives the R2 account, endpoint,
+   and bucket location from this URL; confirm the populated values.
+3. Enter the supplied **Access Key ID** and **Secret Access Key**.
+4. Save the storage.
+
+Credentials and machine-specific paths are stored only in Mallard's local
+metadata under `~/.mallard/`; they are never uploaded inside a portable
+project bundle.
+
+### Test Flow 1: Pull the public demo project
+
+This flow demonstrates how an existing Mallard project is discovered and
+pulled onto a new machine.
+
+1. Clone the public demo repository:
+
+   ```sh
+   git clone https://github.com/Git4Agent/mallard_test_demo.git
+   ```
+
+2. In Mallard, choose **Add project** and select the cloned
+   `mallard_test_demo` folder.
+3. Select the local Codex profile and the R2 storage configured above.
+4. Under **Repository**, choose the existing remote repository marked
+   **Git match** instead of creating a new repository.
+5. Choose **Finish & review**, inspect the Pull plan, approve the intended
+   resources, and apply the Pull.
+6. Open **Project History** and verify that the project shows:
+   - its Git commits and branch timeline;
+   - mapped sessions plus any intentionally unmapped sessions;
+   - always-visible session summaries;
+   - session metrics for activity time, turns, tokens, messages, and tools;
+   - expandable conversation previews.
+
+### Test Flow 2: Push and transfer your own project
+
+This flow works with a new or existing Git project, or with a non-Git folder.
+
+1. Use the project from Codex so it has at least one project-scoped session.
+   For the clearest Git mapping, make one or more commits after or during that
+   work.
+2. In Mallard, choose **Add project**, select the folder and Codex profile,
+   choose the configured R2 storage, and select **New repository**.
+3. Finish setup and open **Project History**. Git projects show the selected
+   branch's commit-to-session mapping; both Git and non-Git projects show
+   summaries, conversation previews, and session metrics.
+4. Choose **Push** and review **Git & sessions**, **Skills**, **Plugins**, and
+   the final **Review** step.
+5. For a non-Git project, optionally open **Project files**, run
+   **Scan files**, and select the ordinary files and folders that
+   should travel with the bundle. This step is unavailable for Git-managed
+   content.
+6. Complete the Push to publish the reviewed bundle to R2.
+7. On another machine, configure the same R2 storage, clone the Git repository
+   or create an appropriate local folder, add it to Mallard, select the
+   existing remote repository, and complete a reviewed Pull.
+
+## How session-to-commit mapping works
+
+Mallard parses Codex JSONL archives locally to recover session metadata,
+activity windows, branch information, and recorded commit references. For a
+Git project, it places sessions on the selected branch's first-parent history
+when the evidence is strong enough: a commit can occur during the session or
+be the nearest follow-up commit within 24 hours. Ambiguous sessions remain
+visible as unmapped rather than being assigned to a commit without evidence.
+
+## Push, Pull, and project-file safety
+
+- Every Push and Pull is reviewed by resource before it changes shared or
+  local state.
+- Non-Git project-file scans are explicit and read-only. `.gitignore`,
+  `.ignore`, and `.mallardignore` are honored.
+- VCS data, build output, Codex and Mallard metadata, credential filenames,
+  links, special files, and private-key material are excluded or blocked.
+- Credential-shaped or executable content requires an explicit warning
+  acknowledgement.
+- Pull deletions begin unselected. Approved file deletion verifies the local
+  digest and creates a backup; approved directory deletion removes only an
+  exact empty directory and is never recursive.
+- Absolute checkout paths, Codex-home paths, storage credentials, restore
+  plans, receipts, backups, and local preferences stay on the machine.
+
+## Architecture
+
+Mallard is a Tauri 2 desktop application. React, TypeScript, and Vite provide
+the review-focused interface; Rust handles discovery, validation, hashing,
+safe filesystem operations, local persistence, and S3/R2 transport.
+
+Local-folder and R2 storage share the same versioned bundle model. A mutable
+head points to immutable manifests and uploaded objects, with SHA-256 checks
+and compare-and-swap publication protecting concurrent updates.
+
+See [TECHNICAL_REPORT.md](./TECHNICAL_REPORT.md) for the current schemas,
+storage layout, sync semantics, and implementation boundaries.
+
+## Development
 
 Requirements: Node.js with npm, a stable Rust toolchain, and Git.
 
 ```sh
 npm install
-npm run dev          # frontend at http://localhost:1420
-npm run tauri dev    # desktop app
+npm run dev          # frontend only at http://localhost:1420
+npm run tauri dev    # complete desktop app
 ```
 
 Configuration is created through the app; no `.env` file is required.
-
-## Basic workflow
-
-1. Add a local folder or S3/R2 storage.
-2. Add the project and select its local Codex and/or Claude profile.
-3. Discover resources, choose the initial recipe, and link the project to a
-   storage.
-4. Open **Push** and review **Git & sessions**, **Skills**, **Plugins**, and
-   **Review**.
-5. For a non-Git project, optionally open **Project files** after **Plugins**
-   and run **Scan project files**. Newly discovered eligible entries are
-   selected for that pending Push by default. Files and directories are
-   tracked individually; selecting a file also selects its ancestor folders.
-6. On another machine, map the same bundle to a local checkout, open **Pull**,
-   and approve the exact actions to apply. Project-file actions start
-   unchecked, so unchecked entries stay local.
-
-Git-managed projects do not upload ordinary project content. If a bundle
-already contains project files and the mapped folder becomes Git-managed, the
-Project files step remains visible but locked.
-
-## Project-file safety
-
-- Scans are explicit and read-only. Selection metadata changes only after a
-  successful Push.
-- `.gitignore`, `.ignore`, and `.mallardignore` are honored. VCS data, build
-  output, provider homes, Mallard metadata/storage, credential filenames,
-  links, and special files are excluded or blocked.
-- Credential-shaped content and executable files require a byte-bound warning
-  acknowledgement; private-key material is blocked.
-- Removing a local path does not remove it from storage. The user must choose
-  **Remove from storage** for each tracked entry.
-- Pull deletions are unselected by default. An approved file deletion verifies
-  the unchanged digest, creates a backup, and removes only that regular file.
-  An approved directory deletion removes only the exact empty directory and
-  is never recursive.
-
-For example, storage entry `project/docs/specs/a.md` restores to
-`<project-root>/docs/specs/a.md`. `docs` and `docs/specs` are separate tracked
-directory entries, so both are recreated before the file is written.
-
-## Metadata
-
-Machine-only state lives under `~/.mallard/` and includes paths, provider
-profiles, storage credentials, project/storage links, recipes, exclusion
-preferences, reviewed bases, plans, receipts, backups, caches, and logs. It is
-never uploaded as a directory.
-
-Portable storage uses this layout for both local folders and S3/R2:
-
-```text
-.mallard/
-|-- _storage.json
-`-- v1/repositories/<bundle-id>/
-    |-- _tag.json
-    |-- _head.json
-    |-- _manifests/<generation>-<commit-id>.json
-    |-- _commits/<generation>-<commit-id>.json
-    `-- _uploads/<upload-id>/files/<logical-path>
-```
-
-Local-folder storage also uses `.mallard/.storage.lock` to serialize writers
-on the same filesystem.
-
-The schema-4 manifest contains portable relative paths, selected resource
-descriptors, file hashes/sizes/safe modes/source mtimes, directory entries,
-and typed tombstones. Absolute checkout paths, provider-home paths,
-credentials, plans, receipts, backups, and local exclusion preferences remain
-on the machine.
 
 ## Verify
 
@@ -124,24 +178,17 @@ restricted environments may require permission for that test server.
 
 ## Code map
 
-- `src/components/project-sync/` — project setup, Push/Pull review, project
-  files, storage, and status UI.
+- `src/components/project-sync/` — project setup, history, storage, Push/Pull
+  review, project files, and status UI.
 - `src/components/project-sync/api.ts` and `src/types.ts` — Tauri command and
   DTO contracts.
-- `src-tauri/src/project_sync_v3/domain.rs` — current local and portable
-  schemas, validation, plans, and receipts.
-- `src-tauri/src/project_sync_v3/provider_capture.rs` — Codex/Claude discovery
-  and no-follow project-content scanning.
-- `src-tauri/src/project_sync_v3/bundle_engine.rs` — publish, fetch, CAS,
-  restore planning, backups, and apply.
-- `src-tauri/src/project_sync_v3/commands.rs` — command orchestration and
-  metadata transactions.
-- `src-tauri/src/project_sync_v3/persistence.rs` — bounded atomic state under
-  `~/.mallard`.
+- `src-tauri/src/project_sync_v3/chat_history.rs` — Codex history parsing,
+  metrics, previews, and Git mapping.
+- `src-tauri/src/project_sync_v3/provider_capture.rs` — Codex resource
+  discovery and no-follow project-content scanning.
+- `src-tauri/src/project_sync_v3/bundle_engine.rs` — publish, fetch, integrity
+  checks, restore planning, backups, and apply.
 - `src-tauri/src/project_sync_v3/s3_store.rs` — S3/R2 object-store adapter.
-
-See [TECHNICAL_REPORT.md](./TECHNICAL_REPORT.md) for the complete current
-architecture and sync semantics.
 
 ## License
 
