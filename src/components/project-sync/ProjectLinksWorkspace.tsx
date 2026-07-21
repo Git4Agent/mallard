@@ -1101,6 +1101,7 @@ export default function ProjectLinksWorkspace({
                                   aria-controls={pushReviewOpen ? reviewPanelId : undefined}
                                 >
                                   <Icon
+                                    key={pushProgress ? "push-progress" : "push-idle"}
                                     name={pushProgress ? "refresh" : "upload"}
                                     size={15}
                                     className={pushProgress ? "icon-spin" : undefined}

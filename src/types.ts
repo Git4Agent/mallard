@@ -956,7 +956,7 @@ export interface RestoreResult {
   message: string;
   plan_id?: string;
   applied_action_ids?: string[];
-  failed_actions?: Array<{ action_id: string; message: string }>;
+  failed_actions?: Array<{ action_id: string; display_name?: string | null; message: string }>;
 }
 
 export interface DependencyPlan {
@@ -990,7 +990,7 @@ export interface DependencyResult {
   success: boolean;
   message: string;
   applied_action_ids?: string[];
-  failed_actions?: Array<{ action_id: string; message: string }>;
+  failed_actions?: Array<{ action_id: string; display_name?: string | null; message: string }>;
 }
 
 export interface BundleReadinessIssue {

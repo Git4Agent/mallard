@@ -194,11 +194,23 @@ impl ProcessRunner {
 
 fn drain<R: Read + Send + 'static>(stream: Option<R>) -> std::thread::JoinHandle<String> {
     std::thread::spawn(move || {
-        let mut buf = String::new();
+        let mut captured = Vec::new();
         if let Some(mut stream) = stream {
-            let _ = stream.read_to_string(&mut buf);
+            let mut chunk = [0_u8; 8 * 1024];
+            loop {
+                let read = match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => read,
+                };
+                if captured.len() < MAX_CLI_BYTES {
+                    let remaining = MAX_CLI_BYTES - captured.len();
+                    captured.extend_from_slice(&chunk[..read.min(remaining)]);
+                }
+                // Keep draining after the capture limit so a noisy child
+                // cannot fill its pipe and deadlock while we wait for it.
+            }
         }
-        buf
+        String::from_utf8_lossy(&captured).into_owned()
     })
 }
 
@@ -2309,7 +2321,62 @@ pub fn apply_managed_plan(
     let target_config = target_home.join("config.toml");
     let intents = effective_plugin_intents(lock, Some(&target_config))?;
     let explicitly_disabled = explicitly_disabled_plugin_ids(Some(&target_config))?;
-    let initial_config_issues = codex_config::inspect_managed_config(&target_config, target_home);
+    apply_managed_plan_for_intents(
+        target_runner,
+        default_runner,
+        lock,
+        &intents,
+        &explicitly_disabled,
+        target_home,
+        default_home,
+        log,
+    )
+}
+
+/// Apply only the plugin intents explicitly approved by the caller. Unlike
+/// [`apply_managed_plan`], this does not pull additional enabled plugin intent
+/// from the target config, so one project-sync approval cannot install an
+/// unrelated plugin. Managed marketplace provisioning and final verification
+/// are otherwise identical to the full repair path.
+pub fn apply_approved_managed_plan(
+    target_runner: &dyn CodexRunner,
+    default_runner: &dyn CodexRunner,
+    lock: &CodexPluginLock,
+    target_home: &Path,
+    default_home: &Path,
+    log: &mut dyn FnMut(&str, &str),
+) -> Result<CodexPluginRepairReport, String> {
+    validate_lock(lock)?;
+    let explicitly_disabled =
+        explicitly_disabled_plugin_ids(Some(&target_home.join("config.toml")))?;
+    apply_managed_plan_for_intents(
+        target_runner,
+        default_runner,
+        lock,
+        &lock.plugins,
+        &explicitly_disabled,
+        target_home,
+        default_home,
+        log,
+    )
+}
+
+fn apply_managed_plan_for_intents(
+    target_runner: &dyn CodexRunner,
+    default_runner: &dyn CodexRunner,
+    lock: &CodexPluginLock,
+    intents: &[CodexPluginIntent],
+    explicitly_disabled: &BTreeSet<String>,
+    target_home: &Path,
+    default_home: &Path,
+    log: &mut dyn FnMut(&str, &str),
+) -> Result<CodexPluginRepairReport, String> {
+    let target_config = target_home.join("config.toml");
+    let initial_config_issues = codex_config::inspect_managed_config_with_default(
+        &target_config,
+        target_home,
+        default_home,
+    );
     let needs_mcp_repair = initial_config_issues
         .iter()
         .any(|entry| entry.id.starts_with("mcp_servers."));
@@ -2372,7 +2439,7 @@ pub fn apply_managed_plan(
     let mut unavailable: BTreeSet<ManagedMarketplace> = discovery.issues.keys().copied().collect();
     for (marketplace, catalog_issue) in &discovery.issues {
         log("error", &catalog_issue.message);
-        block_managed_dependents(&intents, *marketplace, catalog_issue, &mut blocked);
+        block_managed_dependents(intents, *marketplace, catalog_issue, &mut blocked);
     }
 
     if required.contains(&ManagedMarketplace::Curated)
@@ -2396,7 +2463,7 @@ pub fn apply_managed_plan(
                 attempted_failures.push(format!("marketplace {}", CURATED_MARKETPLACE));
                 unavailable.insert(ManagedMarketplace::Curated);
                 block_managed_dependents(
-                    &intents,
+                    intents,
                     ManagedMarketplace::Curated,
                     &catalog_issue,
                     &mut blocked,
@@ -2427,7 +2494,7 @@ pub fn apply_managed_plan(
                 attempted_failures.push(format!("marketplace {} config", CURATED_MARKETPLACE));
                 unavailable.insert(ManagedMarketplace::Curated);
                 block_managed_dependents(
-                    &intents,
+                    intents,
                     ManagedMarketplace::Curated,
                     &catalog_issue,
                     &mut blocked,
@@ -2487,7 +2554,7 @@ pub fn apply_managed_plan(
                             error
                         ),
                     );
-                    block_managed_dependents(&intents, marketplace, &catalog_issue, &mut blocked);
+                    block_managed_dependents(intents, marketplace, &catalog_issue, &mut blocked);
                 }
             }
         }
@@ -2517,7 +2584,7 @@ pub fn apply_managed_plan(
                     log("error", &catalog_issue.message);
                     attempted_failures.push(format!("marketplace {}", marketplace.name()));
                     unavailable.insert(*marketplace);
-                    block_managed_dependents(&intents, *marketplace, &catalog_issue, &mut blocked);
+                    block_managed_dependents(intents, *marketplace, &catalog_issue, &mut blocked);
                 }
             }
         }
@@ -2534,7 +2601,7 @@ pub fn apply_managed_plan(
                         "managed_catalog_provision_failed",
                         error.clone(),
                     );
-                    block_managed_dependents(&intents, *marketplace, &catalog_issue, &mut blocked);
+                    block_managed_dependents(intents, *marketplace, &catalog_issue, &mut blocked);
                 }
             }
         }
@@ -2552,7 +2619,7 @@ pub fn apply_managed_plan(
         .cloned()
         .collect();
     let mut report =
-        match apply_plan_for_intents(target_runner, lock, &runnable, &explicitly_disabled, log) {
+        match apply_plan_for_intents(target_runner, lock, &runnable, explicitly_disabled, log) {
             Ok(report) => report,
             Err(error) => {
                 log("error", &format!("Codex plugin replay failed: {}", error));
@@ -2609,7 +2676,9 @@ pub fn apply_managed_plan(
         }
     }
 
-    for unresolved in codex_config::inspect_managed_config(&target_config, target_home) {
+    for unresolved in
+        codex_config::inspect_managed_config_with_default(&target_config, target_home, default_home)
+    {
         log(
             "error",
             &format!(
@@ -4047,6 +4116,176 @@ mod tests {
         assert!(!target_runner.calls()[calls_before..]
             .iter()
             .any(|call| call.starts_with("plugin add")));
+    }
+
+    #[test]
+    fn approved_managed_plan_does_not_install_unapproved_config_intent() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_home = dir.path().join("default/.codex");
+        let target_home = dir.path().join("target/.codex");
+        fs::create_dir_all(&default_home).unwrap();
+        fs::create_dir_all(&target_home).unwrap();
+        let target_config = target_home.join("config.toml");
+        fs::write(
+            &target_config,
+            "[plugins.\"unapproved@openai-curated\"]\nenabled = true\n",
+        )
+        .unwrap();
+        let lock = CodexPluginLock {
+            schema: LOCK_SCHEMA,
+            marketplaces: vec![CodexMarketplaceIntent {
+                name: "team-tools".to_string(),
+                repository: "owner/repo".to_string(),
+                git_ref: None,
+            }],
+            plugins: vec![CodexPluginIntent {
+                id: "approved@team-tools".to_string(),
+                observed_version: None,
+            }],
+            ..CodexPluginLock::default()
+        };
+
+        let default_runner = FakeRunner::new();
+        default_runner.on(
+            "plugin marketplace list --json",
+            Ok((true, marketplaces_json(&[]))),
+        );
+        let target_runner = FakeRunner::new();
+        target_runner.use_config(target_config);
+        target_runner.on(
+            "plugin marketplace list --json",
+            Ok((
+                true,
+                marketplaces_json(&[("team-tools", "git", "owner/repo", None)]),
+            )),
+        );
+        target_runner.on("plugin list --json", Ok((true, plugins_json(&[]))));
+        target_runner.on(
+            "plugin list --json",
+            Ok((
+                true,
+                plugins_json(&[("approved@team-tools", "team-tools", "1.0.0", true, true)]),
+            )),
+        );
+        target_runner.on("plugin add approved@team-tools", Ok((true, String::new())));
+
+        let mut log = |_: &str, _: &str| {};
+        let report = apply_approved_managed_plan(
+            &target_runner,
+            &default_runner,
+            &lock,
+            &target_home,
+            &default_home,
+            &mut log,
+        )
+        .unwrap();
+
+        assert_eq!(report.state, CodexRepairState::Ready);
+        assert_eq!(report.plugins_installed, ["approved@team-tools"]);
+        assert!(target_runner
+            .calls()
+            .contains(&"plugin add approved@team-tools".to_string()));
+        assert!(!target_runner
+            .calls()
+            .iter()
+            .any(|call| call.contains("unapproved@openai-curated")));
+    }
+
+    #[test]
+    fn approved_plan_rebinds_primary_runtime_before_installing_documents() {
+        let dir = tempfile::tempdir().unwrap();
+        let default_home = dir.path().join("default/.codex");
+        let target_home = dir.path().join("target/.codex");
+        let runtime = default_home
+            .parent()
+            .unwrap()
+            .join(".cache/codex-runtimes/runtime-1");
+        fs::create_dir_all(runtime.join(".agents/plugins")).unwrap();
+        fs::create_dir_all(&default_home).unwrap();
+        fs::create_dir_all(&target_home).unwrap();
+        fs::write(
+            runtime.join(".agents/plugins/marketplace.json"),
+            r#"{"name":"openai-primary-runtime","plugins":[]}"#,
+        )
+        .unwrap();
+        fs::write(default_home.join("config.toml"), "model = 'gpt'\n").unwrap();
+        let target_config = target_home.join("config.toml");
+        let lock = CodexPluginLock {
+            schema: LOCK_SCHEMA,
+            plugins: vec![CodexPluginIntent {
+                id: "documents@openai-primary-runtime".to_string(),
+                observed_version: None,
+            }],
+            ..CodexPluginLock::default()
+        };
+
+        let primary_inventory = marketplaces_json_with_roots(&[(
+            PRIMARY_RUNTIME_MARKETPLACE,
+            &runtime,
+            Some(("local", &runtime)),
+        )]);
+        let default_runner = FakeRunner::new();
+        default_runner.on(
+            "plugin marketplace list --json",
+            Ok((true, primary_inventory.clone())),
+        );
+        let target_runner = FakeRunner::new();
+        target_runner.use_config(target_config.clone());
+        target_runner.on(
+            "plugin marketplace list --json",
+            Ok((true, primary_inventory)),
+        );
+        target_runner.on("plugin list --json", Ok((true, plugins_json(&[]))));
+        target_runner.on(
+            "plugin list --json",
+            Ok((
+                true,
+                plugins_json(&[(
+                    "documents@openai-primary-runtime",
+                    PRIMARY_RUNTIME_MARKETPLACE,
+                    "1.0.0",
+                    true,
+                    true,
+                )]),
+            )),
+        );
+        target_runner.on(
+            "plugin add documents@openai-primary-runtime",
+            Ok((true, String::new())),
+        );
+
+        let mut messages = Vec::new();
+        let mut log = |level: &str, message: &str| {
+            messages.push(format!("{}: {}", level, message));
+        };
+        let report = apply_approved_managed_plan(
+            &target_runner,
+            &default_runner,
+            &lock,
+            &target_home,
+            &default_home,
+            &mut log,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report.state,
+            CodexRepairState::Ready,
+            "report: {:?}; logs: {:?}",
+            report,
+            messages
+        );
+        assert_eq!(
+            report.plugins_installed,
+            ["documents@openai-primary-runtime"]
+        );
+        assert_eq!(
+            report.managed_marketplaces_provisioned,
+            [PRIMARY_RUNTIME_MARKETPLACE]
+        );
+        let repaired = fs::read_to_string(target_config).unwrap();
+        assert!(repaired.contains("marketplaces.openai-primary-runtime"));
+        assert!(repaired.contains(runtime.to_string_lossy().as_ref()));
     }
 
     #[test]

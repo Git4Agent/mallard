@@ -307,6 +307,57 @@ test("skipping a required global tool cannot produce a ready Pull outcome", () =
   assert.match(html, /Readiness is not confirmed/);
 });
 
+test("dependency failures show the plugin name instead of its hashed action id", () => {
+  const hashedActionId = "dependency:codex:plugin:sha256-0313d68879b46d2035391eb489f0aae0c13bb8fc40c65494ee596f437bdc7f01";
+  const dependencies = dependencyPlan([{
+    action_id: hashedActionId,
+    resource_id: "codex:plugin:sha256-0313d68879b46d2035391eb489f0aae0c13bb8fc40c65494ee596f437bdc7f01",
+    kind: "install_codex_plugin",
+    display_name: "documents@openai-primary-runtime",
+    provider: "codex",
+    argv: ["plugin", "add", "documents@openai-primary-runtime"],
+    requires_explicit_approval: true,
+  }]);
+  const dependencyResult: DependencyResult = {
+    success: false,
+    message: "Applied 0 dependencies; 1 failed",
+    applied_action_ids: [],
+    failed_actions: [{
+      action_id: hashedActionId,
+      display_name: "documents@openai-primary-runtime",
+      message: "managed marketplace is unavailable",
+    }],
+  };
+
+  const html = renderToStaticMarkup(
+    <RestorePlanView
+      projectName="gam2"
+      profileLabel="myconf2"
+      plan={restorePlan}
+      binding={binding}
+      dependencyPlan={dependencies}
+      readiness={{ bundle_id: binding.bundle_id, state: "needs_setup", issues: [] }}
+      restoreResult={null}
+      dependencyResult={dependencyResult}
+      phase="complete"
+      supportLoading={false}
+      completedActionIds={new Set()}
+      completedResourceIds={new Set()}
+      failedResourceIds={new Set([dependencies.actions[0].resource_id])}
+      busy={false}
+      error={null}
+      initialStep="review"
+      onApply={() => undefined}
+      onRefresh={() => undefined}
+      onBack={() => undefined}
+    />,
+  );
+
+  assert.match(html, /documents@openai-primary-runtime/);
+  assert.match(html, /managed marketplace is unavailable/);
+  assert.doesNotMatch(html, new RegExp(hashedActionId));
+});
+
 test("the composite Apply coordinator restores, installs, then verifies one aligned generation", async () => {
   const dependencies = dependencyPlan([{
     action_id: "install-plugin",
