@@ -3250,12 +3250,78 @@ fn manifest_thread_versions(manifest: &BundleManifest) -> BTreeMap<ResourceId, T
                 ThreadVersion {
                     thread_id: descriptor.display_name.clone(),
                     display_name: descriptor.display_name.clone(),
-                    digest: descriptor.metadata.get("content_sha256").cloned(),
+                    digest: single_manifest_resource_file_digest(manifest, resource_id),
                     updated_at,
                 },
             )
         })
         .collect()
+}
+
+fn single_manifest_resource_file_digest(
+    manifest: &BundleManifest,
+    resource_id: &ResourceId,
+) -> Option<String> {
+    let mut files = manifest
+        .files
+        .values()
+        .filter(|file| &file.resource_id == resource_id);
+    let digest = files.next()?.sha256.clone();
+    files.next().is_none().then_some(digest)
+}
+
+fn single_captured_resource_file_digest(
+    captured: &provider_capture::CapturedResources,
+    resource_id: &str,
+) -> Option<String> {
+    let mut files = captured
+        .files
+        .values()
+        .filter(|file| file.resource_id == resource_id);
+    let digest = hex_digest(Sha256::digest(&files.next()?.bytes).as_slice());
+    files.next().is_none().then_some(digest)
+}
+
+fn materialized_thread_base_digests(
+    repository: &V3Repository,
+    project: &LocalProjectRegistration,
+    storage_id: &StorageId,
+    binding: &ProjectBinding,
+    base: &RecipeBase,
+) -> Result<BTreeMap<ResourceId, String>, String> {
+    let materializations = repository.load_materializations()?;
+    let record = materializations.records.iter().rev().find(|record| {
+        record.replica_id == binding.replica_id
+            && record.local_project_id == project.local_project_id
+            && record.storage_id == *storage_id
+            && record.bundle_id == project.bundle_id
+            && record.generation == base.generation
+            && record.manifest_sha256 == base.manifest_sha256
+            && record.binding_revision == binding.revision
+            && record.status == MaterializationStatus::Complete
+            && base
+                .commit_id
+                .as_ref()
+                .is_none_or(|commit_id| record.commit_id == *commit_id)
+    });
+    let Some(record) = record else {
+        return Ok(BTreeMap::new());
+    };
+    Ok(record
+        .receipts
+        .iter()
+        .filter(|receipt| {
+            receipt.action_type == RestoreActionType::MaterializeConversation
+                && receipt.status == ActionStatus::Applied
+                && receipt.resource_id.as_str().starts_with("codex:session:")
+        })
+        .filter_map(|receipt| {
+            receipt
+                .target_sha256_after
+                .as_ref()
+                .map(|digest| (receipt.resource_id.clone(), digest.clone()))
+        })
+        .collect())
 }
 
 fn classify_thread_sync_state(
@@ -3264,12 +3330,28 @@ fn classify_thread_sync_state(
     base_known: bool,
     base_digest: Option<&str>,
 ) -> ThreadSyncState {
+    classify_thread_sync_state_with_side_bases(
+        local_digest,
+        storage_digest,
+        base_known,
+        base_digest,
+        base_digest,
+    )
+}
+
+fn classify_thread_sync_state_with_side_bases(
+    local_digest: Option<&str>,
+    storage_digest: Option<&str>,
+    base_known: bool,
+    local_base_digest: Option<&str>,
+    storage_base_digest: Option<&str>,
+) -> ThreadSyncState {
     if local_digest == storage_digest {
         return ThreadSyncState::Synced;
     }
     if base_known {
-        let local_changed = local_digest != base_digest;
-        let storage_changed = storage_digest != base_digest;
+        let local_changed = local_digest != local_base_digest;
+        let storage_changed = storage_digest != storage_base_digest;
         return match (local_changed, storage_changed) {
             (true, false) => ThreadSyncState::LocalAhead,
             (false, true) => ThreadSyncState::StorageAhead,
@@ -3399,7 +3481,7 @@ fn get_project_thread_sync_comparison_with_repository(
                 ThreadVersion {
                     thread_id: resource.descriptor.display_name.clone(),
                     display_name: resource.descriptor.display_name.clone(),
-                    digest: Some(resource.content_sha256.clone()),
+                    digest: single_captured_resource_file_digest(&captured, resource_id),
                     updated_at,
                 },
             ))
@@ -3456,6 +3538,12 @@ fn get_project_thread_sync_comparison_with_repository(
         .as_ref()
         .map(manifest_thread_versions)
         .unwrap_or_default();
+    let materialized_base_digests = match base {
+        Some(base) => {
+            materialized_thread_base_digests(repository, &project, storage_id, &binding, base)?
+        }
+        None => BTreeMap::new(),
+    };
 
     let resource_ids = local_descriptors
         .keys()
@@ -3497,11 +3585,17 @@ fn get_project_thread_sync_comparison_with_repository(
         let state = if status_detail.is_some() {
             ThreadSyncState::Unavailable
         } else {
-            classify_thread_sync_state(
+            let storage_base_digest = base_version.and_then(|version| version.digest.as_deref());
+            let local_base_digest = materialized_base_digests
+                .get(&resource_id)
+                .map(String::as_str)
+                .or(storage_base_digest);
+            classify_thread_sync_state_with_side_bases(
                 local_digest,
                 storage_digest,
                 base_resource_known,
-                base_version.and_then(|version| version.digest.as_deref()),
+                local_base_digest,
+                storage_base_digest,
             )
         };
         let descriptor = local.or(remote).or(base_version);
@@ -10781,7 +10875,7 @@ mod tests {
         assert_eq!(applied.applied_action_ids.len(), 2);
 
         let restored_session =
-            std::fs::read_to_string(target_codex.join(session_relative)).unwrap();
+            std::fs::read_to_string(target_codex.join(&session_relative)).unwrap();
         let rows = restored_session
             .lines()
             .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
@@ -10808,6 +10902,49 @@ mod tests {
             get_bundle_readiness_with_repository(&repo, &storage_id, &bundle_id, &target_binding)
                 .unwrap();
         assert_eq!(after.state, "ready");
+
+        let comparison = get_project_thread_sync_comparison_with_repository(
+            &repo,
+            &target.local_project_id,
+            &storage_id,
+        )
+        .unwrap();
+        let restored_thread = comparison
+            .entries
+            .iter()
+            .find(|entry| entry.thread_id == session_id)
+            .unwrap();
+        assert_eq!(
+            restored_thread.state,
+            ThreadSyncState::Synced,
+            "replica-specific cwd rewriting must not look like a local edit"
+        );
+
+        let mut locally_extended = restored_session;
+        locally_extended.push_str(&format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": { "message": "continued locally" },
+            })
+        ));
+        std::fs::write(target_codex.join(&session_relative), locally_extended).unwrap();
+        let changed = get_project_thread_sync_comparison_with_repository(
+            &repo,
+            &target.local_project_id,
+            &storage_id,
+        )
+        .unwrap();
+        assert_eq!(
+            changed
+                .entries
+                .iter()
+                .find(|entry| entry.thread_id == session_id)
+                .unwrap()
+                .state,
+            ThreadSyncState::LocalAhead,
+            "real local transcript changes must still be detected"
+        );
     }
 
     #[test]

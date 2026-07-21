@@ -10,7 +10,7 @@ import type {
 } from "../../types";
 import Icon from "../Icons";
 import { projectSyncApi } from "./api";
-import { compactProjectPath, errorMessage, formatRelativeTime, projectLabel } from "./model";
+import { compactProjectPath, errorMessage, projectLabel } from "./model";
 
 interface PageProps {
   project: LocalProjectSummary;
@@ -77,18 +77,25 @@ function formatCount(value?: number | null): string {
   return new Intl.NumberFormat(undefined, { notation: value >= 1_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value);
 }
 
-function threadSyncPresentation(entry: ThreadSyncEntry, storageName: string) {
+type ThreadSyncPresentation = {
+  glyph?: "+" | "●" | "↓";
+  icon?: "alert-triangle" | "ban" | "help-circle";
+  className: string;
+  label: string;
+};
+
+export function threadSyncPresentation(entry: ThreadSyncEntry, storageName: string): ThreadSyncPresentation {
   switch (entry.state) {
     case "synced":
-      return { icon: "check-circle" as const, className: "synced", label: `Up to date here and in ${storageName}.` };
+      return { glyph: "●", className: "synced", label: `Up to date here and in ${storageName}.` };
     case "local_only":
-      return { icon: "upload" as const, className: "local", label: `Only on this computer. Push to save it in ${storageName}.` };
+      return { glyph: "+", className: "local", label: `Only on this computer. Push to save it in ${storageName}.` };
     case "local_ahead":
-      return { icon: "upload" as const, className: "local", label: `Newer on this computer. Push to update ${storageName}.` };
+      return { glyph: "●", className: "local", label: `Newer on this computer. Push to update ${storageName}.` };
     case "storage_only":
-      return { icon: "download" as const, className: "storage", label: `Only in ${storageName}. Pull to download it here.` };
+      return { glyph: "↓", className: "storage", label: `Only in ${storageName}. Pull to download it here.` };
     case "storage_ahead":
-      return { icon: "download" as const, className: "storage", label: `Newer in ${storageName}. Pull to update this computer.` };
+      return { glyph: "↓", className: "storage", label: `Newer in ${storageName}. Pull to update this computer.` };
     case "diverged":
       return { icon: "alert-triangle" as const, className: "diverged", label: `Changed here and in ${storageName}. Review before syncing.` };
     case "unavailable":
@@ -111,7 +118,11 @@ function ThreadSyncIndicator({ entry, storageName }: { entry: ThreadSyncEntry; s
       aria-label={presentation.label}
       tabIndex={0}
     >
-      <Icon name={presentation.icon} size={13} />
+      {presentation.glyph
+        ? <span className="v3-thread-sync-glyph" aria-hidden="true">{presentation.glyph}</span>
+        : presentation.icon
+          ? <Icon name={presentation.icon} size={13} />
+          : null}
     </span>
   );
 }
@@ -184,7 +195,6 @@ function ThreadCard({
 }: ThreadCardProps) {
   const launchable = THREAD_UUID.test(thread.thread_id);
   const chatDetailsId = `thread-chat-${occurrenceKey.replace(/[^a-z0-9_-]/gi, "-")}`;
-  const updatedLabel = `Updated ${formatDate(thread.ended_at)}`;
   const chatDetailsLabel = detailsOpen
     ? "Hide chat history"
     : details?.page
@@ -214,25 +224,16 @@ function ThreadCard({
           {reviewStateLabel && (
             <span className={`v3-sync-review-state state-${syncEntry?.state ?? "local_only"}`}>{reviewStateLabel}</span>
           )}
-          <time
-            className="v3-history-thread-updated"
-            dateTime={new Date(thread.ended_at * 1_000).toISOString()}
-            title={updatedLabel}
-            aria-label={updatedLabel}
-          >
-            {formatRelativeTime(thread.ended_at)}
-          </time>
         </div>
         <div className="v3-history-thread-actions">
           <button type="button" className="btn btn-ghost v3-history-launch-action" disabled={!launchable || busy}
             onClick={() => onOpenCodex(thread.thread_id)} title={busy ? "Opening in Codex…" : "Open in Codex"}
             aria-label={busy ? "Opening in Codex" : "Open in Codex"}>
             <Icon name={busy ? "refresh" : "openai"} size={15} className={busy ? "icon-spin" : "v3-openai-icon"} />
-            {busy ? "Opening…" : "Open in Codex"}
           </button>
           <button type="button" className="btn btn-ghost v3-history-launch-action" disabled={!launchable || busy}
             onClick={() => onOpenTerminal(thread.thread_id)} title="Open in Terminal" aria-label="Open in Terminal">
-            <Icon name="terminal" size={14} /> Open in Terminal
+            <Icon name="terminal" size={14} />
           </button>
         </div>
       </div>
@@ -244,7 +245,7 @@ function ThreadCard({
             <button type="button" className={`btn btn-ghost v3-history-chat-toggle${detailsOpen ? " active" : ""}`}
               aria-label={chatDetailsLabel} title={chatDetailsLabel} aria-expanded={detailsOpen} aria-controls={chatDetailsId}
               onClick={() => onToggleDetails(thread.thread_id, occurrenceKey)}>
-              <Icon name="message" size={13} />{chatDetailsLabel}
+              <Icon name="message" size={13} />
             </button>
           )}
         </div>
@@ -289,7 +290,6 @@ function StoredThreadCard({
   selectionDisabled?: boolean;
   onToggleResource?: (resourceId: string) => void;
 }) {
-  const updatedAt = entry.storage_updated_at ?? entry.local_updated_at ?? null;
   const shortId = entry.thread_id.length > 12 ? entry.thread_id.slice(0, 8) : entry.thread_id;
   const title = entry.display_name && entry.display_name !== entry.thread_id
     ? entry.display_name
@@ -313,15 +313,6 @@ function StoredThreadCard({
           <ThreadSyncIndicator entry={entry} storageName={storageName} />
           <strong>{title}</strong>
           {reviewStateLabel && <span className={`v3-sync-review-state state-${entry.state}`}>{reviewStateLabel}</span>}
-          {updatedAt && (
-            <time
-              className="v3-history-thread-updated"
-              dateTime={new Date(updatedAt * 1_000).toISOString()}
-              title={`Updated ${formatDate(updatedAt)}`}
-            >
-              {formatRelativeTime(updatedAt)}
-            </time>
-          )}
         </div>
       </div>
     </article>

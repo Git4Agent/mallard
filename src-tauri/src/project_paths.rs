@@ -406,6 +406,23 @@ pub fn create_claude_alias(
     }
 }
 
+/// Windows does not offer the same permission-free relative directory-link
+/// behavior as Unix. Keep the project mapping operation fail-closed until a
+/// Windows-native alias strategy is implemented.
+#[cfg(not(unix))]
+pub fn create_claude_alias(
+    _projects_dir: &Path,
+    mapping: &ProjectPathMapping,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if encode_claude_project_path(&mapping.target_path) == mapping.source_key {
+        return Ok(None);
+    }
+    Err(
+        "Claude project folder remapping is not supported on Windows yet; use the original project path"
+            .to_string(),
+    )
+}
+
 /// Unlink a mapping's alias only when it is exactly the expected relative
 /// link. A missing alias is fine (already gone); anything unexpected at the
 /// name is left alone and reported.
@@ -575,6 +592,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn claude_alias_state_matrix() {
         let dir = tempfile::tempdir().unwrap();
@@ -646,6 +664,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn claude_alias_create_and_remove_lifecycle() {
         let dir = tempfile::tempdir().unwrap();

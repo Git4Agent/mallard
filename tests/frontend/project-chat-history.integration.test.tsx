@@ -6,6 +6,7 @@ import Icon from "../../src/components/Icons";
 import ProjectChatHistoryPage, {
   ProjectChatHistoryContent,
   ThreadMetrics,
+  threadSyncPresentation,
 } from "../../src/components/project-sync/ProjectChatHistoryPage";
 import ProjectSidebar from "../../src/components/project-sync/ProjectSidebar";
 import { createSingleFlight } from "../../src/components/project-sync/api";
@@ -69,6 +70,31 @@ const history = {
     last_push_at: 1_752_800_000,
   }],
 };
+
+test("V3 thread indicators use the file-status symbol vocabulary", () => {
+  const presentation = (state: Parameters<typeof threadSyncPresentation>[0]["state"]) => (
+    threadSyncPresentation({ state } as Parameters<typeof threadSyncPresentation>[0], "Storage")
+  );
+
+  assert.deepEqual(
+    ["local_only", "local_ahead", "storage_only", "storage_ahead", "synced"].map((state) => {
+      const { glyph, className } = presentation(state as Parameters<typeof presentation>[0]);
+      return { glyph, className };
+    }),
+    [
+      { glyph: "+", className: "local" },
+      { glyph: "●", className: "local" },
+      { glyph: "↓", className: "storage" },
+      { glyph: "↓", className: "storage" },
+      { glyph: "●", className: "synced" },
+    ],
+  );
+
+  const css = readFileSync("src/App.css", "utf8");
+  assert.match(css, /\.v3-thread-sync-indicator\.synced \{ color: var\(--text-2\); \}/);
+  assert.match(css, /\.v3-thread-sync-indicator\.local \{ color: var\(--green\); \}/);
+  assert.match(css, /\.v3-thread-sync-indicator\.storage \{ color: var\(--blue\); \}/);
+});
 
 test("sync tooltip hover keeps the sibling icon rail geometry stable", () => {
   const css = readFileSync("src/App.css", "utf8");
@@ -182,8 +208,8 @@ test("history content uses the local alias and renders commit/thread actions", (
   assert.match(html, /aria-label="Last push:/);
   assert.match(html, /Repository: mallard/);
   assert.match(html, /Add project-scoped history/);
-  assert.match(html, /class="v3-history-thread-updated"/);
-  assert.match(html, /aria-label="Updated [^"]+"/);
+  assert.doesNotMatch(html, /v3-history-thread-updated/);
+  assert.doesNotMatch(html, /aria-label="Updated [^"]+"/);
   assert.doesNotMatch(html, /aria-label="Show session details"/);
   assert.doesNotMatch(html, /aria-label="Hide session details"/);
   assert.match(html, /aria-label="Started [^"]+"/);
@@ -198,8 +224,9 @@ test("history content uses the local alias and renders commit/thread actions", (
   assert.match(html, /aria-label="Open in Codex"/);
   assert.match(html, /aria-label="Open in Terminal"/);
   assert.match(html, /v3-openai-icon/);
-  assert.match(html, />Open in Codex</);
-  assert.match(html, /> Open in Terminal</);
+  assert.doesNotMatch(html, />Open in Codex</);
+  assert.doesNotMatch(html, /> Open in Terminal</);
+  assert.doesNotMatch(html, />Load chat history</);
   assert.doesNotMatch(html, /Show chat details/);
 });
 
@@ -210,6 +237,19 @@ test("permanent session summaries label every metric icon", () => {
   assert.match(html, /data-tooltip="Total tokens · 24\.8K"/);
   assert.match(html, /data-tooltip="Agent messages · 5"/);
   assert.match(html, /data-tooltip="Tool calls · 8"/);
+});
+
+test("thread icon actions stay compact and the chat action follows the metrics", () => {
+  const css = readFileSync("src/App.css", "utf8");
+  const metaRule = css.match(/\.v3-history-session-summary \.v3-history-thread-meta\s*\{[^}]+\}/s)?.[0] ?? "";
+  const chatRule = css.match(/\.v3-history-chat-toggle\s*\{[^}]+\}/s)?.[0] ?? "";
+  const launchRule = css.match(/\.v3-history-thread-actions \.v3-history-launch-action\s*\{[^}]+\}/s)?.[0] ?? "";
+
+  assert.match(metaRule, /flex:\s*0 1 auto/);
+  assert.match(chatRule, /width:\s*24px/);
+  assert.match(chatRule, /padding:\s*0/);
+  assert.match(launchRule, /width:\s*28px/);
+  assert.match(launchRule, /padding:\s*0/);
 });
 
 test("chat history remains independently collapsible under the permanent summary", () => {
@@ -415,6 +455,8 @@ test("selected storage adds directional indicators and storage-only threads", ()
   assert.doesNotMatch(html, /title="2 local thread changes"/);
   assert.match(html, /aria-label="Newer on this computer\. Push to update Local storage 1\."/);
   assert.match(html, /aria-label="Only in Local storage 1\. Pull to download it here\."/);
+  assert.match(html, /v3-thread-sync-indicator local[^>]+aria-label="Newer on this computer\.[^"]+"[^>]*><span class="v3-thread-sync-glyph" aria-hidden="true">●<\/span>/);
+  assert.match(html, /v3-thread-sync-indicator storage[^>]+aria-label="Only in Local storage 1\.[^"]+"[^>]*><span class="v3-thread-sync-glyph" aria-hidden="true">↓<\/span>/);
   assert.match(html, /Stored thread 019f7798/);
   assert.match(html, /aria-label="2 threads"/);
   assert.ok(

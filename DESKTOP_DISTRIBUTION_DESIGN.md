@@ -1,12 +1,12 @@
 # Desktop Distribution Design
 
-Status: Proposed
+Status: Implemented in code; production launch gates remain
 Date: 2026-07-19
-Application: Agent Sync (Tauri 2)
+Application: Mallard (Tauri 2)
 
 ## 1. Objective
 
-Distribute Agent Sync as native, installable desktop packages with a download
+Distribute Mallard as native, installable desktop packages with a download
 experience similar to the MossX client page:
 
 - macOS Apple Silicon (`.dmg`)
@@ -35,22 +35,24 @@ The repository is already close to macOS packaging readiness:
 - `npm run build` and `cargo check --manifest-path src-tauri/Cargo.toml`
   pass on macOS.
 
-The repository does not currently contain:
+This implementation adds:
 
-- a GitHub Actions release workflow;
-- platform signing configuration;
-- a Tauri updater integration; or
-- confirmed Windows-compatible backend behavior.
+- tag-triggered GitHub Actions release and guarded promotion workflows;
+- Tauri updater signing, runtime integration, and update UI;
+- public release delivery through the existing Cloudflare Worker and R2; and
+- a safe Windows fallback for the Unix-only Claude alias operation.
 
-### 2.1 Windows blockers
+Production still requires Apple and Windows publisher credentials, deployment
+of the Worker release routes, and clean-machine validation on every target.
+
+### 2.1 Windows validation gaps
 
 Generating an installer is not enough by itself: the application must first
 compile and behave correctly on Windows.
 
-The current source has one expected compile blocker:
-
-- `project_paths::create_claude_alias` is defined only under `#[cfg(unix)]`,
-  but `lib.rs` calls it without a platform guard.
+The known cross-platform compile blocker is resolved: Windows now has a
+fail-closed `create_claude_alias` implementation that returns an explicit
+unsupported message when a remap would require a Unix link.
 
 It also has runtime assumptions that need Windows implementations:
 
@@ -70,9 +72,9 @@ Each release should publish these three primary assets:
 
 | Platform | Architecture | Bundle | Suggested filename |
 |---|---|---|---|
-| macOS | Apple Silicon | DMG | `Agent-Sync_<version>_aarch64.dmg` |
-| macOS | Intel | DMG | `Agent-Sync_<version>_x64.dmg` |
-| Windows | x64 | NSIS EXE | `Agent-Sync_<version>_x64-setup.exe` |
+| macOS | Apple Silicon | DMG | `Mallard_<version>_aarch64.dmg` |
+| macOS | Intel | DMG | `Mallard_<version>_x64.dmg` |
+| Windows | x64 | NSIS EXE | `Mallard_<version>_x64-setup.exe` |
 
 Optional release assets:
 
@@ -181,76 +183,14 @@ The release flow is:
 Draft releases are preferred because they create a human review point between
 automated artifact production and public distribution.
 
-### 6.1 Workflow skeleton
+### 6.1 Implemented workflows
 
-Create `.github/workflows/release.yml` during implementation:
-
-```yaml
-name: Release desktop app
-
-on:
-  workflow_dispatch:
-  push:
-    tags:
-      - "v*"
-
-jobs:
-  release:
-    permissions:
-      contents: write
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: macos-latest
-            target: aarch64-apple-darwin
-            bundles: dmg
-          - os: macos-latest
-            target: x86_64-apple-darwin
-            bundles: dmg
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            bundles: nsis
-
-    runs-on: ${{ matrix.os }}
-
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          cache: npm
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
-
-      - uses: Swatinem/rust-cache@v2
-        with:
-          workspaces: "./src-tauri -> target"
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build and attach release artifacts
-        uses: tauri-apps/tauri-action@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tagName: v__VERSION__
-          releaseName: "Agent Sync v__VERSION__"
-          releaseBody: "Download the installer for your platform."
-          releaseDraft: true
-          prerelease: false
-          args: >-
-            --target ${{ matrix.target }}
-            --bundles ${{ matrix.bundles }}
-```
-
-The production workflow must add platform signing steps and secrets before the
-Tauri build step. It should also run the frontend and backend checks before
-creating artifacts.
+`.github/workflows/release.yml` builds the two macOS updater applications and
+DMGs plus the Windows NSIS package, creates one draft release, validates the
+generated multi-platform updater manifest, and mirrors immutable public files
+to R2. `.github/workflows/promote-release.yml` runs only after the draft is
+published and promotes the reviewed release notes and manifest to the stable
+updater endpoint. Detailed operator steps are in `docs/RELEASING.md`.
 
 ## 7. Signing and Trust
 
@@ -272,10 +212,10 @@ must remain in GitHub Actions secrets and must never be committed.
 Release verification should include:
 
 ```bash
-hdiutil verify path/to/Agent-Sync.dmg
-codesign --verify --deep --strict --verbose=2 /path/to/Agent\ Sync.app
-spctl --assess --type execute --verbose=4 /path/to/Agent\ Sync.app
-xcrun stapler validate /path/to/Agent\ Sync.app
+hdiutil verify path/to/Mallard.dmg
+codesign --verify --deep --strict --verbose=2 /path/to/Mallard.app
+spctl --assess --type execute --verbose=4 /path/to/Mallard.app
+xcrun stapler validate /path/to/Mallard.app
 ```
 
 ### 7.2 Windows
@@ -292,7 +232,7 @@ after the signing certificate expires.
 Release verification should include:
 
 ```powershell
-Get-AuthenticodeSignature .\Agent-Sync_0.1.0_x64-setup.exe
+Get-AuthenticodeSignature .\Mallard_0.1.0_x64-setup.exe
 ```
 
 The status must be `Valid`, and the signer subject must match the intended
@@ -314,7 +254,7 @@ Show:
 - minimum supported OS beside each platform;
 - installer size and SHA-256 checksum;
 - link to release notes;
-- link to all GitHub Release assets; and
+- explicit links to every public release asset; and
 - short installation guidance for macOS drag-to-Applications and Windows setup.
 
 Do not claim minimum macOS or Windows versions until packages have been tested
@@ -322,32 +262,43 @@ on clean installations of those versions.
 
 ### 8.2 Artifact resolution
 
-GitHub Releases is the simplest first hosting layer. The page can obtain the
-latest published release through the GitHub Releases API and select assets by a
-stable naming convention.
+The source repository and its GitHub Releases are private. The download page
+must resolve stable metadata from the public Worker and link to immutable R2
+objects under `/v1/releases/{version}/`, using the same artifact names as the
+updater manifest.
 
 The UI should treat operating-system detection as a recommendation, not an
 access restriction. Browser architecture detection is imperfect, so all
 downloads must remain visible.
 
-If bandwidth, analytics, or regional download performance later becomes a
-problem, mirror the immutable release assets to object storage or a CDN while
-keeping the release metadata in GitHub.
+If bandwidth, analytics, or regional performance later becomes a problem, put
+a CDN cache in front of the immutable Worker routes without changing client
+URLs.
 
 ## 9. Automatic Updates
 
-Automatic updates are a second phase and are not required to install version
-0.1.0. Without an updater, users download and install each new version manually.
+The signed updater is implemented. Mallard automatically checks after startup
+and every six hours, offers the available version without interrupting work,
+blocks restart while a Push, Pull, restore, or other tracked operation is busy,
+shows download progress, and displays the published release notes once after a
+successful restart. Choosing **Later** defers that version for 24 hours.
 
-When introduced:
+The implementation includes:
 
-- add `tauri-plugin-updater` to Rust and the frontend;
-- generate a dedicated Tauri updater signing keypair;
-- store only the public key in `tauri.conf.json`;
-- store the private key and optional password in CI secrets;
-- enable `bundle.createUpdaterArtifacts`;
-- configure an HTTPS updater endpoint; and
-- publish `latest.json`, update bundles, and `.sig` files with each release.
+- `tauri-plugin-updater` and `tauri-plugin-process` in Rust and the frontend;
+- a dedicated Tauri updater signing keypair, with only its public key committed;
+- `bundle.createUpdaterArtifacts` and the required Tauri capabilities;
+- the HTTPS endpoint `https://api.mallard-ai.com/v1/releases/latest.json`;
+- a tag-triggered native build matrix that creates a draft private GitHub
+  Release and copies its public artifacts to versioned R2 keys;
+- a separate release-published workflow that promotes the validated versioned
+  manifest to `latest.json`; and
+- public Worker routes for the manifest and immutable assets in the internal
+  Cloudflare service repository.
+
+The GitHub source repository is private, so clients never use private GitHub
+asset URLs or receive a GitHub token. Release files are copied to the public
+`releases/` prefix of the existing demo R2 bucket and streamed by the Worker.
 
 Updater signing is separate from macOS and Windows publisher signing. The
 updater private key must be backed up securely: losing it prevents existing
@@ -409,9 +360,11 @@ the developer's real `~/.codex`, `~/.claude`, or `~/.mallard` data.
 
 ### Phase 5: updates
 
-- add the Tauri updater;
-- publish signed update metadata; and
-- test upgrades and rollback/error behavior.
+- [x] add the Tauri updater and restart flow;
+- [x] publish signed update metadata through versioned R2 objects;
+- [x] add guarded promotion of `latest.json` when a draft release is published;
+- [x] deploy the Worker release routes; and
+- [ ] test real upgrades and rollback/error behavior on all release targets.
 
 ## 12. Acceptance Criteria
 
@@ -425,7 +378,7 @@ The first public desktop release is complete when:
 - core sync flows pass on all three targets;
 - the download page links the correct immutable release assets;
 - checksums and release notes are available; and
-- no certificate, token, updater private key, or local Agent Sync data is
+- no certificate, token, updater private key, or local Mallard data is
   committed to the repository.
 
 ## 13. Reference Findings
@@ -436,7 +389,7 @@ downloads by operating system and publishes support expectations. Its linked
 is an IntelliJ plugin project whose workflow builds a plugin ZIP on Ubuntu and
 uploads that ZIP to GitHub Releases.
 
-Use Tauri's release tooling for Agent Sync rather than copying that Gradle
+Use Tauri's release tooling for Mallard rather than copying that Gradle
 workflow.
 
 ## 14. Sources

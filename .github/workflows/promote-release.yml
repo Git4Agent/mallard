@@ -1,0 +1,63 @@
+name: Promote published update
+
+on:
+  release:
+    types:
+      - published
+
+concurrency:
+  group: promote-production-update
+  cancel-in-progress: false
+
+jobs:
+  promote:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      RELEASE_BASE_URL: https://api.mallard-ai.com/v1/releases
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Download versioned updater manifest
+        run: >-
+          curl --fail --show-error --location --retry 3
+          --output latest.json
+          "${RELEASE_BASE_URL}/${RELEASE_TAG}/latest.json"
+
+      - name: Read published release notes
+        run: gh release view "${RELEASE_TAG}" --json body --jq .body > release-notes.md
+
+      - name: Finalize updater manifest
+        run: >-
+          node scripts/finalize-updater-manifest.mjs
+          latest.json
+          "${RELEASE_TAG}"
+          "${RELEASE_BASE_URL}"
+          release-notes.md
+
+      - name: Verify Cloudflare publication credentials
+        shell: bash
+        run: |
+          test -n "${CLOUDFLARE_API_TOKEN:-}" || { echo "CLOUDFLARE_API_TOKEN is required"; exit 1; }
+          test -n "${CLOUDFLARE_ACCOUNT_ID:-}" || { echo "CLOUDFLARE_ACCOUNT_ID is required"; exit 1; }
+
+      - name: Promote updater manifest
+        run: >-
+          npx --yes wrangler@4.112.0 r2 object put
+          mallard-cloud-prod-demo/releases/latest.json
+          --file latest.json
+          --remote
+          --force

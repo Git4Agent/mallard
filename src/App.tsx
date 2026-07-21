@@ -8,6 +8,7 @@ import SyncPanel from "./components/SyncPanel";
 import LogPanel from "./components/LogPanel";
 import FinishSetup from "./components/FinishSetup";
 import Icon from "./components/Icons";
+import AppUpdater from "./components/AppUpdater";
 import ProjectSyncV3 from "./components/project-sync/ProjectSyncV3";
 import { profileLabel } from "./components/SyncPanel";
 import { AppTheme, CloudRootState, CodexPluginRepairReport, CodexPluginRestoreState, ConfigSource, FileEntry, FileStatusReport, PluginRepairReport, ProjectPathApplyReport, ProjectPathMapping, SetupIssue, SetupReadiness, SyncConfig, SyncStatus, SyncResult, LogLine, SyncProgress } from "./types";
@@ -118,9 +119,10 @@ interface LegacyAppProps {
   theme: AppTheme;
   onThemeChange: (theme: AppTheme) => void;
   onOpenProjects: () => void;
+  onBusyChange: (busy: boolean) => void;
 }
 
-function LegacyApp({ theme, onThemeChange, onOpenProjects }: LegacyAppProps) {
+function LegacyApp({ theme, onThemeChange, onOpenProjects, onBusyChange }: LegacyAppProps) {
 
   const [sources, setSources] = useState<ConfigSource[]>([]);
   const [loading, setLoading] = useState(true);
@@ -836,6 +838,8 @@ function LegacyApp({ theme, onThemeChange, onOpenProjects }: LegacyAppProps) {
   }, [logHeight, showLog]);
 
   const busy = syncStatus.state === "uploading" || syncStatus.state === "paused" || syncStatus.state === "downloading";
+  useEffect(() => onBusyChange(busy), [busy, onBusyChange]);
+  useEffect(() => () => onBusyChange(false), [onBusyChange]);
   const profileStats = useMemo(
     () => Object.fromEntries(
       sources.map((source) => [
@@ -1189,20 +1193,28 @@ function LegacyApp({ theme, onThemeChange, onOpenProjects }: LegacyAppProps) {
 export default function App() {
   const [theme, setTheme] = useState<AppTheme>(getStoredTheme);
   const [mode, setMode] = useState<"projects" | "legacy">("projects");
+  const [busy, setBusy] = useState(false);
 
   useEffect(() => applyTheme(theme), [theme]);
 
-  return mode === "projects" ? (
-    <ProjectSyncV3
-      theme={theme}
-      onThemeChange={setTheme}
-      onOpenLegacy={() => setMode("legacy")}
-    />
-  ) : (
-    <LegacyApp
-      theme={theme}
-      onThemeChange={setTheme}
-      onOpenProjects={() => setMode("projects")}
-    />
+  return (
+    <>
+      {mode === "projects" ? (
+        <ProjectSyncV3
+          theme={theme}
+          onThemeChange={setTheme}
+          onOpenLegacy={() => setMode("legacy")}
+          onBusyChange={setBusy}
+        />
+      ) : (
+        <LegacyApp
+          theme={theme}
+          onThemeChange={setTheme}
+          onOpenProjects={() => setMode("projects")}
+          onBusyChange={setBusy}
+        />
+      )}
+      <AppUpdater busy={busy} />
+    </>
   );
 }

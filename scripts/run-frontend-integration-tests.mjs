@@ -9,6 +9,7 @@ const projectRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const outputDirectory = await mkdtemp(join(tmpdir(), "agent-sync-frontend-tests-"));
 const entries = [
   "tests/frontend/activity-log.integration.test.tsx",
+  "tests/frontend/app-updater.integration.test.tsx",
   "tests/frontend/capability-status.integration.test.tsx",
   "tests/frontend/conversation-path-repair.integration.test.tsx",
   "tests/frontend/pull-review.integration.test.tsx",

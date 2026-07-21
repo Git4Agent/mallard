@@ -9039,9 +9039,20 @@ div.storage-link-main {
   flex: 0 0 auto;
 }
 
-.v3-thread-sync-indicator.synced { color: var(--green); }
-.v3-thread-sync-indicator.local { color: var(--accent); }
-.v3-thread-sync-indicator.storage { color: var(--text-1); }
+.v3-thread-sync-glyph {
+  display: block;
+  min-width: 13px;
+  color: currentColor;
+  font-family: var(--font);
+  font-size: 14px;
+  font-weight: 750;
+  line-height: 1;
+  text-align: center;
+}
+
+.v3-thread-sync-indicator.synced { color: var(--text-2); }
+.v3-thread-sync-indicator.local { color: var(--green); }
+.v3-thread-sync-indicator.storage { color: var(--blue); }
 .v3-thread-sync-indicator.diverged,
 .v3-thread-sync-error { color: var(--yellow); }
 .v3-thread-sync-indicator.unavailable { color: var(--red); }
@@ -9093,14 +9104,6 @@ div.storage-link-main {
 .v3-thread-sync-indicator:focus-visible,
 .v3-thread-sync-error:focus-visible {
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent);
-}
-
-.v3-history-thread-updated {
-  flex: 0 0 auto;
-  color: var(--text-3);
-  font-size: 10.5px;
-  font-weight: 450;
-  white-space: nowrap;
 }
 
 .v3-history-stored-thread .v3-history-thread-title > strong {
@@ -9172,8 +9175,8 @@ div.storage-link-main {
 .v3-history-thread-meta .v3-history-partial svg { color: inherit; }
 .v3-history-session-details { display: grid; gap: 8px; }
 .v3-history-session-summary { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; }
-.v3-history-session-summary .v3-history-thread-meta { flex: 1 1 auto; }
-.v3-history-chat-toggle { min-height: 24px; flex: 0 0 auto; gap: 6px; padding: 0 7px; color: var(--text-2); font-size: 10.5px; }
+.v3-history-session-summary .v3-history-thread-meta { flex: 0 1 auto; }
+.v3-history-chat-toggle { width: 24px; min-width: 24px; min-height: 24px; flex: 0 0 auto; padding: 0; color: var(--text-2); }
 .v3-history-chat-toggle.active { color: var(--text-0); }
 .v3-history-chat-details { display: grid; gap: 2px; padding-top: 7px; border-top: 1px solid var(--border); }
 .v3-history-load-older { min-height: 26px; justify-self: start; margin-bottom: 5px; font-size: 10.5px; }
@@ -9202,11 +9205,11 @@ div.storage-link-main {
 }
 
 .v3-history-thread-actions .v3-history-launch-action {
+  width: 28px;
+  min-width: 28px;
   min-height: 28px;
-  gap: 6px;
-  padding: 0 8px;
+  padding: 0;
   border: 0;
-  font-size: 10.5px;
 }
 
 .v3-history-thread-actions .v3-history-launch-action + .v3-history-launch-action {
@@ -9887,4 +9890,250 @@ button.v3-project-file-expand { cursor: pointer; }
     flex-direction: column;
     gap: 9px;
   }
+}
+
+/* ── Signed application updates ─────────────────── */
+
+.app-update-notice {
+  position: fixed;
+  z-index: 480;
+  right: 16px;
+  bottom: 16px;
+  width: min(430px, calc(100vw - 32px));
+  padding: 13px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 9px 11px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  border-radius: 13px;
+  background: var(--surface-overlay);
+  box-shadow: var(--shadow-popover);
+  backdrop-filter: blur(20px);
+  animation: app-update-enter 180ms ease-out;
+}
+
+.app-update-notice.error {
+  border-color: color-mix(in srgb, var(--red) 28%, var(--border));
+}
+
+.app-update-notice-icon,
+.app-update-progress-icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  border-radius: 9px;
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.app-update-notice.error .app-update-notice-icon {
+  color: var(--red);
+  background: var(--danger-soft);
+}
+
+.app-update-notice-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.app-update-notice-copy strong {
+  overflow: hidden;
+  color: var(--text-0);
+  font-size: 12.5px;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.app-update-notice-copy span {
+  display: -webkit-box;
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 10.5px;
+  line-height: 1.4;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.app-update-notice-copy small {
+  color: var(--yellow);
+  font-size: 9.5px;
+}
+
+.app-update-notice-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+  padding-top: 2px;
+}
+
+.app-update-notice-actions .btn {
+  min-height: 30px;
+  padding: 0 10px;
+  font-size: 10.5px;
+}
+
+.app-update-backdrop {
+  position: fixed;
+  z-index: 500;
+  inset: 0;
+  padding: 24px;
+  display: grid;
+  place-items: center;
+  background: color-mix(in srgb, var(--app-shell) 70%, transparent);
+  backdrop-filter: blur(10px);
+}
+
+.app-update-progress-card,
+.app-whats-new-card {
+  width: min(480px, 100%);
+  border: 1px solid var(--border-mid);
+  border-radius: 16px;
+  background: var(--surface-card);
+  box-shadow: var(--shadow-card);
+  animation: app-update-enter 180ms ease-out;
+}
+
+.app-update-progress-card {
+  padding: 21px;
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 13px;
+}
+
+.app-update-progress-card h2,
+.app-whats-new-card h2 {
+  color: var(--text-0);
+  font-size: 16px;
+  font-weight: 650;
+  letter-spacing: -0.02em;
+}
+
+.app-update-progress-card p {
+  margin-top: 4px;
+  color: var(--text-2);
+  font-size: 10.5px;
+  line-height: 1.45;
+}
+
+.app-update-progress-track {
+  position: relative;
+  grid-column: 1 / -1;
+  height: 5px;
+  overflow: hidden;
+  border-radius: var(--r-pill);
+  background: var(--loader-track);
+}
+
+.app-update-progress-track > span {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 160ms ease;
+}
+
+.app-update-progress-track.indeterminate > span {
+  width: 38%;
+  animation: app-update-indeterminate 1.1s ease-in-out infinite;
+}
+
+.app-update-progress-card > small {
+  grid-column: 1 / -1;
+  margin-top: -5px;
+  color: var(--text-3);
+  font-size: 9.5px;
+}
+
+.app-whats-new-card {
+  width: min(620px, 100%);
+  max-height: min(680px, calc(100vh - 48px));
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+.app-whats-new-card > header {
+  padding: 18px 20px 15px;
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+.app-whats-new-card > header span {
+  display: block;
+  margin-bottom: 2px;
+  color: var(--green);
+  font-size: 9.5px;
+  font-weight: 650;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.app-whats-new-card > header .app-update-progress-icon {
+  color: var(--green);
+  background: color-mix(in srgb, var(--green) 10%, transparent);
+}
+
+.app-whats-new-body {
+  min-height: 0;
+  padding: 17px 21px;
+  overflow-y: auto;
+  color: var(--text-1);
+  font-size: 11.5px;
+  line-height: 1.6;
+}
+
+.app-whats-new-body h1,
+.app-whats-new-body h2,
+.app-whats-new-body h3 {
+  margin: 15px 0 6px;
+  color: var(--text-0);
+  font-size: 13px;
+}
+
+.app-whats-new-body h1:first-child,
+.app-whats-new-body h2:first-child,
+.app-whats-new-body h3:first-child { margin-top: 0; }
+.app-whats-new-body p + p { margin-top: 9px; }
+.app-whats-new-body ul,
+.app-whats-new-body ol { margin: 7px 0 7px 19px; }
+.app-whats-new-body code { font-family: var(--font-mono); font-size: 10.5px; }
+.app-whats-new-body a { color: var(--accent); }
+
+.app-whats-new-card > footer {
+  padding: 10px 13px;
+  display: flex;
+  justify-content: flex-end;
+  border-top: 1px solid var(--border);
+  background: var(--surface-footer);
+}
+
+@keyframes app-update-enter {
+  from { opacity: 0; transform: translateY(7px) scale(0.99); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+
+@keyframes app-update-indeterminate {
+  0% { left: -38%; }
+  55% { left: 45%; }
+  100% { left: 100%; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-update-notice,
+  .app-update-progress-card,
+  .app-whats-new-card { animation: none; }
+  .app-update-progress-track.indeterminate > span { animation-duration: 2s; }
+}
+
+@media (max-width: 520px) {
+  .app-update-notice { right: 10px; bottom: 10px; width: calc(100vw - 20px); }
+  .app-update-backdrop { padding: 12px; }
+  .app-update-progress-card { padding: 17px; }
 }
