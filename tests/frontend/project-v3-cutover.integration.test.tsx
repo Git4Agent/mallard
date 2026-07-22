@@ -34,3 +34,30 @@ test("the production Tauri handler exposes only V3 sync and shared log commands"
   const persistence = readFileSync("src-tauri/src/project_sync_v3/persistence.rs", "utf8");
   assert.match(persistence, /schema-2 configuration, baselines,[\s\S]*are neither read nor overwritten/);
 });
+
+test("the desktop shell supports a persistent sidebar toggle and keyboard shortcut", () => {
+  const workspace = readFileSync("src/components/project-sync/ProjectSyncV3.tsx", "utf8");
+  const sidebar = readFileSync("src/components/project-sync/ProjectSidebar.tsx", "utf8");
+  const icons = readFileSync("src/components/Icons.tsx", "utf8");
+  const css = readFileSync("src/App.css", "utf8");
+  const tauriConfig = JSON.parse(readFileSync("src-tauri/tauri.conf.json", "utf8"));
+
+  assert.match(workspace, /PROJECT_SIDEBAR_VISIBILITY_KEY/);
+  assert.match(workspace, /aria-keyshortcuts="Meta\+B Control\+B"/);
+  assert.match(workspace, /event\.metaKey/);
+  assert.match(workspace, /event\.ctrlKey/);
+  assert.match(workspace, /className="v3-sidebar-toggle"/);
+  assert.match(workspace, /sidebarVisible \? "sidebar-collapse" : "sidebar-expand"/);
+  assert.match(sidebar, /id="project-sidebar"/);
+  assert.match(icons, /\| "sidebar-collapse"/);
+  assert.match(icons, /\| "sidebar-expand"/);
+  assert.match(css, /\.v3-app\.sidebar-hidden \.v3-sidebar/);
+  assert.match(css, /\.v3-app\.sidebar-hidden \.v3-titlebar/);
+  assert.match(css, /\.v3-sidebar-toggle \{[^}]*top: 14px;[^}]*left: 87px;/);
+  assert.match(css, /\.v3-app\.sidebar-hidden \.v3-titlebar \{[^}]*padding-left: 140px;/);
+  assert.match(css, /\.v3-app\.sidebar-hidden \.v3-titlebar::before \{[^}]*left: 123px;/);
+  assert.match(css, /\.v3-titlebar \{[^}]*height: 52px;[^}]*min-height: 52px;[^}]*flex: 0 0 52px;/);
+  assert.match(css, /\.v3-sidebar-drag \{[^}]*height: 38px;/);
+  assert.match(css, /\.v3-sidebar-brand \{[^}]*height: 52px;/);
+  assert.deepEqual(tauriConfig.app.windows[0].trafficLightPosition, { x: 8, y: 29 });
+});

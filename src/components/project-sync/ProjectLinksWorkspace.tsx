@@ -305,6 +305,7 @@ export default function ProjectLinksWorkspace({
   const bundleRequestRef = useRef(0);
   const storageSettingsRef = useRef<HTMLDivElement>(null);
   const storagePickerRef = useRef<HTMLDivElement>(null);
+  const storagePickerMenuRef = useRef<HTMLDivElement>(null);
   const storagePickerTriggerRef = useRef<HTMLButtonElement>(null);
 
   useEffect(() => {
@@ -335,10 +336,16 @@ export default function ProjectLinksWorkspace({
 
   useEffect(() => {
     if (!storagePickerProjectId) return;
+    const pickerContains = (target: EventTarget | null) => target instanceof Node && (
+      storagePickerRef.current?.contains(target) || storagePickerMenuRef.current?.contains(target)
+    );
     const handlePointerDown = (event: PointerEvent) => {
-      if (!storagePickerRef.current?.contains(event.target as Node)) {
+      if (!pickerContains(event.target)) {
         setStoragePickerProjectId(null);
       }
+    };
+    const handleFocusIn = (event: FocusEvent) => {
+      if (!pickerContains(event.target)) setStoragePickerProjectId(null);
     };
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
@@ -346,9 +353,11 @@ export default function ProjectLinksWorkspace({
       window.requestAnimationFrame(() => storagePickerTriggerRef.current?.focus());
     };
     document.addEventListener("pointerdown", handlePointerDown);
+    document.addEventListener("focusin", handleFocusIn);
     document.addEventListener("keydown", handleKeyDown);
     return () => {
       document.removeEventListener("pointerdown", handlePointerDown);
+      document.removeEventListener("focusin", handleFocusIn);
       document.removeEventListener("keydown", handleKeyDown);
     };
   }, [storagePickerProjectId]);
@@ -890,15 +899,14 @@ export default function ProjectLinksWorkspace({
                       const storageControlsLocked = busy
                         || !!runningAction
                         || storageActionLockedForReview(activeReviewKind, "storage");
-                      const focusStorageOption = (position: "selected" | "first" | "last") => {
+                      const focusStorageOption = (position: "first" | "last") => {
                         window.requestAnimationFrame(() => {
-                          const options = Array.from(storagePickerRef.current?.querySelectorAll<HTMLButtonElement>(
-                            '[role="menuitemradio"]',
+                          const options = Array.from(storagePickerMenuRef.current?.querySelectorAll<HTMLButtonElement>(
+                            '[role="menuitem"]',
                           ) ?? []);
                           if (options.length === 0) return;
                           if (position === "first") options[0]?.focus();
-                          else if (position === "last") options[options.length - 1]?.focus();
-                          else options.find((option) => option.getAttribute("aria-checked") === "true")?.focus();
+                          else options[options.length - 1]?.focus();
                         });
                       };
 
@@ -911,97 +919,50 @@ export default function ProjectLinksWorkspace({
                           <div className="storage-link-row">
                             <div className="storage-link-storage-section">
                               <div ref={storagePickerRef} className="storage-link-main">
-                                <span className="storage-link-icon">
-                                  <Icon name={storage.kind === "local" ? "drive" : "cloud"} size={23} />
-                                </span>
-                                <span className="storage-link-copy">
-                                  {linkedStorages.length > 1 ? (
-                                    <span className={`storage-link-name-picker${storagePickerOpen ? " open" : ""}`}>
-                                      <button
-                                        ref={storagePickerTriggerRef}
-                                        type="button"
-                                        className="storage-link-name-trigger"
-                                        disabled={storageControlsLocked}
-                                        aria-haspopup="menu"
-                                        aria-expanded={storagePickerOpen}
-                                        aria-controls={`storage-picker-${project.local_project_id}`}
-                                        title="Choose the storage used to compare, pull, and push"
-                                        onClick={() => {
-                                          setLinkingProjectId(null);
-                                          setStoragePickerProjectId((current) => (
-                                            current === project.local_project_id ? null : project.local_project_id
-                                          ));
-                                        }}
-                                        onKeyDown={(event) => {
-                                          if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
-                                          event.preventDefault();
-                                          setStoragePickerProjectId(project.local_project_id);
-                                          focusStorageOption(event.key === "ArrowDown" ? "selected" : "last");
-                                        }}
-                                        aria-label={`Active storage: ${storage.name || "unnamed"}. Choose another storage`}
-                                      >
-                                        <strong>{storage.name || "(unnamed)"}</strong>
-                                        <Icon name="chevron-down" size={12} aria-hidden="true" />
-                                      </button>
-                                    </span>
-                                  ) : (
-                                    <strong>{storage.name || "(unnamed)"}</strong>
-                                  )}
-                                  <span title={storageSubtitle(storage)}>{storageSubtitle(storage)}</span>
-                                </span>
-
-                                {linkedStorages.length > 1 && (
-                                  <div
-                                    id={`storage-picker-${project.local_project_id}`}
-                                    className="storage-link-menu"
-                                    role="menu"
-                                    aria-label="Choose active storage"
-                                    hidden={!storagePickerOpen}
-                                    onKeyDown={(event) => {
-                                      const options = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>(
-                                        '[role="menuitemradio"]',
+                                {linkedStorages.length > 1 ? (
+                                  <button
+                                    ref={storagePickerTriggerRef}
+                                    type="button"
+                                    className={`storage-link-identity storage-link-switcher${storagePickerOpen ? " open" : ""}`}
+                                    disabled={storageControlsLocked}
+                                    aria-haspopup="menu"
+                                    aria-expanded={storagePickerOpen}
+                                    aria-controls={`storage-picker-${project.local_project_id}`}
+                                    title="Choose the storage used to compare, pull, and push"
+                                    onClick={() => {
+                                      setLinkingProjectId(null);
+                                      setStoragePickerProjectId((current) => (
+                                        current === project.local_project_id ? null : project.local_project_id
                                       ));
-                                      const currentIndex = options.indexOf(document.activeElement as HTMLButtonElement);
-                                      let nextIndex: number | null = null;
-                                      if (event.key === "ArrowDown") nextIndex = (currentIndex + 1) % options.length;
-                                      if (event.key === "ArrowUp") nextIndex = (currentIndex - 1 + options.length) % options.length;
-                                      if (event.key === "Home") nextIndex = 0;
-                                      if (event.key === "End") nextIndex = options.length - 1;
-                                      if (nextIndex === null || options.length === 0) return;
-                                      event.preventDefault();
-                                      options[nextIndex]?.focus();
                                     }}
+                                    onKeyDown={(event) => {
+                                      if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return;
+                                      event.preventDefault();
+                                      setStoragePickerProjectId(project.local_project_id);
+                                      focusStorageOption(event.key === "ArrowDown" ? "first" : "last");
+                                    }}
+                                    aria-label={`Active storage: ${storage.name || "unnamed"}. Choose another storage`}
                                   >
-                                    {linkedStorages.map((linkedStorage) => {
-                                      const isSelected = linkedStorage.id === storage.id;
-                                      return (
-                                        <button
-                                          key={linkedStorage.id}
-                                          type="button"
-                                          role="menuitemradio"
-                                          aria-checked={isSelected}
-                                          className={`storage-link-menu-option${isSelected ? " selected" : ""}`}
-                                          disabled={storageControlsLocked}
-                                          onClick={() => {
-                                            setStoragePickerProjectId(null);
-                                            if (!isSelected) {
-                                              if (reviewOpen) inlineStorageReview?.onClose();
-                                              void onSelectStorage(project.local_project_id, linkedStorage.id);
-                                            }
-                                            window.requestAnimationFrame(() => storagePickerTriggerRef.current?.focus());
-                                          }}
-                                        >
-                                          <span className={`storage-link-selector${isSelected ? " active" : ""}`} aria-hidden="true"><span /></span>
-                                          <span className="storage-link-menu-icon" aria-hidden="true">
-                                            <Icon name={linkedStorage.kind === "local" ? "drive" : "cloud"} size={20} />
-                                          </span>
-                                          <span className="storage-link-menu-copy">
-                                            <strong>{linkedStorage.name || "(unnamed)"}</strong>
-                                            <span title={storageSubtitle(linkedStorage)}>{storageSubtitle(linkedStorage)}</span>
-                                          </span>
-                                        </button>
-                                      );
-                                    })}
+                                    <span className="storage-link-icon" aria-hidden="true">
+                                      <Icon name={storage.kind === "local" ? "drive" : "cloud"} size={23} />
+                                    </span>
+                                    <span className="storage-link-copy">
+                                      <strong>{storage.name || "(unnamed)"}</strong>
+                                      <span title={storageSubtitle(storage)}>{storageSubtitle(storage)}</span>
+                                    </span>
+                                    <span className="storage-link-switcher-affordance" aria-hidden="true">
+                                      <Icon name="chevron-down" size={13} />
+                                    </span>
+                                  </button>
+                                ) : (
+                                  <div className="storage-link-identity">
+                                    <span className="storage-link-icon">
+                                      <Icon name={storage.kind === "local" ? "drive" : "cloud"} size={23} />
+                                    </span>
+                                    <span className="storage-link-copy">
+                                      <strong>{storage.name || "(unnamed)"}</strong>
+                                      <span title={storageSubtitle(storage)}>{storageSubtitle(storage)}</span>
+                                    </span>
                                   </div>
                                 )}
                               </div>
@@ -1121,6 +1082,64 @@ export default function ProjectLinksWorkspace({
                               </div>
                             </div>
                           </div>
+
+                          {linkedStorages.length > 1 && (
+                            <div
+                              ref={storagePickerMenuRef}
+                              id={`storage-picker-${project.local_project_id}`}
+                              className="storage-link-menu"
+                              role="menu"
+                              aria-label="Switch storage"
+                              hidden={!storagePickerOpen}
+                              onKeyDown={(event) => {
+                                const options = Array.from(event.currentTarget.querySelectorAll<HTMLButtonElement>(
+                                  '[role="menuitem"]',
+                                ));
+                                if (options.length === 0) return;
+                                const currentIndex = options.indexOf(document.activeElement as HTMLButtonElement);
+                                let nextIndex: number | null = null;
+                                if (event.key === "ArrowDown") {
+                                  nextIndex = currentIndex < 0 ? 0 : (currentIndex + 1) % options.length;
+                                }
+                                if (event.key === "ArrowUp") {
+                                  nextIndex = currentIndex < 0
+                                    ? options.length - 1
+                                    : (currentIndex - 1 + options.length) % options.length;
+                                }
+                                if (event.key === "Home") nextIndex = 0;
+                                if (event.key === "End") nextIndex = options.length - 1;
+                                if (nextIndex === null) return;
+                                event.preventDefault();
+                                options[nextIndex]?.focus();
+                              }}
+                            >
+                              {linkedStorages.filter((linkedStorage) => linkedStorage.id !== storage.id).map((linkedStorage) => (
+                                <button
+                                  key={linkedStorage.id}
+                                  type="button"
+                                  role="menuitem"
+                                  className="storage-link-menu-option"
+                                  disabled={storageControlsLocked}
+                                  aria-label={`Switch to ${linkedStorage.name || "unnamed storage"}`}
+                                  onClick={() => {
+                                    setStoragePickerProjectId(null);
+                                    if (reviewOpen) inlineStorageReview?.onClose();
+                                    void onSelectStorage(project.local_project_id, linkedStorage.id);
+                                    window.requestAnimationFrame(() => storagePickerTriggerRef.current?.focus());
+                                  }}
+                                >
+                                  <span className="storage-link-menu-icon" aria-hidden="true">
+                                    <Icon name={linkedStorage.kind === "local" ? "drive" : "cloud"} size={20} />
+                                  </span>
+                                  <span className="storage-link-menu-copy">
+                                    <strong>{linkedStorage.name || "(unnamed)"}</strong>
+                                    <span title={storageSubtitle(linkedStorage)}>{storageSubtitle(linkedStorage)}</span>
+                                  </span>
+                                  <Icon className="storage-link-menu-arrow" name="chevron-right" size={13} aria-hidden="true" />
+                                </button>
+                              ))}
+                            </div>
+                          )}
 
                           {reviewOpen && (
                             <div id={reviewPanelId} className="v3-storage-inline-review">

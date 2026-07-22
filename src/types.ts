@@ -845,6 +845,7 @@ export interface GitHistoryPage {
   selected_branch: string;
   branches: GitBranchSummary[];
   commits: GitCommitSummary[];
+  github_repository_url?: string | null;
   next_cursor?: string | null;
   unique_thread_count: number;
   reference_count: number;

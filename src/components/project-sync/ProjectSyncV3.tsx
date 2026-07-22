@@ -84,6 +84,7 @@ const EMPTY_CONFIG: SyncConfigV3 = {
 };
 
 const PROJECT_SIDEBAR_WIDTH_KEY = "agent-sync.project-sidebar-width";
+const PROJECT_SIDEBAR_VISIBILITY_KEY = "mallard.project-sidebar-visible";
 const ACTIVE_STORAGE_BY_PROJECT_KEY = "mallard.active-storage-by-project";
 const DEFAULT_PROJECT_SIDEBAR_WIDTH = 318;
 const MIN_PROJECT_SIDEBAR_WIDTH = 220;
@@ -109,6 +110,20 @@ function storedSidebarWidth(): number {
   } catch {
     return DEFAULT_PROJECT_SIDEBAR_WIDTH;
   }
+}
+
+function storedSidebarVisibility(): boolean {
+  if (typeof window === "undefined") return true;
+  try {
+    return window.localStorage.getItem(PROJECT_SIDEBAR_VISIBILITY_KEY) !== "hidden";
+  } catch {
+    return true;
+  }
+}
+
+function sidebarShortcutLabel(): string {
+  if (typeof navigator !== "undefined" && /Mac|iPhone|iPad|iPod/.test(navigator.platform)) return "⌘B";
+  return "Ctrl+B";
 }
 
 function storedActiveStorages(): Record<string, string> {
@@ -259,6 +274,7 @@ export default function ProjectSyncV3({ theme, onThemeChange }: Props) {
   const [logHeight, setLogHeight] = useState(240);
   const [resizingLog, setResizingLog] = useState(false);
   const [sidebarWidth, setSidebarWidth] = useState(storedSidebarWidth);
+  const [sidebarVisible, setSidebarVisible] = useState(storedSidebarVisibility);
   const [resizingSidebar, setResizingSidebar] = useState(false);
   const [unreadLogs, setUnreadLogs] = useState(0);
   const activityOpenRef = useRef(false);
@@ -286,6 +302,12 @@ export default function ProjectSyncV3({ theme, onThemeChange }: Props) {
   const [failedPullResourceIds, setFailedPullResourceIds] = useState<Set<string>>(new Set());
   const restoreRequest = useRef(0);
 
+  const toggleSidebar = useCallback(() => {
+    sidebarResizeRef.current = null;
+    setResizingSidebar(false);
+    setSidebarVisible((current) => !current);
+  }, []);
+
   useEffect(() => {
     activityOpenRef.current = activityOpen;
   }, [activityOpen]);
@@ -306,6 +328,30 @@ export default function ProjectSyncV3({ theme, onThemeChange }: Props) {
       // Persistence is a convenience; resizing still works if storage is unavailable.
     }
   }, [sidebarWidth]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(PROJECT_SIDEBAR_VISIBILITY_KEY, sidebarVisible ? "visible" : "hidden");
+    } catch {
+      // The sidebar can still be toggled for this session when storage is unavailable.
+    }
+  }, [sidebarVisible]);
+
+  useEffect(() => {
+    const handleSidebarShortcut = (event: KeyboardEvent) => {
+      if (
+        event.repeat
+        || event.altKey
+        || event.shiftKey
+        || (!event.metaKey && !event.ctrlKey)
+        || event.key.toLocaleLowerCase() !== "b"
+      ) return;
+      event.preventDefault();
+      toggleSidebar();
+    };
+    window.addEventListener("keydown", handleSidebarShortcut);
+    return () => window.removeEventListener("keydown", handleSidebarShortcut);
+  }, [toggleSidebar]);
 
   useEffect(() => {
     try {
@@ -1904,9 +1950,22 @@ export default function ProjectSyncV3({ theme, onThemeChange }: Props) {
 
   return (
     <div
-      className={`v3-app${resizingSidebar ? " resizing-sidebar" : ""}`}
+      className={`v3-app${sidebarVisible ? "" : " sidebar-hidden"}${resizingSidebar ? " resizing-sidebar" : ""}`}
       style={{ "--v3-sidebar-width": `${sidebarWidth}px` } as CSSProperties}
     >
+      <button
+        type="button"
+        className="v3-sidebar-toggle"
+        onClick={toggleSidebar}
+        title={`Toggle sidebar ${sidebarShortcutLabel()}`}
+        aria-label={sidebarVisible ? "Hide sidebar" : "Show sidebar"}
+        aria-controls="project-sidebar"
+        aria-expanded={sidebarVisible}
+        aria-keyshortcuts="Meta+B Control+B"
+      >
+        <Icon name={sidebarVisible ? "sidebar-collapse" : "sidebar-expand"} size={15} />
+      </button>
+
       <ProjectSidebar
         projects={projects}
         drafts={setupDrafts}

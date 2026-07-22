@@ -9,7 +9,7 @@ use super::persistence::{read_json_bounded, write_json_atomic, V3Repository};
 use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::Value;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Component, Path, PathBuf};
@@ -108,6 +108,8 @@ pub struct GitHistoryPage {
     pub selected_branch: String,
     pub branches: Vec<GitBranchSummary>,
     pub commits: Vec<GitCommitSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_repository_url: Option<String>,
     pub next_cursor: Option<String>,
     pub unique_thread_count: usize,
     pub reference_count: usize,
@@ -159,6 +161,8 @@ struct ParsedRollout {
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 struct RolloutIdentity {
+    #[serde(default)]
+    thread_id: Option<String>,
     cwd: PathBuf,
     is_internal_subagent: bool,
 }
@@ -298,6 +302,7 @@ pub fn get_project_chat_history(
     let mut unmapped = Vec::new();
 
     let git_page = if let Some(discovery) = git.as_mut() {
+        let github_repository_url = discover_github_repository_url(&resolved.project_root);
         // Mapping must use the complete bounded first-parent rail, rather than
         // just the visible page, so pagination does not change classification.
         let all_commits = if discovery.selected_available {
@@ -347,6 +352,7 @@ pub fn get_project_chat_history(
             selected_branch: discovery.selected_branch.clone(),
             branches: discovery.branches.clone(),
             commits: visible_commits,
+            github_repository_url,
             next_cursor: None,
             unique_thread_count: mapping.unique_thread_count,
             reference_count: mapping.reference_count,
@@ -522,9 +528,19 @@ fn resolve_owned_rollout(
 ) -> Result<(ResolvedProject, PathBuf), String> {
     validate_thread_uuid(thread_id)?;
     let resolved = resolve_project(repository, local_project_id)?;
-    let mut best: Option<(ParsedRollout, PathBuf)> = None;
+    let rollout_path = find_owned_rollout(&resolved.codex_home, &resolved.project_root, thread_id)?;
+    Ok((resolved, rollout_path))
+}
+
+fn find_owned_rollout(
+    codex_home: &Path,
+    project_root: &Path,
+    thread_id: &str,
+) -> Result<PathBuf, String> {
+    let mut rollout_paths = Vec::new();
+    let mut named_candidates = Vec::new();
     for directory_name in ["sessions", "archived_sessions"] {
-        let directory = resolved.codex_home.join(directory_name);
+        let directory = codex_home.join(directory_name);
         if !directory.exists() {
             continue;
         }
@@ -539,31 +555,71 @@ fn resolve_owned_rollout(
             {
                 continue;
             }
-            let metadata = entry
-                .metadata()
-                .map_err(|error| format!("read '{}': {error}", entry.path().display()))?;
-            let mut warnings = Vec::new();
-            let Ok(parsed) = parse_rollout_file(
-                entry.path(),
-                modified_secs(&metadata).unwrap_or(0),
-                &mut warnings,
-            ) else {
-                continue;
-            };
-            if parsed.thread.thread_id == thread_id
-                && cwd_belongs_to_project(&parsed.cwd, &resolved.project_root)
-            {
-                let replace = best
-                    .as_ref()
-                    .is_none_or(|(current, _)| rollout_is_preferred(&parsed, current));
-                if replace {
-                    best = Some((parsed, entry.path().to_path_buf()));
-                }
+            let path = entry.path().to_path_buf();
+            if rollout_filename_matches_thread(&path, thread_id) {
+                named_candidates.push(path.clone());
             }
+            rollout_paths.push(path);
         }
     }
-    best.map(|(_, path)| (resolved, path))
+
+    let mut best: Option<(ParsedRollout, PathBuf)> = None;
+    for path in &named_candidates {
+        consider_owned_rollout(path, project_root, thread_id, &mut best)?;
+    }
+
+    // Current Codex rollouts end with their UUID, so the normal path parses
+    // only the requested transcript. If an older or renamed rollout does not,
+    // inspect only its bounded session metadata before deciding to parse it.
+    if best.is_none() {
+        for path in rollout_paths
+            .iter()
+            .filter(|path| !rollout_filename_matches_thread(path, thread_id))
+        {
+            let identity = match read_rollout_identity(path) {
+                Ok(Some(identity)) => identity,
+                Ok(None) | Err(_) => continue,
+            };
+            if identity.thread_id.as_deref() != Some(thread_id) {
+                continue;
+            }
+            consider_owned_rollout(path, project_root, thread_id, &mut best)?;
+        }
+    }
+
+    best.map(|(_, path)| path)
         .ok_or_else(|| "Codex thread does not belong to the selected project".to_string())
+}
+
+fn rollout_filename_matches_thread(path: &Path, thread_id: &str) -> bool {
+    path.file_stem()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| value.ends_with(thread_id))
+}
+
+fn consider_owned_rollout(
+    path: &Path,
+    project_root: &Path,
+    thread_id: &str,
+    best: &mut Option<(ParsedRollout, PathBuf)>,
+) -> Result<(), String> {
+    let metadata =
+        fs::metadata(path).map_err(|error| format!("read '{}': {error}", path.display()))?;
+    let mut warnings = Vec::new();
+    let Ok(parsed) = parse_rollout_file(path, modified_secs(&metadata).unwrap_or(0), &mut warnings)
+    else {
+        return Ok(());
+    };
+    if parsed.thread.thread_id != thread_id || !cwd_belongs_to_project(&parsed.cwd, project_root) {
+        return Ok(());
+    }
+    let replace = best
+        .as_ref()
+        .is_none_or(|(current, _)| rollout_is_preferred(&parsed, current));
+    if replace {
+        *best = Some((parsed, path.to_path_buf()));
+    }
+    Ok(())
 }
 
 fn rollout_is_preferred(candidate: &ParsedRollout, current: &ParsedRollout) -> bool {
@@ -692,6 +748,7 @@ fn scan_codex_threads(
                             cached.size == metadata.len() && cached.modified_nanos == modified_nanos
                         })
                         .map(|cached| RolloutIdentity {
+                            thread_id: Some(cached.parsed.thread.thread_id.clone()),
                             cwd: cached.parsed.cwd.clone(),
                             is_internal_subagent: cached.parsed.is_internal_subagent,
                         })
@@ -748,6 +805,7 @@ fn scan_codex_threads(
                                 size: metadata.len(),
                                 modified_nanos,
                                 identity: RolloutIdentity {
+                                    thread_id: Some(parsed.thread.thread_id.clone()),
                                     cwd: parsed.cwd.clone(),
                                     is_internal_subagent: parsed.is_internal_subagent,
                                 },
@@ -1070,6 +1128,7 @@ fn rollout_identity_from_value(value: &Value) -> Option<RolloutIdentity> {
     }
     let cwd = string_alias(payload, &["cwd", "working_directory", "project_path"])?;
     Some(RolloutIdentity {
+        thread_id: string_alias(payload, &["id", "thread_id", "session_id"]).map(ToOwned::to_owned),
         cwd: PathBuf::from(cwd),
         is_internal_subagent: session_meta_is_internal_subagent(payload),
     })
@@ -1408,18 +1467,20 @@ fn parse_thread_detail_file(
     limit: usize,
 ) -> Result<CodexThreadDetailsPage, String> {
     let limit = limit.clamp(1, 50);
-    let total = scan_thread_detail_file(path, |_| true)?;
+    let retained_limit = cursor.unwrap_or(0).saturating_add(limit);
+    let mut recent = VecDeque::new();
+    let total = scan_thread_detail_file(path, |turn| {
+        recent.push_back(turn);
+        if recent.len() > retained_limit {
+            recent.pop_front();
+        }
+        true
+    })?;
     let (start, end, next_cursor) = latest_turn_bounds(total, cursor, limit);
-    let mut turns = Vec::new();
-    if start < end {
-        scan_thread_detail_file(path, |turn| {
-            let ordinal = turn.ordinal;
-            if ordinal >= start && ordinal < end {
-                turns.push(turn);
-            }
-            ordinal.saturating_add(1) < end
-        })?;
-    }
+    let turns = recent
+        .into_iter()
+        .filter(|turn| turn.ordinal >= start && turn.ordinal < end)
+        .collect();
     Ok(CodexThreadDetailsPage {
         thread_id: String::new(),
         next_cursor,
@@ -1987,6 +2048,103 @@ fn map_threads_to_commits(
         unique_thread_count: mapped_threads.len(),
         reference_count,
     }
+}
+
+fn discover_github_repository_url(project_root: &Path) -> Option<String> {
+    let output = git_output(
+        project_root,
+        &["config", "--get-regexp", r"^remote\..*\.url$"],
+    )
+    .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut fallback = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(separator) = line.find(char::is_whitespace) else {
+            continue;
+        };
+        let key = &line[..separator];
+        let value = line[separator..].trim();
+        let Some(remote_name) = key
+            .strip_prefix("remote.")
+            .and_then(|value| value.strip_suffix(".url"))
+        else {
+            continue;
+        };
+        let Some(repository_url) = normalize_github_repository_url(value) else {
+            continue;
+        };
+        if remote_name.eq_ignore_ascii_case("origin") {
+            return Some(repository_url);
+        }
+        fallback.get_or_insert(repository_url);
+    }
+    fallback
+}
+
+fn normalize_github_repository_url(remote_url: &str) -> Option<String> {
+    let remote_url = remote_url.trim();
+    if remote_url.is_empty()
+        || remote_url
+            .chars()
+            .any(|character| matches!(character, '\r' | '\n' | '\0' | '?' | '#' | '\\'))
+    {
+        return None;
+    }
+
+    let path = if let Some((scheme, remainder)) = remote_url.split_once("://") {
+        if !matches!(
+            scheme.to_ascii_lowercase().as_str(),
+            "https" | "http" | "ssh" | "git"
+        ) {
+            return None;
+        }
+        let (authority, path) = remainder.split_once('/')?;
+        let host_with_port = authority.rsplit('@').next()?;
+        let host = if let Some((host, port)) = host_with_port.rsplit_once(':') {
+            if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            host
+        } else {
+            host_with_port
+        };
+        if !host.eq_ignore_ascii_case("github.com") {
+            return None;
+        }
+        path
+    } else {
+        let (authority, path) = remote_url.split_once(':')?;
+        let (_, host) = authority.rsplit_once('@')?;
+        if !host.eq_ignore_ascii_case("github.com") {
+            return None;
+        }
+        path
+    };
+
+    let path = path.trim_matches('/');
+    let mut segments = path.split('/');
+    let owner = segments.next()?;
+    let repository = segments.next()?;
+    if segments.next().is_some() {
+        return None;
+    }
+    let repository = repository.strip_suffix(".git").unwrap_or(repository);
+    if !valid_github_path_segment(owner) || !valid_github_path_segment(repository) {
+        return None;
+    }
+    Some(format!("https://github.com/{owner}/{repository}"))
+}
+
+fn valid_github_path_segment(value: &str) -> bool {
+    !value.is_empty()
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Result<Output, String> {
@@ -2599,6 +2757,91 @@ mod tests {
         );
         assert_eq!(cache.entries.len(), 1);
         assert_eq!(cache.ownership.len(), 2);
+        assert!(cache
+            .ownership
+            .values()
+            .all(|entry| entry.identity.thread_id.is_some()));
+    }
+
+    #[test]
+    fn owned_rollout_lookup_parses_the_uuid_named_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let sessions = temp.path().join("codex/sessions/2026/07/21");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let thread_id = "019f742a-a206-7932-876c-9db8d8ce575a";
+        let target = sessions.join(format!("rollout-2026-07-21T00-00-00-{thread_id}.jsonl"));
+        fs::write(
+            &target,
+            format!(
+                "{}\n{}\n",
+                json!({"timestamp":100,"type":"session_meta","payload":{"id":thread_id,"cwd":project_root}}),
+                json!({"timestamp":101,"type":"event_msg","payload":{"type":"agent_message","message":"Done"}}),
+            ),
+        )
+        .unwrap();
+
+        let found =
+            find_owned_rollout(&temp.path().join("codex"), &project_root, thread_id).unwrap();
+
+        assert_eq!(found, target);
+    }
+
+    #[test]
+    fn owned_rollout_lookup_supports_renamed_files_with_bounded_identity_probe() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let sessions = temp.path().join("codex/archived_sessions");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let thread_id = "019f742a-a206-7932-876c-9db8d8ce575a";
+        let target = sessions.join("renamed-session.jsonl");
+        fs::write(
+            &target,
+            format!(
+                "{}\n{}\n",
+                json!({"timestamp":100,"type":"session_meta","payload":{"id":thread_id,"cwd":project_root}}),
+                json!({"timestamp":101,"type":"event_msg","payload":{"type":"agent_message","message":"Done"}}),
+            ),
+        )
+        .unwrap();
+
+        let found =
+            find_owned_rollout(&temp.path().join("codex"), &project_root, thread_id).unwrap();
+
+        assert_eq!(found, target);
+    }
+
+    #[test]
+    fn owned_rollout_lookup_rejects_a_spoofed_uuid_filename() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_root = temp.path().join("project");
+        let sessions = temp.path().join("codex/sessions");
+        fs::create_dir_all(&project_root).unwrap();
+        fs::create_dir_all(&sessions).unwrap();
+        let project_root = fs::canonicalize(project_root).unwrap();
+        let requested_id = "019f742a-a206-7932-876c-9db8d8ce575a";
+        let recorded_id = "019f742a-a206-7932-876c-9db8d8ce575b";
+        let target = sessions.join(format!("rollout-2026-07-21T00-00-00-{requested_id}.jsonl"));
+        fs::write(
+            target,
+            format!(
+                "{}\n",
+                json!({"timestamp":100,"type":"session_meta","payload":{"id":recorded_id,"cwd":project_root}}),
+            ),
+        )
+        .unwrap();
+
+        let error = find_owned_rollout(&temp.path().join("codex"), &project_root, requested_id)
+            .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Codex thread does not belong to the selected project"
+        );
     }
 
     #[test]
@@ -2956,6 +3199,29 @@ mod tests {
     }
 
     #[test]
+    fn streamed_chat_detail_pages_match_in_memory_pagination() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("rollout.jsonl");
+        let lines = (0..25)
+            .map(|index| {
+                json!({
+                    "timestamp": 100 + index,
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": format!("Message {index}")}
+                })
+                .to_string()
+            })
+            .collect::<Vec<_>>();
+        fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        for cursor in [None, Some(1), Some(10), Some(20), Some(25), Some(100)] {
+            let expected = parse_thread_detail_lines(lines.iter().map(String::as_str), cursor, 7);
+            let actual = parse_thread_detail_file(&path, cursor, 7).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
     fn chat_details_include_assistant_response_items_without_duplicate_event_copies() {
         let lines = vec![
             json!({"timestamp":100,"type":"event_msg","payload":{"type":"agent_message","message":"Same answer"}}).to_string(),
@@ -3096,6 +3362,81 @@ mod tests {
         assert_eq!(next.commits.len(), 1);
         assert!(discover_git_history(root, Some("main; touch /tmp/nope"), None, 2).is_err());
         assert!(discover_git_history(root, Some("main"), Some("not-a-sha"), 2).is_err());
+    }
+
+    #[test]
+    fn github_remote_urls_are_canonicalized_without_credentials() {
+        for (remote, expected) in [
+            (
+                "https://github.com/Owner/repository.git",
+                Some("https://github.com/Owner/repository"),
+            ),
+            (
+                "ssh://git@github.com/Owner/repository.git",
+                Some("https://github.com/Owner/repository"),
+            ),
+            (
+                "git@github.com:Owner/repository.git",
+                Some("https://github.com/Owner/repository"),
+            ),
+            (
+                "https://user:secret@github.com/Owner/repository.git",
+                Some("https://github.com/Owner/repository"),
+            ),
+            ("https://github.com.evil/Owner/repository.git", None),
+            ("https://github.com/Owner/repository/tree/main", None),
+            ("file:///tmp/Owner/repository.git", None),
+        ] {
+            assert_eq!(normalize_github_repository_url(remote).as_deref(), expected);
+        }
+    }
+
+    #[test]
+    fn github_remote_discovery_prefers_origin_then_another_github_remote() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        git(root, &["init", "-b", "main"]);
+        git(
+            root,
+            &[
+                "remote",
+                "add",
+                "mirror",
+                "git@github.com:mirror/repository.git",
+            ],
+        );
+        assert_eq!(
+            discover_github_repository_url(root).as_deref(),
+            Some("https://github.com/mirror/repository")
+        );
+
+        git(
+            root,
+            &[
+                "remote",
+                "add",
+                "origin",
+                "https://user:secret@github.com/owner/repository.git",
+            ],
+        );
+        assert_eq!(
+            discover_github_repository_url(root).as_deref(),
+            Some("https://github.com/owner/repository")
+        );
+
+        git(
+            root,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "https://gitlab.com/owner/repository.git",
+            ],
+        );
+        assert_eq!(
+            discover_github_repository_url(root).as_deref(),
+            Some("https://github.com/mirror/repository")
+        );
     }
 
     #[test]

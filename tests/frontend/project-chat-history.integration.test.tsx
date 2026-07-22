@@ -46,6 +46,7 @@ const history = {
   git: {
     selected_branch: "main",
     branches: [{ name: "main", is_current: true, available: true }],
+    github_repository_url: "https://github.com/Git4Agent/mallard",
     commits: [{
       sha: "b".repeat(40),
       short_sha: "bbbbbbb",
@@ -235,6 +236,8 @@ test("history content uses the local alias and renders commit/thread actions", (
   assert.match(html, /aria-label="Last push:/);
   assert.match(html, /Repository: mallard/);
   assert.match(html, /Add project-scoped history/);
+  assert.match(html, new RegExp(`href="https://github\\.com/Git4Agent/mallard/commit/${"b".repeat(40)}"`));
+  assert.match(html, /aria-label="Open commit bbbbbbb on GitHub"/);
   assert.doesNotMatch(html, /v3-history-thread-updated/);
   assert.doesNotMatch(html, /aria-label="Updated [^"]+"/);
   assert.doesNotMatch(html, /aria-label="Show session details"/);
@@ -251,10 +254,44 @@ test("history content uses the local alias and renders commit/thread actions", (
   assert.match(html, /aria-label="Open in Codex"/);
   assert.match(html, /aria-label="Open in Terminal"/);
   assert.match(html, /v3-openai-icon/);
+  assert.doesNotMatch(html, /aria-label="1 sessions"/);
   assert.doesNotMatch(html, />Open in Codex</);
   assert.doesNotMatch(html, /> Open in Terminal</);
   assert.doesNotMatch(html, />Load chat history</);
   assert.doesNotMatch(html, /Show chat details/);
+});
+
+test("commit hashes remain plain text without a GitHub remote", () => {
+  const html = renderToStaticMarkup(
+    <ProjectChatHistoryContent
+      project={project}
+      binding={{
+        replica_id: "replica",
+        local_project_id: project.local_project_id,
+        bundle_id: project.bundle_id,
+        project_root: project.project_root,
+        canonical_project_root: project.project_root,
+        profile_ids: { codex: "profile-codex" },
+        state: "active",
+        revision: 1,
+        updated_at: 2,
+      }}
+      history={{ ...history, git: { ...history.git, github_repository_url: null } }}
+      loading={false}
+      loadingMore={false}
+      actionError={null}
+      actionBusyThreadId={null}
+      onBranchChange={() => undefined}
+      onRefresh={() => undefined}
+      onLoadMore={() => undefined}
+      onOpenCodex={() => undefined}
+      onOpenTerminal={() => undefined}
+    />,
+  );
+
+  assert.match(html, new RegExp(`<code title="${"b".repeat(40)}">bbbbbbb</code>`));
+  assert.doesNotMatch(html, /aria-label="Open commit .* on GitHub"/);
+  assert.doesNotMatch(html, /\/commit\/b{40}/);
 });
 
 test("permanent session summaries label every metric icon", () => {
@@ -332,6 +369,13 @@ test("chat history remains independently collapsible under the permanent summary
 });
 
 test("embedded history follows the project workspace without repeating project controls", () => {
+  const historyWithUncommitted = {
+    ...history,
+    unmapped: [{
+      thread_id: history.threads[0].thread_id,
+      reason: "No subsequent commit",
+    }],
+  };
   const html = renderToStaticMarkup(
     <ProjectChatHistoryContent
       embedded
@@ -347,7 +391,7 @@ test("embedded history follows the project workspace without repeating project c
         revision: 1,
         updated_at: 2,
       }}
-      history={history}
+      history={historyWithUncommitted}
       loading={false}
       loadingMore={false}
       actionError={null}
@@ -362,8 +406,10 @@ test("embedded history follows the project workspace without repeating project c
 
   assert.match(html, /v3-history-embedded/);
   assert.match(html, /<h2[^>]*v3-history-embedded-title[^>]*>.*Git history/s);
+  assert.match(html, /<h2 id="uncommitted-heading">Uncommitted<\/h2>/);
   assert.doesNotMatch(html, />Commit history</);
-  assert.match(html, /aria-label="1 thread"/);
+  assert.doesNotMatch(html, /aria-label="1 thread"/);
+  assert.doesNotMatch(html, /Sessions not linked to a commit/);
   assert.doesNotMatch(html, /<main/);
   assert.doesNotMatch(html, /aria-label="Project settings"/);
   assert.doesNotMatch(html, /v3-history-project-context/);

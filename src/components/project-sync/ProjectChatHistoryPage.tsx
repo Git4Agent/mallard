@@ -1,3 +1,4 @@
+import { openUrl } from "@tauri-apps/plugin-opener";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type {
   CodexThreadDetailsPage,
@@ -75,6 +76,19 @@ function formatDate(value?: number | null): string {
 function formatCount(value?: number | null): string {
   if (value == null) return "Not reported";
   return new Intl.NumberFormat(undefined, { notation: value >= 1_000 ? "compact" : "standard", maximumFractionDigits: 1 }).format(value);
+}
+
+async function openExternalUrl(url: string) {
+  try {
+    await openUrl(url);
+  } catch {
+    if (typeof window !== "undefined") window.open(url, "_blank", "noopener,noreferrer");
+  }
+}
+
+function githubCommitUrl(repositoryUrl: string | null | undefined, sha: string): string | null {
+  if (!repositoryUrl) return null;
+  return `${repositoryUrl.replace(/\/+$/, "")}/commit/${sha}`;
 }
 
 type ThreadSyncPresentation = {
@@ -361,7 +375,7 @@ export function ProjectChatHistoryContent({
     + visibleComparisonCounts.diverged
     + visibleComparisonCounts.unavailable
     + visibleComparisonCounts.needsBaseline;
-  const showEmbeddedThreadCount = embedded && !compactSelectionReview && embeddedThreadCount !== null;
+  const showEmbeddedThreadCount = embedded && !compactSelectionReview && !history?.git && embeddedThreadCount !== null;
   const showComparisonSummary = comparison != null && visibleComparisonChangeCount > 0;
   const renderThread = (thread: CodexThreadSummary, key: string) => {
     const entry = syncByThread.get(thread.thread_id);
@@ -513,19 +527,31 @@ export function ProjectChatHistoryContent({
                 )}
                 {history.unmapped.length > 0 && (
                   <section className="v3-history-uncommitted" aria-labelledby="uncommitted-heading">
-                    <div className="v3-history-section-heading"><h2 id="uncommitted-heading">Uncommitted</h2><span className="v3-history-heading-count" title="Sessions not linked to a commit"><Icon name="message" size={12} />{history.unmapped.length}</span></div>
+                    <div className="v3-history-section-heading"><h2 id="uncommitted-heading">Uncommitted</h2></div>
                     <div className="v3-history-thread-list flat">{history.unmapped.map((reference) => { const thread = threads.get(reference.thread_id); return thread ? renderThread(thread, `uncommitted:${thread.thread_id}`) : null; })}</div>
                   </section>
                 )}
                 <section className="v3-history-commit-section" aria-label={`First-parent commits on ${history.git.selected_branch}`}>
-                  {!embedded && <div className="v3-history-section-heading"><h2>Commit history</h2><div className="v3-history-heading-counts"><span title={`${history.git.unique_thread_count} sessions`} aria-label={`${history.git.unique_thread_count} sessions`}><Icon name="message" size={12} />{history.git.unique_thread_count}</span><span title={`${history.git.reference_count} commit occurrences`} aria-label={`${history.git.reference_count} commit occurrences`}><Icon name="git-branch" size={12} />{history.git.reference_count}</span></div></div>}
+                  {!embedded && <div className="v3-history-section-heading"><h2>Commit history</h2><span className="v3-history-heading-count" title={`${history.git.reference_count} commit occurrences`} aria-label={`${history.git.reference_count} commit occurrences`}><Icon name="git-branch" size={12} />{history.git.reference_count}</span></div>}
                   {history.git.commits.length === 0 ? <div className="v3-history-state">No commits are available in this 30-day window.</div> : (
-                    <ol className="v3-history-commit-rail">{history.git.commits.map((commit) => (
-                      <li key={commit.sha} className="v3-history-commit"><span className="v3-history-commit-node" aria-hidden="true" />
-                        <div className="v3-history-commit-heading"><code title={commit.sha}>{commit.short_sha}</code><time dateTime={new Date(commit.committed_at * 1_000).toISOString()}>{formatDate(commit.committed_at)}</time><strong>{commit.subject}</strong></div>
-                        {commit.thread_refs.length > 0 && <div className="v3-history-thread-list">{orderedReferences(commit.thread_refs).map((reference) => { const thread = threads.get(reference.thread_id); return thread ? renderThread(thread, `${commit.sha}:${thread.thread_id}`) : null; })}</div>}
-                      </li>
-                    ))}</ol>
+                    <ol className="v3-history-commit-rail">{history.git.commits.map((commit) => {
+                      const commitUrl = githubCommitUrl(history.git?.github_repository_url, commit.sha);
+                      return (
+                        <li key={commit.sha} className="v3-history-commit"><span className="v3-history-commit-node" aria-hidden="true" />
+                          <div className="v3-history-commit-heading">
+                            {commitUrl ? (
+                              <a className="v3-history-commit-link" href={commitUrl} target="_blank" rel="noopener noreferrer"
+                                title={`Open ${commit.sha} on GitHub`} aria-label={`Open commit ${commit.short_sha} on GitHub`}
+                                onClick={(event) => { event.preventDefault(); void openExternalUrl(commitUrl); }}>
+                                <code>{commit.short_sha}</code>
+                              </a>
+                            ) : <code title={commit.sha}>{commit.short_sha}</code>}
+                            <time dateTime={new Date(commit.committed_at * 1_000).toISOString()}>{formatDate(commit.committed_at)}</time><strong>{commit.subject}</strong>
+                          </div>
+                          {commit.thread_refs.length > 0 && <div className="v3-history-thread-list">{orderedReferences(commit.thread_refs).map((reference) => { const thread = threads.get(reference.thread_id); return thread ? renderThread(thread, `${commit.sha}:${thread.thread_id}`) : null; })}</div>}
+                        </li>
+                      );
+                    })}</ol>
                   )}
                 </section>
               </>

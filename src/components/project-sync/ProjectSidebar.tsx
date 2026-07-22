@@ -126,7 +126,7 @@ export default function ProjectSidebar({
   };
 
   return (
-    <aside className="v3-sidebar">
+    <aside id="project-sidebar" className="v3-sidebar">
       <div className="v3-sidebar-drag" data-tauri-drag-region />
       <div className="v3-sidebar-brand" data-tauri-drag-region>
         <img className="v3-brand-logo" src="/mallard-logo.svg" alt="" data-tauri-drag-region />
